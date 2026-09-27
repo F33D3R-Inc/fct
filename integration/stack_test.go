@@ -32,6 +32,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -127,9 +128,12 @@ func checkNotStale(t *testing.T, bin string) {
 	}
 }
 
-// freePort asks the kernel for a port and immediately releases it. Racy in
-// principle, reliable in practice, and far better than a hardcoded port in a
-// suite that may run beside a developer's own servers.
+// freePort asks the kernel for a port and immediately releases it — racy,
+// and kept only for the fabric front door, which takes a port number and
+// cannot yet say which one it bound. The engine is started on port 0 and
+// says which port it got (bannerPort); the app is handed a listener this
+// process bound (runtime.ServeOn). Neither has a window in which another
+// process can take the port first.
 func freePort(t *testing.T) int {
 	t.Helper()
 
@@ -140,6 +144,25 @@ func freePort(t *testing.T) int {
 	defer l.Close()
 
 	return l.Addr().(*net.TCPAddr).Port
+}
+
+var bannerPortRE = regexp.MustCompile(`FacetQL Server Running on port (\d+)`)
+
+// bannerPort is the port an engine's banner names ("FacetQL Server Running
+// on port N" — `facetql start` and fqserver.fct print the same line, and
+// with port 0 asked for, N is the ephemeral port the kernel chose), read
+// from its log; 0 until the banner is there.
+func bannerPort(logPath string) int {
+	body, err := os.ReadFile(logPath)
+	if err != nil {
+		return 0
+	}
+	m := bannerPortRE.FindSubmatch(body)
+	if m == nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(string(m[1]))
+	return n
 }
 
 // engine is a running FacetQL with its own data directory.
@@ -174,12 +197,11 @@ func startEngineIn(t *testing.T, dir string) *engine {
 
 	e := &engine{t: t, dir: dir, token: "integration-token"}
 
-	// freePort releases the port it found before the engine binds it, so
-	// another process may take it in between — rarely, but reliably under a
-	// full parallel `go test ./...`. An engine that exits because its port
-	// was taken is simply started again on another.
+	// The engine is asked for port 0 and told which port the kernel gave
+	// it by its banner: no port is chosen here that another process could
+	// take before the engine binds it.
 	for attempt := 1; ; attempt++ {
-		port := freePort(t)
+		port := 0
 		e.port = port
 
 		log, err := os.Create(filepath.Join(dir, "facetql.log"))
@@ -373,8 +395,13 @@ func (e *engine) waitReady() bool {
 
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := e.get("/stats"); err == nil {
-			return true
+		if e.port == 0 {
+			e.port = bannerPort(filepath.Join(e.dir, "facetql.log"))
+		}
+		if e.port != 0 {
+			if _, err := e.get("/stats"); err == nil {
+				return true
+			}
 		}
 		select {
 		case <-e.done:
@@ -560,10 +587,15 @@ func startAppFile(t *testing.T, e *engine, path string) *app {
 		t.Fatalf("starting the runtime: %v", err)
 	}
 
-	port := freePort(t)
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	// The listener is bound here and handed to the runtime: the port is
+	// this process's from the moment it is known.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("binding the app's port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
 
-	go func() { _ = srv.Serve(addr) }()
+	go func() { _ = srv.ServeOn(ln) }()
 
 	a := &app{t: t, port: port, cl: &http.Client{Timeout: 30 * time.Second}}
 	a.newSession()

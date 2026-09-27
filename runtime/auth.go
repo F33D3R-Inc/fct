@@ -131,7 +131,10 @@ func (s *Server) authSignup(w http.ResponseWriter, sid, username, password strin
 	s.persistSession(sid)
 	s.recordAudit(username, "signup", true, "")
 	// The verify token would be emailed in production; surfaced here for the flow.
-	writeJSON(w, map[string]any{"reload": true, "verifyToken": verifyToken})
+	// `token` is the same bearer credential login answers with: the account is
+	// signed in the moment it exists, and a native client that signed up must
+	// not have to log in again to act.
+	writeJSON(w, map[string]any{"reload": true, "verifyToken": verifyToken, "token": signValue(sid)})
 }
 
 func (s *Server) authLogin(w http.ResponseWriter, sid, username, password string) {

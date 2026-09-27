@@ -1,0 +1,29 @@
+import "../../selfhost/fabricd_lib.fct"
+
+app FabricdHotCellGated:
+    # fabricd, with tests/mover.rs's HotCell telemetry source behind a gate:
+    # the command fabricd.fct is — the same fabricd_lib.fct process, the
+    # front door on its data port, the operator port, the daemon's own
+    # mover — with Daemon::start handed one cell under sustained write
+    # pressure (us-east-db-0, shard 1, cell (0,0)) that the loop sees only
+    # once the file `hot` exists in the data directory. Until then every
+    # sweep is empty and nothing is decided; the instant it exists the
+    # optimizer isolates the cell and the daemon moves it — while whatever
+    # session is running keeps running. integration/allfct_stack_test.go
+    # runs it, and creates the file mid-session.
+    proc hotCell() -> DaemonTelemetry:
+        let decoded = do protocolDecode("{\"Telemetry\":{\"timestamp_ms\":0,\"node_id\":\"us-east-db-0\",\"shard\":{\"id\":1,\"workload_domain\":\"us-east\"},\"samples\":[{\"coordinate\":{\"x\":0,\"y\":0},\"operations_per_second\":12000.0,\"read_ratio\":0.1,\"write_ratio\":0.9,\"read_latency_us\":40000.0,\"write_latency_us\":60000.0,\"cpu_utilization\":0.99,\"memory_utilization\":0.95,\"queue_depth\":30000,\"cell_breakdown\":[],\"cell_breakdown_partial\":false}]}}")
+        return daemonGatedTelemetry("one cell under sustained write pressure, once `hot` exists", [decoded.message], "hot")
+
+    proc main(args: [text]) -> int uses io.net, io.net.listen, io.file, io.env, io.console:
+        let named = do fabricdArguments(args)
+        if named.kind == "exit":
+            return named.code
+        let granted = grantRead(named.path)
+        let start = do fabricdConfigure(named.path)
+        if start.kind == "exit":
+            return start.code
+        let exit = channel()
+        detach fabricdRun(start.settings, hotCell(), exit)
+        let code = recv(exit)
+        return toInt(code)

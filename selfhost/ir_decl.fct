@@ -89,6 +89,11 @@ app IRDeclSelfHost:
         reads: [text]
         seal: [text]
         body: [IRStmt]
+        # builtin: a built-in auth action (authActions() in build.go), the
+        # one kind the builder never lowers — its writes/reads/body are
+        # nil, `null`. Every lowered action, a bodiless stand-in from
+        # `expect action` included, has sortedKeys' `[]` for both.
+        builtin: bool
 
     struct IRProc:
         name: text
@@ -247,6 +252,8 @@ app IRDeclSelfHost:
         let reason = do jStr(v, "reason")
         let writes = do jTextListOf(v, "writes")
         let reads = do jTextListOf(v, "reads")
+        let readsV = do jGet(v, "reads")
+        let builtin = readsV.kind == "null"
         let seal = do jTextListOf(v, "seal")
         let bv = do jGet(v, "body")
         let bn = len(bv.vals)
@@ -256,7 +263,7 @@ app IRDeclSelfHost:
             let st = do irStmtFromJVal(bv.vals[k])
             body = append(body, st)
             k = k + 1
-        return IRAction{name: name, params: params, requires: reqs, optimistic: optimistic, ret: ret, retList: retList, placement: placement, reason: reason, writes: writes, reads: reads, seal: seal, body: body}
+        return IRAction{name: name, params: params, requires: reqs, optimistic: optimistic, ret: ret, retList: retList, placement: placement, reason: reason, writes: writes, reads: reads, seal: seal, body: body, builtin: builtin}
 
     proc irProcFromJVal(v: JVal) -> IRProc:
         let name = do jStr(v, "name")
@@ -467,7 +474,7 @@ app IRDeclSelfHost:
         # signup, …) is the one action with no body, and the builder leaves
         # its writes/reads/body nil — `null` — where an author's action always
         # has sortedKeys' `[]` and a non-empty body.
-        if len(a.body) == 0:
+        if a.builtin:
             out = out + ",\"writes\":null,\"reads\":null"
             if len(a.seal) > 0:
                 let sj0 = do textListJSON(a.seal)
@@ -479,6 +486,8 @@ app IRDeclSelfHost:
         if len(a.seal) > 0:
             let sj = do textListJSON(a.seal)
             out = out + ",\"seal\":" + sj
+        if len(a.body) == 0:
+            return out + ",\"body\":null}"
         let bj = do irStmtListJSON(a.body)
         return out + ",\"body\":" + bj + "}"
 

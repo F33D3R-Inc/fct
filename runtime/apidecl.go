@@ -233,6 +233,22 @@ func (s *Server) serveDeclaredAPI(w http.ResponseWriter, r *http.Request, apis [
 		}
 		bound[a.decl.Bearer] = tok
 	}
+	// `auth <scheme> basic <id> <secret>`: the client id and secret arrive as
+	// HTTP Basic credentials — a header a browser page cannot attach without
+	// a preflight, which is what makes a server-to-server exchange safe to
+	// exempt from the site's own session — and bind to their two parameters.
+	if a.decl.BasicID != "" {
+		id, secret, ok := r.BasicAuth()
+		if !ok || id == "" || secret == "" {
+			w.Header().Set("WWW-Authenticate", `Basic realm="`+a.decl.Auth+`"`)
+			// RFC 6749 §5.2: a token endpoint refuses a missing or malformed
+			// client credential as invalid_client, the same code the action
+			// answers for a wrong one — one branch for "no good credential".
+			apiErrorCode(w, http.StatusUnauthorized, "invalid_client", "Present your client_id and client_secret as HTTP Basic credentials.")
+			return true
+		}
+		bound[a.decl.BasicID], bound[a.decl.BasicSecret] = id, secret
+	}
 	q := r.URL.Query()
 	for _, p := range a.act.Params {
 		if _, ok := bound[p.Name]; ok {
@@ -253,6 +269,27 @@ func (s *Server) serveDeclaredAPI(w http.ResponseWriter, r *http.Request, apis [
 			if err := s.bindMultipartBody(w, r, a, bound); err != nil {
 				apiError(w, http.StatusBadRequest, err.Error())
 				return true
+			}
+		} else if ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); a.decl.Form && (ct == "application/x-www-form-urlencoded" || ct == "multipart/form-data") {
+			// `body form`: the fields of the form bind the body parameters,
+			// each as the text the client sent (paramArg coerces below, as it
+			// does a query value).
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseMultipartForm(1 << 20); err != nil && err != http.ErrNotMultipart {
+				apiError(w, http.StatusBadRequest, "the request body could not be read")
+				return true
+			}
+			for _, p := range a.act.Params {
+				if _, ok := bound[p.Name]; ok {
+					continue
+				}
+				if vs := r.PostForm[p.Name]; len(vs) > 0 {
+					if p.List {
+						bound[p.Name] = anySlice(vs)
+					} else {
+						bound[p.Name] = vs[0]
+					}
+				}
 			}
 		} else {
 			var body map[string]any

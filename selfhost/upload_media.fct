@@ -1,0 +1,373 @@
+import "api_decl.fct"
+
+app UploadMedia:
+    # upload_media.fct — runtime/upload.go and media.go's endpoints: POST
+    # /upload (one multipart file, stored under a random name with the
+    # file's own safe extension, answered as its /uploads/ reference),
+    # the resumable /upload/init, /upload/chunk?id=, /upload/finish?id=,
+    # /upload/abort?id= (a temporary .part assembled chunk by chunk, then
+    # renamed), and GET /uploads/<name> as net/http's ServeFile answers it
+    # (Content-Type by extension, Last-Modified, Accept-Ranges), refused
+    # for a path that leaves the directory and — when FACET_MEDIA_TTL signs
+    # media — for a link whose exp/sig do not hold. The upload directory is
+    # FACET_UPLOAD_DIR (an absolute path inside the sandbox, or a path
+    # relative to it), else facet-uploads.
+    #
+    # A request's body reaches these handlers as bytes: the connection task
+    # carries them beside the text body (x-facet-body-b64), and a stored
+    # file leaves the same way (x-facet-body-b64 on the response), so a
+    # binary payload never passes through a text conversion.
+    proc rtUploadDir(w: RtWorld) -> text:
+        if w.uploadDir != "":
+            return w.uploadDir
+        return "facet-uploads"
+
+    proc rtRandomName() -> text:
+        let b = randomBytes(16)
+        let h = do rtHex(b)
+        return h
+
+    proc rtHex(bs: [int]) -> text:
+        let digits = "0123456789abcdef"
+        let mut out = ""
+        let mut i = 0
+        loop i < len(bs):
+            out = out + charAt(digits, bs[i] / 16) + charAt(digits, bs[i] % 16)
+            i = i + 1
+        return out
+
+    # rtSafeExt: safeExt — a lowercase extension of at most 5 letters or
+    # digits, else none.
+    proc rtSafeExt(filename: text) -> text:
+        let mut dot = -1
+        let mut i = len(filename) - 1
+        loop i >= 0 && dot < 0:
+            let c = charAt(filename, i)
+            if c == ".":
+                dot = i
+            if c == "/" || c == "\\":
+                i = -1
+            i = i - 1
+        if dot < 0:
+            return ""
+        let ext = lower(slice(filename, dot, len(filename)))
+        if ext == "" || len(ext) > 6:
+            return ""
+        let mut k = 1
+        loop k < len(ext):
+            let c2 = charAt(ext, k)
+            if !((c2 >= "a" && c2 <= "z") || (c2 >= "0" && c2 <= "9")):
+                return ""
+            k = k + 1
+        return ext
+
+    # rtBodyBytes: the request body as the bytes that arrived.
+    proc rtBodyBytes(req: HttpServerRequest) -> [int]:
+        let b64 = do rtHeaderValue(req.headers, "x-facet-body-b64")
+        if b64 == "":
+            return textToBytes(req.body)
+        let bs = do rtBase64UrlDecode(b64)
+        return bs
+
+    # ── multipart/form-data ─────────────────────────────────────────────
+    struct RtPart:
+        name: text
+        filename: text
+        data: [int]
+
+    proc rtBoundaryOf(contentType: text) -> text:
+        let at = do rtIndexOfText(lower(contentType), "boundary=")
+        if at < 0:
+            return ""
+        let mut b = slice(contentType, at + 9, len(contentType))
+        let semi = do rtIndexOfText(b, ";")
+        if semi >= 0:
+            b = slice(b, 0, semi)
+        b = trim(b)
+        if len(b) >= 2 && charAt(b, 0) == "\"":
+            b = slice(b, 1, len(b) - 1)
+        return b
+
+    proc rtBytesIndexOf(hay: [int], needle: [int], from: int) -> int:
+        let n = len(hay)
+        let m = len(needle)
+        let mut i = from
+        loop i + m <= n:
+            let mut k = 0
+            let mut same = true
+            loop k < m && same:
+                if hay[i + k] != needle[k]:
+                    same = false
+                k = k + 1
+            if same:
+                return i
+            i = i + 1
+        return -1
+
+    proc rtDispositionParam(header: text, key: text) -> text:
+        let at = do rtIndexOfText(header, key + "=\"")
+        if at < 0:
+            return ""
+        let rest = slice(header, at + len(key) + 2, len(header))
+        let q = do rtIndexOfText(rest, "\"")
+        if q < 0:
+            return rest
+        return slice(rest, 0, q)
+
+    # rtParseMultipart: every part of a multipart/form-data body; an empty
+    # list when the body is not one.
+    proc rtParseMultipart(contentType: text, body: [int]) -> [RtPart]:
+        let boundary = do rtBoundaryOf(contentType)
+        let isMulti = do rtHasPrefix(lower(contentType), "multipart/form-data")
+        if boundary == "" || !isMulti:
+            return []
+        let delim = textToBytes("--" + boundary)
+        let crlf = textToBytes("\r\n")
+        let mut parts = []
+        let mut pos = do rtBytesIndexOf(body, delim, 0)
+        let mut going = pos >= 0
+        loop going:
+            pos = pos + len(delim)
+            if pos + 2 <= len(body) && body[pos] == 45 && body[pos + 1] == 45:
+                going = false
+            else:
+                let headEnd = do rtBytesIndexOf(body, textToBytes("\r\n\r\n"), pos)
+                if headEnd < 0:
+                    going = false
+                else:
+                    let head = bytesToText(slice(body, pos + 2, headEnd))
+                    let next = do rtBytesIndexOf(body, crlf + delim, headEnd + 4)
+                    if next < 0:
+                        going = false
+                    else:
+                        let data = slice(body, headEnd + 4, next)
+                        let lines = split(head, "\r\n")
+                        let mut name = ""
+                        let mut filename = ""
+                        let mut li = 0
+                        loop li < len(lines):
+                            let isDisp = do rtHasPrefix(lower(lines[li]), "content-disposition:")
+                            if isDisp:
+                                name = do rtDispositionParam(lines[li], "name")
+                                filename = do rtDispositionParam(lines[li], "filename")
+                            li = li + 1
+                        parts = append(parts, RtPart{name: name, filename: filename, data: data})
+                        pos = next + 2
+        return parts
+
+    # ── POST /upload ────────────────────────────────────────────────────
+    proc rtUploadedJSON(name: text) -> HttpServerResponse:
+        let ref = "/uploads/" + name
+        let r = do rtJSONResponse(200, rtObjectJSONRaw(["url"], [jsonQuote(ref)]) + "\n")
+        return r
+
+    proc rtHandleUpload(w0: RtWorld, req: HttpServerRequest) -> RtHandled uses io.file:
+        let mut w = w0
+        if req.method != "POST":
+            let m = do rtTextError(405, "POST only")
+            return RtHandled{resp: m, w: w}
+        let csrf = do rtCheckCSRF(w, req)
+        if !csrf:
+            let f = do rtTextError(403, "missing or invalid CSRF token")
+            return RtHandled{resp: f, w: w}
+        let body = do rtBodyBytes(req)
+        let ct = do rtHeaderValue(req.headers, "content-type")
+        let parts = do rtParseMultipart(ct, body)
+        if len(parts) == 0 || len(body) > w.uploadCap:
+            let bad = do rtTextError(400, "upload too large or malformed")
+            return RtHandled{resp: bad, w: w}
+        let mut at = -1
+        let mut i = 0
+        loop i < len(parts):
+            if parts[i].name == "file" && parts[i].filename != "" && at < 0:
+                at = i
+            i = i + 1
+        if at < 0:
+            let nf = do rtTextError(400, "missing file field")
+            return RtHandled{resp: nf, w: w}
+        let name = rtRandomName() + rtSafeExt(parts[at].filename)
+        let path = rtUploadDir(w) + "/" + name
+        let wrote = writeFileAt(path, 0, parts[at].data)
+        let ok = do rtUploadedJSON(name)
+        return RtHandled{resp: ok, w: w}
+
+    # ── the resumable endpoints ─────────────────────────────────────────
+    proc rtUploadSessionIndex(w: RtWorld, id: text) -> int:
+        let mut i = 0
+        loop i < len(w.upIds):
+            if w.upIds[i] == id:
+                return i
+            i = i + 1
+        return -1
+
+    proc rtDropUploadSession(w0: RtWorld, at: int) -> RtWorld:
+        let mut w = w0
+        w.upIds = slice(w.upIds, 0, at) + slice(w.upIds, at + 1, len(w.upIds))
+        w.upNames = slice(w.upNames, 0, at) + slice(w.upNames, at + 1, len(w.upNames))
+        w.upSizes = slice(w.upSizes, 0, at) + slice(w.upSizes, at + 1, len(w.upSizes))
+        return w
+
+    proc rtHandleUploadChunked(w0: RtWorld, req: HttpServerRequest) -> RtHandled uses io.file:
+        let mut w = w0
+        if req.method != "POST":
+            let m = do rtTextError(405, "POST only")
+            return RtHandled{resp: m, w: w}
+        let csrf = do rtCheckCSRF(w, req)
+        if !csrf:
+            let f = do rtTextError(403, "missing or invalid CSRF token")
+            return RtHandled{resp: f, w: w}
+        let op = slice(req.path, 8, len(req.path))
+        let dir = do rtUploadDir(w)
+        if op == "init":
+            let j = do jsonParse(req.body)
+            let filename = do jStr(j, "filename")
+            let id = do rtRandomName()
+            let name = rtRandomName() + rtSafeExt(filename)
+            let created = writeFileAt(dir + "/" + id + ".part", 0, [])
+            w.upIds = append(w.upIds, id)
+            w.upNames = append(w.upNames, name)
+            w.upSizes = append(w.upSizes, 0)
+            let r = do rtJSONResponse(200, rtObjectJSONRaw(["id"], [jsonQuote(id)]) + "\n")
+            return RtHandled{resp: r, w: w}
+        let id2 = do rtQueryValue(req.query, "id")
+        let at = do rtUploadSessionIndex(w, id2)
+        if op == "chunk":
+            if at < 0:
+                let u = do rtTextError(404, "unknown upload session")
+                return RtHandled{resp: u, w: w}
+            let body = do rtBodyBytes(req)
+            let n = w.upSizes[at] + len(body)
+            if len(body) > w.uploadCap || n > w.uploadTotalCap:
+                w.upSizes[at] = n
+                let big = do rtTextError(413, "upload too large or write failed")
+                return RtHandled{resp: big, w: w}
+            let wrote = writeFileAt(dir + "/" + w.upIds[at] + ".part", w.upSizes[at], body)
+            w.upSizes[at] = n
+            let r2 = do rtJSONResponse(200, "{\"received\":" + n + "}\n")
+            return RtHandled{resp: r2, w: w}
+        if op == "finish":
+            if at < 0:
+                let u2 = do rtTextError(404, "unknown upload session")
+                return RtHandled{resp: u2, w: w}
+            let name2 = w.upNames[at]
+            let moved = renameFile(dir + "/" + w.upIds[at] + ".part", dir + "/" + name2)
+            w = do rtDropUploadSession(w, at)
+            let done = do rtUploadedJSON(name2)
+            return RtHandled{resp: done, w: w}
+        if op == "abort":
+            if at >= 0:
+                let gone = removeFile(dir + "/" + w.upIds[at] + ".part")
+                w = do rtDropUploadSession(w, at)
+            let r3 = do rtJSONResponse(200, "{\"ok\":true}\n")
+            return RtHandled{resp: r3, w: w}
+        let nf = do rtNotFound()
+        return RtHandled{resp: nf, w: w}
+
+    # ── GET /uploads/<name> ─────────────────────────────────────────────
+    # rtMimeType: mime.TypeByExtension for the extensions a stored upload
+    # has (net/http's ServeFile sniffs the rest; a text file is served as
+    # text/plain; charset=utf-8).
+    proc rtMimeType(ext: text) -> text:
+        let hls = do rtHlsContentType(ext)
+        if hls != "":
+            return hls
+        if ext == ".txt":
+            return "text/plain; charset=utf-8"
+        if ext == ".html" || ext == ".htm":
+            return "text/html; charset=utf-8"
+        if ext == ".css":
+            return "text/css; charset=utf-8"
+        if ext == ".js" || ext == ".mjs":
+            return "text/javascript; charset=utf-8"
+        if ext == ".json":
+            return "application/json"
+        if ext == ".png":
+            return "image/png"
+        if ext == ".jpg" || ext == ".jpeg":
+            return "image/jpeg"
+        if ext == ".gif":
+            return "image/gif"
+        if ext == ".webp":
+            return "image/webp"
+        if ext == ".svg":
+            return "image/svg+xml"
+        if ext == ".avif":
+            return "image/avif"
+        if ext == ".mp4":
+            return "video/mp4"
+        if ext == ".webm":
+            return "video/webm"
+        if ext == ".mp3":
+            return "audio/mpeg"
+        if ext == ".pdf":
+            return "application/pdf"
+        if ext == ".xml":
+            return "text/xml; charset=utf-8"
+        if ext == ".wasm":
+            return "application/wasm"
+        return "application/octet-stream"
+
+    proc rtHlsContentType(ext: text) -> text:
+        if ext == ".m3u8":
+            return "application/vnd.apple.mpegurl"
+        if ext == ".ts":
+            return "video/mp2t"
+        if ext == ".m4s":
+            return "video/iso.segment"
+        if ext == ".mpd":
+            return "application/dash+xml"
+        return ""
+
+    proc rtExtOf(name: text) -> text:
+        let mut i = len(name) - 1
+        loop i >= 0:
+            if charAt(name, i) == ".":
+                return lower(slice(name, i, len(name)))
+            i = i - 1
+        return ""
+
+    # rtMediaSig / rtMediaAccessOK: a signed media link's exp/sig, over the
+    # name and expiry under the signing key (media.go's mediaSig).
+    proc rtMediaSig(w: RtWorld, name: text, exp: int) -> text:
+        let s = do rtSign(w, "media:" + name + ":" + exp)
+        return s
+
+    proc rtMediaAccessOK(w: RtWorld, name: text, query: text) -> bool:
+        if w.mediaTTL <= 0:
+            return true
+        let expT = do rtQueryValue(query, "exp")
+        let num = do rtIsNumericText(expT)
+        if expT == "" || !num:
+            return false
+        let exp = toInt(expT)
+        if nowMs() / 1000 > exp:
+            return false
+        let sig = do rtQueryValue(query, "sig")
+        let want = do rtMediaSig(w, name, exp)
+        return sig == want
+
+    proc rtHandleUploads(w0: RtWorld, req: HttpServerRequest) -> RtHandled uses io.file:
+        let mut w = w0
+        let name = slice(req.path, 9, len(req.path))
+        let sl = do rtIndexOfText(name, "/")
+        let bsl = do rtIndexOfText(name, "\\")
+        let dd = do rtIndexOfText(name, "..")
+        if name == "" || sl >= 0 || bsl >= 0 || dd >= 0:
+            let nf = do rtNotFound()
+            return RtHandled{resp: nf, w: w}
+        let ok = do rtMediaAccessOK(w, name, req.query)
+        if !ok:
+            let fb = do rtTextError(403, "expired or invalid media link")
+            return RtHandled{resp: fb, w: w}
+        let path = rtUploadDir(w) + "/" + name
+        let exists = fileExists(path)
+        if !exists:
+            let nf2 = do rtNotFound()
+            return RtHandled{resp: nf2, w: w}
+        let size = fileSize(path)
+        let data = readFileAt(path, 0, size)
+        let ext = do rtExtOf(name)
+        let mtime = fileModTime(path)
+        let lm = do httpServerDate(mtime)
+        let headers = [HttpHeader{name: "accept-ranges", value: "bytes"}, HttpHeader{name: "content-type", value: rtMimeType(ext)}, HttpHeader{name: "last-modified", value: lm}, HttpHeader{name: "x-facet-body-b64", value: base64UrlRaw(data)}]
+        return RtHandled{resp: HttpServerResponse{status: 200, reason: "", headers: headers, body: ""}, w: w}

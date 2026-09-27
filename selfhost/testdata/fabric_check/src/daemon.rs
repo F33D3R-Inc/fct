@@ -491,6 +491,42 @@ fn loaded_poll_case(line: &str) -> String {
     })
 }
 
+/// A `daemon-movers` line: `;`-separated steps over one MoverSupervisor —
+/// `refuse:<id>:<reason>`, `retain:<id,id,...>`, `stop:<id>`, `stop_all` —
+/// then `active=[id>dest,...]|refusals=[id=reason,...]` in the supervisor's
+/// own (BTreeMap, u64) order. Only the operations that need no copy task
+/// are scripted: `ensure` spawns one, so it is the live tests' to drive.
+fn movers_case(line: &str) -> String {
+    use fabric_controller::ActionId;
+    use fabric_daemon::mover::MoverSupervisor;
+    let mut supervisor = MoverSupervisor::new();
+    for step in line.split(';').filter(|s| !s.is_empty()) {
+        let mut parts = step.splitn(3, ':');
+        match parts.next().unwrap() {
+            "refuse" => {
+                let id: u64 = parts.next().unwrap().parse().unwrap();
+                supervisor.refuse(ActionId(id), parts.next().unwrap_or(""));
+            }
+            "retain" => {
+                let live: Vec<u64> = parts
+                    .next()
+                    .unwrap_or("")
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse().unwrap())
+                    .collect();
+                supervisor.retain(|id| live.contains(&id.0));
+            }
+            "stop" => supervisor.stop(ActionId(parts.next().unwrap().parse().unwrap())),
+            "stop_all" => supervisor.stop_all(),
+            other => panic!("unknown movers step {other:?}"),
+        }
+    }
+    let active: Vec<String> = supervisor.active().iter().map(|(id, d)| format!("{id}>{d}")).collect();
+    let refusals: Vec<String> = supervisor.refusals().iter().map(|r| format!("{}={}", r.id, r.reason)).collect();
+    format!("active=[{}]|refusals=[{}]", active.join(","), refusals.join(","))
+}
+
 pub fn run(mode: &str) {
     match mode {
         "daemon-config" => {
@@ -519,6 +555,11 @@ pub fn run(mode: &str) {
             }
         }
         "daemon-control" => crate::daemon_control::run(mode),
+        "daemon-movers" => {
+            for line in stdin_lines() {
+                println!("{}", movers_case(&line));
+            }
+        }
         "daemon-loaded-poll" => {
             for line in stdin_lines() {
                 println!("{}", loaded_poll_case(&line));

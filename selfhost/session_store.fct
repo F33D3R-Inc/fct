@@ -1,0 +1,462 @@
+import "runtime_json.fct"
+import "runtime_css.fct"
+import "render_html.fct"
+import "http_server.fct"
+
+app SessionStore:
+    # session_store.fct — the runtime's world (runtime/server.go's Server
+    # fields a request reads and an action writes: the entity working set
+    # and its id counters, the sessions, the write sequence, the live
+    # subscribers) and its sessions (Server.session / newSession /
+    # rotateSession / scope / fullStore / identityScope), plus secret.go's
+    # signing: FACET_SECRET → a "sign" subkey by SHA-256 → HMAC-SHA256 →
+    # base64url, for the `fa_sid` cookie and the per-session CSRF token.
+    # A random ephemeral secret when FACET_SECRET is unset, as in Go.
+    #
+    # One RtWorld value is owned by the server loop (runtime_server.fct) and
+    # threaded through every handler; nothing here is shared between tasks.
+    struct RtSession:
+        sid: text
+        actor: text
+        role: text
+        verified: bool
+        visitor: text
+        expires: int
+        pendingMFA: text
+        stateKeys: [text]
+        stateVals: [Val]
+
+    struct RtSub:
+        ch: int
+        actor: text
+        role: text
+        verified: bool
+        tenant: int
+        tenantRole: text
+        session: text
+
+    struct RtWorld:
+        g: IRGraph
+        entNames: [text]
+        entRows: [Val]
+        nextIds: [int]
+        sessions: [RtSession]
+        writeSeq: int
+        subs: [RtSub]
+        signKey: [int]
+        secure: bool
+        cssBody: text
+        cssVer: text
+        lockNames: [text]
+        lockCounts: [int]
+        lockFirst: [int]
+        lockUntil: [int]
+        # FACET_API_READ (apiread.go's apiReadFromEnv): the entities the JSON
+        # API serves rows of, each with its zero-argument guard policy or "".
+        apiReadNames: [text]
+        apiReadGuards: [text]
+        # the declared routes' rate buckets (apidecl.go's rateClasses):
+        # key "class\nip" → tokens, last refill (monoMs)
+        rateKeys: [text]
+        rateTokens: [float]
+        rateLast: [int]
+        rateClassNames: [text]
+        rateClassLimits: [int]
+        rateDefault: int
+        # uploads: the directory, the caps (FACET_MAX_UPLOAD_MB /
+        # FACET_MAX_MEDIA_MB), signed media (FACET_MEDIA_TTL), and the
+        # resumable sessions in flight (id, final name, bytes so far).
+        uploadDir: text
+        uploadCap: int
+        uploadTotalCap: int
+        mediaTTL: int
+        upIds: [text]
+        upNames: [text]
+        upSizes: [int]
+        # the contract this process serves (contracthistory.go)
+        contractRaw: text
+        contractVersion: text
+        contractGenerated: int
+        schemaVersion: int
+
+    proc rtSessionTTLms() -> int:
+        return 24 * 60 * 60 * 1000
+
+    # ── signing ─────────────────────────────────────────────────────────
+    proc rtSignKey(master: text) -> [int]:
+        let k = sha256Bytes(textToBytes("facet:sign:" + master))
+        return k
+
+    proc rtSign(w: RtWorld, msg: text) -> text:
+        let mac = hmacSha256(w.signKey, textToBytes(msg))
+        return base64UrlRaw(mac)
+
+    proc rtSignValue(w: RtWorld, v: text) -> text:
+        let s = do rtSign(w, v)
+        return v + "." + s
+
+    struct RtVerified:
+        ok: bool
+        value: text
+
+    proc rtVerifySigned(w: RtWorld, s: text) -> RtVerified:
+        let mut dot = -1
+        let mut i = len(s) - 1
+        loop i >= 0 && dot < 0:
+            if charAt(s, i) == ".":
+                dot = i
+            i = i - 1
+        if dot < 0:
+            return RtVerified{ok: false, value: ""}
+        let v = slice(s, 0, dot)
+        let sig = slice(s, dot + 1, len(s))
+        let want = do rtSign(w, v)
+        if sig != want:
+            return RtVerified{ok: false, value: ""}
+        return RtVerified{ok: true, value: v}
+
+    proc rtCsrfToken(w: RtWorld, sid: text) -> text:
+        let t = do rtSign(w, "csrf:" + sid)
+        return t
+
+    proc rtHashToken(w: RtWorld, token: text) -> text:
+        let t = do rtSign(w, "token:" + token)
+        return t
+
+    # rtNewSessionID: newSessionID — 24 random bytes, base64url.
+    proc rtNewSessionID() -> text:
+        let b = randomBytes(24)
+        return base64UrlRaw(b)
+
+    # ── the world ───────────────────────────────────────────────────────
+    # rtApiReadRules: apiReadFromEnv — "*" publishes every declared entity;
+    # "Name" or "Name:policy" one; an unknown entity, an undeclared policy
+    # or one with parameters is a warning in Go and stays closed here too.
+    struct RtApiRead:
+        names: [text]
+        guards: [text]
+
+    proc rtApiReadRules(g: IRGraph, spec0: text) -> RtApiRead:
+        let spec = trim(spec0)
+        let mut names = []
+        let mut guards = []
+        if spec == "":
+            return RtApiRead{names: names, guards: guards}
+        let parts = split(spec, ",")
+        let mut i = 0
+        loop i < len(parts):
+            let part = trim(parts[i])
+            if part == "*":
+                let mut e = 0
+                loop e < len(g.entities):
+                    let reserved = do rtIsReservedEntity(g.entities[e].name)
+                    if !reserved:
+                        names = append(names, g.entities[e].name)
+                        guards = append(guards, "")
+                    e = e + 1
+            else:
+                if part != "":
+                    let mut name = part
+                    let mut guard = ""
+                    let c = do rtIndexOfText(part, ":")
+                    if c >= 0:
+                        name = trim(slice(part, 0, c))
+                        guard = trim(slice(part, c + 1, len(part)))
+                    let reserved2 = do rtIsReservedEntity(name)
+                    let ei = do rtEntityIndex(g, name)
+                    let mut ok = ei >= 0 && !reserved2
+                    if ok && guard != "":
+                        let pi = do rtPolicyIndex(g, guard)
+                        ok = pi >= 0 && len(g.policies[pi].params) == 0
+                    if ok:
+                        names = append(names, name)
+                        guards = append(guards, guard)
+            i = i + 1
+        return RtApiRead{names: names, guards: guards}
+
+    proc rtWorldNew(g: IRGraph, master: text, apiRead: text) -> RtWorld:
+        let mut names = []
+        let mut rows = []
+        let mut ids = []
+        let mut i = 0
+        loop i < len(g.entities):
+            names = append(names, g.entities[i].name)
+            rows = append(rows, listVal([]))
+            ids = append(ids, 0)
+            i = i + 1
+        let key = do rtSignKey(master)
+        let css = do rtStylesheet(g)
+        let ver = do rtStylesheetVersion(css)
+        let rules = do rtApiReadRules(g, apiRead)
+        return RtWorld{g: g, entNames: names, entRows: rows, nextIds: ids, sessions: [], writeSeq: 0, subs: [], signKey: key, secure: false, cssBody: css, cssVer: ver, lockNames: [], lockCounts: [], lockFirst: [], lockUntil: [], apiReadNames: rules.names, apiReadGuards: rules.guards, rateKeys: [], rateTokens: [], rateLast: [], rateClassNames: [], rateClassLimits: [], rateDefault: 0, uploadDir: "", uploadCap: 10 * 1024 * 1024, uploadTotalCap: 200 * 1024 * 1024, mediaTTL: 0, upIds: [], upNames: [], upSizes: [], contractRaw: "", contractVersion: "", contractGenerated: 0, schemaVersion: 0}
+
+    proc rtEntIndex(w: RtWorld, name: text) -> int:
+        let mut i = 0
+        loop i < len(w.entNames):
+            if w.entNames[i] == name:
+                return i
+            i = i + 1
+        return -1
+
+    proc rtEntRows(w: RtWorld, name: text) -> [Val]:
+        let i = do rtEntIndex(w, name)
+        if i < 0:
+            return []
+        return w.entRows[i].items
+
+    proc rtSetEntRows(w0: RtWorld, name: text, rows: [Val]) -> RtWorld:
+        let mut w = w0
+        let i = do rtEntIndex(w, name)
+        if i >= 0:
+            w.entRows[i] = listVal(rows)
+        return w
+
+    proc rtIsReservedEntity(name: text) -> bool:
+        return name == "FacetUser" || name == "FacetTenant" || name == "FacetMembership" || name == "FacetInvite" || name == "FacetSubscription" || name == "FacetUsage" || name == "FacetContractVersion"
+
+    # ── sessions ────────────────────────────────────────────────────────
+    proc rtSessionIndex(w: RtWorld, sid: text) -> int:
+        let mut i = 0
+        loop i < len(w.sessions):
+            if w.sessions[i].sid == sid:
+                return i
+            i = i + 1
+        return -1
+
+    # rtNewSession: newSession — a fresh identity with the server-placed
+    # state cells at their declared defaults.
+    proc rtNewSession(w: RtWorld, sid: text, actor: text, role: text) -> RtSession:
+        let mut keys = []
+        let mut vals = []
+        let empty = do rtScopeNew()
+        let mut i = 0
+        loop i < len(w.g.states):
+            let st = w.g.states[i]
+            if st.placement == "server":
+                let r = do rtEvalOpt(st.init, empty, -1)
+                keys = append(keys, st.name)
+                vals = append(vals, r.v)
+            i = i + 1
+        let visitor = do rtNewSessionID()
+        return RtSession{sid: sid, actor: actor, role: role, verified: false, visitor: visitor, expires: nowMs() + rtSessionTTLms(), pendingMFA: "", stateKeys: keys, stateVals: vals}
+
+    proc rtPutSession(w0: RtWorld, ses: RtSession) -> RtWorld:
+        let mut w = w0
+        let i = do rtSessionIndex(w, ses.sid)
+        if i >= 0:
+            w.sessions[i] = ses
+            return w
+        w.sessions = append(w.sessions, ses)
+        return w
+
+    proc rtDropSession(w0: RtWorld, sid: text) -> RtWorld:
+        let mut w = w0
+        let mut out = []
+        let mut i = 0
+        loop i < len(w.sessions):
+            if w.sessions[i].sid != sid:
+                out = append(out, w.sessions[i])
+            i = i + 1
+        w.sessions = out
+        return w
+
+    # rtCookieValue: the value of one cookie on a request, "" when absent.
+    proc rtCookieValue(headers: [HttpHeader], name: text) -> text:
+        let mut i = 0
+        loop i < len(headers):
+            if headers[i].name == "cookie":
+                let parts = split(headers[i].value, ";")
+                let mut k = 0
+                loop k < len(parts):
+                    let p = trim(parts[k])
+                    let eq = do rtIndexOfText(p, "=")
+                    if eq > 0 && slice(p, 0, eq) == name:
+                        return slice(p, eq + 1, len(p))
+                    k = k + 1
+            i = i + 1
+        return ""
+
+    proc rtHeaderValue(headers: [HttpHeader], name: text) -> text:
+        let mut i = 0
+        loop i < len(headers):
+            if headers[i].name == name:
+                return headers[i].value
+            i = i + 1
+        return ""
+
+    # rtSetCookieHeader: http.SetCookie's spelling of the session cookie.
+    proc rtSetCookieHeader(w: RtWorld, sid: text) -> HttpHeader:
+        let signed = do rtSignValue(w, sid)
+        let exp = do httpServerDate((nowMs() + rtSessionTTLms()) / 1000)
+        let mut v = "fa_sid=" + signed + "; Path=/; Expires=" + exp + "; Max-Age=" + (rtSessionTTLms() / 1000) + "; HttpOnly"
+        if w.secure:
+            v = v + "; Secure"
+        v = v + "; SameSite=Lax"
+        return HttpHeader{name: "set-cookie", value: v}
+
+    # RtSessionOut: Server.session's answer — the sid, the world (a new or
+    # slid session), and the cookie to stamp.
+    struct RtSessionOut:
+        sid: text
+        w: RtWorld
+        cookie: HttpHeader
+
+    proc rtQueryValue(query: text, name: text) -> text:
+        let parts = split(query, "&")
+        let mut i = 0
+        loop i < len(parts):
+            let p = parts[i]
+            let eq = do rtIndexOfText(p, "=")
+            if eq > 0 && slice(p, 0, eq) == name:
+                let raw = slice(p, eq + 1, len(p))
+                let dec = do rtPathUnescape(replace(raw, "+", " "))
+                return dec
+            if eq < 0 && p == name:
+                return ""
+            i = i + 1
+        return ""
+
+    # rtSession: Server.session — resolve or mint the caller's session from
+    # the signed cookie; every call slides the expiry and re-stamps.
+    proc rtSession(w0: RtWorld, req: HttpServerRequest) -> RtSessionOut:
+        let mut w = w0
+        let now = nowMs()
+        let raw = do rtCookieValue(req.headers, "fa_sid")
+        if raw != "":
+            let v = do rtVerifySigned(w, raw)
+            if v.ok:
+                let i = do rtSessionIndex(w, v.value)
+                if i >= 0:
+                    if now < w.sessions[i].expires:
+                        let mut ses = w.sessions[i]
+                        ses.expires = now + rtSessionTTLms()
+                        w.sessions[i] = ses
+                        let ck = do rtSetCookieHeader(w, v.value)
+                        return RtSessionOut{sid: v.value, w: w, cookie: ck}
+                    w = do rtDropSession(w, v.value)
+        let sid = do rtNewSessionID()
+        let mut ses2 = do rtNewSession(w, sid, "guest", "guest")
+        if !w.g.auth:
+            if req.hasQuery:
+                let as = do rtQueryValue(req.query, "as")
+                if as != "":
+                    ses2.actor = as
+        w = do rtPutSession(w, ses2)
+        let ck2 = do rtSetCookieHeader(w, sid)
+        return RtSessionOut{sid: sid, w: w, cookie: ck2}
+
+    # rtSidForRequest: sidForRequest — the live session a bearer token or
+    # cookie names, read-only; "" for none. A signed-in session slides.
+    struct RtSidOut:
+        sid: text
+        w: RtWorld
+
+    proc rtSidForRequest(w0: RtWorld, req: HttpServerRequest) -> RtSidOut:
+        let mut w = w0
+        let mut raw = ""
+        let auth = do rtHeaderValue(req.headers, "authorization")
+        if len(auth) > 7 && slice(auth, 0, 7) == "Bearer ":
+            raw = trim(slice(auth, 7, len(auth)))
+        else:
+            raw = do rtCookieValue(req.headers, "fa_sid")
+        if raw == "":
+            return RtSidOut{sid: "", w: w}
+        let v = do rtVerifySigned(w, raw)
+        if !v.ok:
+            return RtSidOut{sid: "", w: w}
+        let i = do rtSessionIndex(w, v.value)
+        if i < 0:
+            return RtSidOut{sid: "", w: w}
+        let now = nowMs()
+        if now >= w.sessions[i].expires:
+            return RtSidOut{sid: "", w: w}
+        if w.sessions[i].actor != "" && w.sessions[i].actor != "guest":
+            let mut ses = w.sessions[i]
+            ses.expires = now + rtSessionTTLms()
+            w.sessions[i] = ses
+        return RtSidOut{sid: v.value, w: w}
+
+    # rtRotateSession: rotateSession — a new identifier for an existing
+    # session; the old one retired.
+    struct RtRotated:
+        sid: text
+        w: RtWorld
+        cookie: HttpHeader
+
+    proc rtRotateSession(w0: RtWorld, old: text) -> RtRotated:
+        let mut w = w0
+        let fresh = do rtNewSessionID()
+        let i = do rtSessionIndex(w, old)
+        if i >= 0:
+            let mut ses = w.sessions[i]
+            ses.sid = fresh
+            w.sessions[i] = ses
+        let ck = do rtSetCookieHeader(w, fresh)
+        return RtRotated{sid: fresh, w: w, cookie: ck}
+
+    # ── scopes ──────────────────────────────────────────────────────────
+    # rtScope: Server.scope — identity, every non-reserved entity's rows,
+    # the session's own state.
+    proc rtScope(w: RtWorld, sid: text) -> RtScope:
+        let mut sc = do rtScopeNew()
+        let mut actor = "guest"
+        let mut role = "guest"
+        let mut verified = false
+        let mut visitor = ""
+        let i = do rtSessionIndex(w, sid)
+        if i >= 0:
+            actor = w.sessions[i].actor
+            role = w.sessions[i].role
+            verified = w.sessions[i].verified
+            visitor = w.sessions[i].visitor
+        sc = do rtSet(sc, "actor", textVal(actor))
+        sc = do rtSet(sc, "role", textVal(role))
+        sc = do rtSet(sc, "verified", boolVal(verified))
+        sc = do rtSet(sc, "session", textVal(visitor))
+        sc = do rtSet(sc, "tenant", intVal(0))
+        sc = do rtSet(sc, "tenantRole", textVal(""))
+        let mut e = 0
+        loop e < len(w.entNames):
+            let reserved = do rtIsReservedEntity(w.entNames[e])
+            if !reserved:
+                sc = do rtSet(sc, w.entNames[e], w.entRows[e])
+            e = e + 1
+        if i >= 0:
+            let mut k = 0
+            loop k < len(w.sessions[i].stateKeys):
+                let key = w.sessions[i].stateKeys[k]
+                if len(key) < 2 || slice(key, 0, 2) != "__":
+                    sc = do rtSet(sc, key, w.sessions[i].stateVals[k])
+                k = k + 1
+        return sc
+
+    # rtFullStore: fullStore — the scope plus the client-placed cells at
+    # their defaults.
+    proc rtFullStore(w: RtWorld, sid: text) -> RtScope:
+        let mut sc = do rtScope(w, sid)
+        let empty = do rtScopeNew()
+        let mut i = 0
+        loop i < len(w.g.states):
+            let st = w.g.states[i]
+            if st.placement == "client":
+                let r = do rtEvalOpt(st.init, empty, -1)
+                sc = do rtSet(sc, st.name, r.v)
+            i = i + 1
+        return sc
+
+    proc rtPolicyIndex(g: IRGraph, name: text) -> int:
+        let mut i = 0
+        loop i < len(g.policies):
+            if g.policies[i].name == name:
+                return i
+            i = i + 1
+        return -1
+
+    # rtGuardOK: guardOK — a zero-argument policy over the scope.
+    proc rtGuardOK(g: IRGraph, policy: text, sc: RtScope) -> bool:
+        let pi = do rtPolicyIndex(g, policy)
+        if pi < 0:
+            return false
+        let r = do rtEvalOpt(g.policies[pi].expr, sc, -1)
+        let ok = do valTruthy(r.v)
+        return ok

@@ -166,6 +166,7 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 	errResp := func(desc string) map[string]any {
 		return map[string]any{"description": desc, "content": map[string]any{"application/json": map[string]any{"schema": nullable(ref(errorSchemaName))}}}
 	}
+	basicSchemes := map[string]bool{} // `auth <scheme> basic …` schemes some route uses
 	for _, a := range g.APIs {
 		if a.Dispatch != "" {
 			if paths[a.Path] == nil {
@@ -221,8 +222,8 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 		var bodyWireParams []ir.Param // POST/PUT/PATCH params that bind from the JSON body, in order
 		hasBytesBody := false         // a `bytes` param uploads a file: the body is multipart, not JSON
 		for _, p := range act.Params {
-			if p.Name == a.Bearer {
-				continue // carried as `Authorization: Bearer`, described by security
+			if p.Name == a.Bearer || p.Name == a.BasicID || p.Name == a.BasicSecret {
+				continue // carried in the Authorization header, described by security
 			}
 			schema := wireSchema(p.Type, p.List, g, usedEntities)
 			switch {
@@ -297,6 +298,8 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 			contentType := "application/json"
 			if hasBytesBody {
 				contentType = "multipart/form-data"
+			} else if a.Form {
+				contentType = "application/x-www-form-urlencoded"
 			}
 			op["requestBody"] = map[string]any{"required": true, "content": map[string]any{contentType: map[string]any{"schema": bodySchema}}}
 		}
@@ -317,6 +320,12 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 			with(code, http.StatusText(code))
 		}
 		switch {
+		case a.BasicID != "":
+			if _, ok := responses["401"]; !ok {
+				with(401, "Unauthorized")
+			}
+			op["security"] = []map[string]any{{a.Auth: []string{}}}
+			basicSchemes[a.Auth] = true
 		case a.Auth == "session", a.Bearer != "":
 			if _, ok := responses["401"]; !ok {
 				with(401, "Unauthorized")
@@ -511,11 +520,15 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 			bearerDesc = c.Bearer
 		}
 	}
+	securitySchemes := map[string]any{"bearer": map[string]any{"type": "http", "scheme": "bearer", "bearerFormat": "opaque", "description": bearerDesc}}
+	for scheme := range basicSchemes {
+		securitySchemes[scheme] = map[string]any{"type": "http", "scheme": "basic", "description": "The app's client id and secret as HTTP Basic credentials (`Authorization: Basic base64(client_id:client_secret)`)."}
+	}
 	doc := map[string]any{
 		"openapi":           "3.1.0",
 		"info":              map[string]any{"title": title, "version": "", "description": description},
 		"paths":             paths,
-		"components":        map[string]any{"schemas": schemas, "securitySchemes": map[string]any{"bearer": map[string]any{"type": "http", "scheme": "bearer", "bearerFormat": "opaque", "description": bearerDesc}}},
+		"components":        map[string]any{"schemas": schemas, "securitySchemes": securitySchemes},
 		"security":          []map[string]any{{"bearer": []string{}}},
 		"x-schema-version":  schemaVersion,
 		"x-stream-events":   streamEvents,

@@ -1,0 +1,1634 @@
+import "eval.fct"
+import "ir_graph.fct"
+
+app RuntimeEvalIR:
+    # runtime_eval_ir.fct — runtime/eval.go's eval()/evalColl()/evalRest()
+    # over the LOWERED IR (ir_expr.fct's IRExpr, as the compiler emits it),
+    # with region.go's materializer: the per-render memo of every aggregate
+    # and entity lookup, keyed by render path and the expression's ordinal
+    # in the page's static walk (aggIndex), which is what a page's `@aggs`
+    # bootstrap carries. The value model is eval.fct's Val (its applyBin /
+    # callBuiltin / toStr are reused as they are); a row is a "record" Val.
+    #
+    # A scope is one value threaded through evaluation and handed back with
+    # the result (RtOut), because the materializer records into it and a
+    # proc cannot mutate its arguments. Names and values are parallel lists,
+    # the convention every port here uses in place of a map.
+    #
+    # ORDINALS. Go's aggIndex gives every agg/eget expression of a page an
+    # index by pointer identity, in preorder over the page's static tree.
+    # There is no pointer identity here, so an expression's ordinal is
+    # computed structurally: the caller passes the ordinal the expression
+    # would get (`base`), and each sub-expression's is base plus the number
+    # of agg/eget nodes in the kids that precede it in ir.Expr.Kids order
+    # (l, r, x, obj, key, where, sel, limit, keys…, args…). `base` < 0 means
+    # the expression is not in any page's index (a policy, a state init, an
+    # action body): nothing is recorded or looked up, as in Go.
+    struct RtScope:
+        names: [text]
+        vals: [Val]
+        matOn: bool
+        matPath: text
+        matKeys: [text]
+        matVals: [Val]
+        unaddressed: int
+        # err: a proc's failure (an index out of bounds, a field of a value
+        # that is not a struct, an unknown proc) — the error the Go engine
+        # returns, carried on the scope so every evaluation site can hand
+        # it back without a second return slot. "" while nothing failed.
+        err: text
+        # given: the parameters an action's caller actually sent (`given(p)`).
+        given: [text]
+
+    struct RtOut:
+        v: Val
+        sc: RtScope
+
+    proc rtScopeNew() -> RtScope:
+        return RtScope{names: [], vals: [], matOn: false, matPath: "", matKeys: [], matVals: [], unaddressed: 0, err: "", given: []}
+
+    proc rtGet(sc: RtScope, name: text) -> Val:
+        let v = do lookupRef(name, sc.names, sc.vals)
+        return v
+
+    proc rtHas(sc: RtScope, name: text) -> bool:
+        let mut k = 0
+        loop k < len(sc.names):
+            if sc.names[k] == name:
+                return true
+            k = k + 1
+        return false
+
+    proc rtSet(sc0: RtScope, name: text, v: Val) -> RtScope:
+        let mut sc = sc0
+        let mut k = 0
+        loop k < len(sc.names):
+            if sc.names[k] == name:
+                sc.vals[k] = v
+                return sc
+            k = k + 1
+        sc.names = append(sc.names, name)
+        sc.vals = append(sc.vals, v)
+        return sc
+
+    # rtDrop: the scope without `name` (Go's delete(scope, name)).
+    proc rtDrop(sc0: RtScope, name: text) -> RtScope:
+        let mut sc = sc0
+        let mut names = []
+        let mut vals = []
+        let mut k = 0
+        loop k < len(sc.names):
+            if sc.names[k] != name:
+                names = append(names, sc.names[k])
+                vals = append(vals, sc.vals[k])
+            k = k + 1
+        sc.names = names
+        sc.vals = vals
+        return sc
+
+    # ── escaping ────────────────────────────────────────────────────────
+    # rtEsc: html.EscapeString — & < > " ' in that order (& first, so the
+    # entities it writes are not re-escaped).
+    proc rtEsc(s: text) -> text:
+        let a = replace(s, "&", "&amp;")
+        let b = replace(a, "<", "&lt;")
+        let c = replace(b, ">", "&gt;")
+        let d = replace(c, "\"", "&#34;")
+        let e = replace(d, "'", "&#39;")
+        return e
+
+    proc rtHasPrefix(s: text, p: text) -> bool:
+        if len(s) < len(p):
+            return false
+        return slice(s, 0, len(p)) == p
+
+    # ── ordinals ─────────────────────────────────────────────────────────
+    proc rtIsAggKind(kind: text) -> bool:
+        return kind == "agg" || kind == "eget"
+
+    proc rtAggCountList(xs: [IRExpr]) -> int:
+        let mut n = 0
+        let mut k = 0
+        loop k < len(xs):
+            let c = do rtAggCount(xs[k])
+            n = n + c
+            k = k + 1
+        return n
+
+    # rtAggCount: how many agg/eget expressions e holds, itself included.
+    proc rtAggCount(e: IRExpr) -> int:
+        let mut n = 0
+        let self = do rtIsAggKind(e.kind)
+        if self:
+            n = 1
+        let a = do rtAggCountList(e.l)
+        let b = do rtAggCountList(e.r)
+        let c = do rtAggCountList(e.x)
+        let d = do rtAggCountList(e.obj)
+        let f = do rtAggCountList(e.key)
+        let g = do rtAggCountList(e.where)
+        let h = do rtAggCountList(e.sel)
+        let i = do rtAggCountList(e.limit)
+        let j = do rtAggCountList(e.keys)
+        let k = do rtAggCountList(e.args)
+        return n + a + b + c + d + f + g + h + i + j + k
+
+    proc rtBaseAfter(base: int, xs: [IRExpr]) -> int:
+        if base < 0:
+            return -1
+        let c = do rtAggCountList(xs)
+        return base + c
+
+    proc rtMatKey(path: text, i: int) -> text:
+        return path + "|" + i
+
+    proc rtMatLookupAt(sc: RtScope, key: text) -> int:
+        let mut k = 0
+        loop k < len(sc.matKeys):
+            if sc.matKeys[k] == key:
+                return k
+            k = k + 1
+        return -1
+
+    proc rtRecord(sc0: RtScope, base: int, v: Val) -> RtScope:
+        let mut sc = sc0
+        if !sc.matOn || sc.unaddressed > 0 || base < 0:
+            return sc
+        let key = do rtMatKey(sc.matPath, base)
+        let at = do rtMatLookupAt(sc, key)
+        if at >= 0:
+            sc.matVals[at] = v
+            return sc
+        sc.matKeys = append(sc.matKeys, key)
+        sc.matVals = append(sc.matVals, v)
+        return sc
+
+    # ── evaluation ───────────────────────────────────────────────────────
+    proc rtEvalList(xs: [IRExpr], sc0: RtScope, base: int) -> RtOut:
+        let mut sc = sc0
+        let mut out = []
+        let mut b = base
+        let mut k = 0
+        loop k < len(xs):
+            let r = do rtEval(xs[k], sc, b)
+            sc = r.sc
+            out = append(out, r.v)
+            if b >= 0:
+                let c = do rtAggCount(xs[k])
+                b = b + c
+            k = k + 1
+        let lv = do listVal(out)
+        return RtOut{v: lv, sc: sc}
+
+    proc rtEvalOpt(xs: [IRExpr], sc0: RtScope, base: int) -> RtOut:
+        if len(xs) == 0:
+            let none = do noneVal()
+            return RtOut{v: none, sc: sc0}
+        let r = do rtEval(xs[0], sc0, base)
+        return r
+
+    proc rtLit(e: IRExpr) -> Val:
+        if e.vtype == "int":
+            let iv = do intVal(toInt(e.val))
+            return iv
+        if e.vtype == "float":
+            let fv = do floatVal(toFloat(e.val))
+            return fv
+        if e.vtype == "bool":
+            let bv = do boolVal(e.val == "true")
+            return bv
+        let tv = do textVal(e.val)
+        return tv
+
+    proc rtEval(e: IRExpr, sc0: RtScope, base: int) -> RtOut:
+        let mut sc = sc0
+        if e.kind == "lit":
+            let lv = do rtLit(e)
+            return RtOut{v: lv, sc: sc}
+        if e.kind == "ref":
+            let rv = do rtGet(sc, e.name)
+            return RtOut{v: rv, sc: sc}
+        if e.kind == "list":
+            let lr = do rtEvalList(e.args, sc, base)
+            return lr
+        if e.kind == "get":
+            let o = do rtEvalOpt(e.obj, sc, base)
+            let gv = do valGet(o.v, e.field)
+            return RtOut{v: gv, sc: o.sc}
+        if e.kind == "eget" || e.kind == "agg":
+            if sc.matOn && sc.unaddressed == 0 && base >= 0:
+                let key = do rtMatKey(sc.matPath, base)
+                let at = do rtMatLookupAt(sc, key)
+                if at >= 0:
+                    return RtOut{v: sc.matVals[at], sc: sc}
+            let cr = do rtEvalColl(e, sc, base)
+            let sc2 = do rtRecord(cr.sc, base, cr.v)
+            return RtOut{v: cr.v, sc: sc2}
+        if e.kind == "index":
+            let o = do rtEvalOpt(e.obj, sc, base)
+            let kb = do rtBaseAfter(base, e.obj)
+            let k = do rtEvalOpt(e.key, o.sc, kb)
+            let iv = do rtIndex(o.v, k.v)
+            return RtOut{v: iv, sc: k.sc}
+        if e.kind == "struct":
+            let ar = do rtEvalList(e.args, sc, base)
+            let mut keys = []
+            let mut items = []
+            let mut i = 0
+            loop i < len(e.fields):
+                if i < len(ar.v.items):
+                    keys = append(keys, e.fields[i])
+                    items = append(items, ar.v.items[i])
+                i = i + 1
+            let mut rv2 = do recordVal(keys, items)
+            rv2 = do rtOmitEmpty(rv2, e.omit)
+            rv2 = do rtNullEmpty(rv2, e.nulls)
+            return RtOut{v: rv2, sc: ar.sc}
+        if e.kind == "astate":
+            if e.op == "failed":
+                let ft = do textVal("")
+                return RtOut{v: ft, sc: sc}
+            let fb = do boolVal(false)
+            return RtOut{v: fb, sc: sc}
+        if e.kind == "call":
+            if e.name == "given" && len(e.args) == 1 && e.args[0].kind == "ref":
+                let mut g = 0
+                let mut hit = false
+                loop g < len(sc.given):
+                    if sc.given[g] == e.args[0].name:
+                        hit = true
+                    g = g + 1
+                let gv = do boolVal(hit)
+                return RtOut{v: gv, sc: sc}
+            let ar2 = do rtEvalList(e.args, sc, base)
+            sc = ar2.sc
+            if sc.err != "":
+                let noneE = do noneVal()
+                return RtOut{v: noneE, sc: sc}
+            let pi = do rtProcIndex(e.name)
+            if pi >= 0:
+                let pr = do rtRunProc(e.name, ar2.v.items)
+                if pr.sc.err != "":
+                    sc.err = pr.sc.err
+                return RtOut{v: pr.v, sc: sc}
+            let cv = do rtCall(e.name, ar2.v.items)
+            return RtOut{v: cv, sc: sc}
+        if e.kind == "un":
+            let xr = do rtEvalOpt(e.x, sc, base)
+            if e.op == "!":
+                let tx = do valTruthy(xr.v)
+                let nv = do boolVal(!tx)
+                return RtOut{v: nv, sc: xr.sc}
+            if e.op == "-":
+                let neg = do valNegate(xr.v)
+                return RtOut{v: neg, sc: xr.sc}
+            if e.op == "~":
+                let xi = do valToInt(xr.v)
+                let inv = do intVal(~xi)
+                return RtOut{v: inv, sc: xr.sc}
+            let none0 = do noneVal()
+            return RtOut{v: none0, sc: xr.sc}
+        if e.kind == "bin":
+            let rb = do rtBaseAfter(base, e.l)
+            if e.op == "&&" || e.op == "||":
+                let lr2 = do rtEvalOpt(e.l, sc, base)
+                let lt = do valTruthy(lr2.v)
+                if e.op == "&&" && !lt:
+                    let f = do boolVal(false)
+                    return RtOut{v: f, sc: lr2.sc}
+                if e.op == "||" && lt:
+                    let t = do boolVal(true)
+                    return RtOut{v: t, sc: lr2.sc}
+                let rr2 = do rtEvalOpt(e.r, lr2.sc, rb)
+                let rt = do valTruthy(rr2.v)
+                let bv2 = do boolVal(rt)
+                return RtOut{v: bv2, sc: rr2.sc}
+            let l2 = do rtEvalOpt(e.l, sc, base)
+            let r2 = do rtEvalOpt(e.r, l2.sc, rb)
+            let res = do applyBin(e.op, l2.v, r2.v)
+            return RtOut{v: res, sc: r2.sc}
+        let none5 = do noneVal()
+        return RtOut{v: none5, sc: sc}
+
+    # rtOmitEmpty: omitEmpty — an optional wire field that is none, "" or an
+    # empty list/map is left out of the record.
+    proc rtOmitEmpty(r: Val, optional: [text]) -> Val:
+        let mut out = r
+        let mut i = 0
+        loop i < len(optional):
+            let f = optional[i]
+            let has = do valHas(out, f)
+            if has:
+                let v = do valGet(out, f)
+                let empty = v.kind == "none" || (v.kind == "text" && v.t == "") || (v.kind == "list" && len(v.items) == 0) || (v.kind == "record" && len(v.keys) == 0)
+                if empty:
+                    out = do rtDropField(out, f)
+            i = i + 1
+        return out
+
+    proc rtDropField(r: Val, f: text) -> Val:
+        let mut keys = []
+        let mut items = []
+        let mut i = 0
+        loop i < len(r.keys):
+            if r.keys[i] != f:
+                keys = append(keys, r.keys[i])
+                items = append(items, r.items[i])
+            i = i + 1
+        let rv = do recordVal(keys, items)
+        return rv
+
+    # rtNullEmpty: nullEmpty — a `T or null` field that is none or "" is null.
+    proc rtNullEmpty(r: Val, nullable: [text]) -> Val:
+        let mut out = r
+        let mut i = 0
+        loop i < len(nullable):
+            let f = nullable[i]
+            let v = do valGet(out, f)
+            if v.kind == "none" || (v.kind == "text" && v.t == ""):
+                out = do valSet(out, f, noneVal())
+            i = i + 1
+        return out
+
+    # rtIndex: indexValue — a list by position, a record by key, else none.
+    proc rtIndex(obj: Val, key: Val) -> Val:
+        if obj.kind == "list":
+            let i = do valToInt(key)
+            if i >= 0 && i < len(obj.items):
+                return obj.items[i]
+            let none0 = do noneVal()
+            return none0
+        if obj.kind == "record":
+            let ks = do valToStr(key)
+            let gv = do valGet(obj, ks)
+            return gv
+        let none1 = do noneVal()
+        return none1
+
+    # rtCall: evalCall's builtins beyond eval.fct's pure port — the clock,
+    # the RNG, JSON, dates, text and byte helpers, the authority's
+    # cryptographic ones — each reached through this language's own
+    # builtin with the same argument coercion Go's callBuiltin applies.
+    # A proc's own name shadows a builtin (procRunner / procSite come
+    # first in Go), which rtEval resolves before reaching here.
+    proc rtCall(name: text, args: [Val]) -> Val:
+        let a0 = do argAt(args, 0)
+        let a1 = do argAt(args, 1)
+        let a2 = do argAt(args, 2)
+        if name == "now":
+            let nv = do intVal(nowMs() / 1000)
+            return nv
+        if name == "rand":
+            let n = do valToInt(a0)
+            if n <= 0:
+                let z = do intVal(0)
+                return z
+            let rv = do intVal(rand(n))
+            return rv
+        if name == "iso":
+            let tv = do textVal(iso(valToInt(a0)))
+            return tv
+        if name == "fromIso":
+            let fv = do intVal(fromIso(valToStr(a0)))
+            return fv
+        if name == "year":
+            let yv = do intVal(year(valToInt(a0)))
+            return yv
+        if name == "month":
+            let mv = do intVal(month(valToInt(a0)))
+            return mv
+        if name == "day":
+            let dv = do intVal(day(valToInt(a0)))
+            return dv
+        if name == "byteLen":
+            let bl = do intVal(byteLen(valToStr(a0)))
+            return bl
+        if name == "toFloat":
+            let tf = do floatVal(valToFloat(a0))
+            return tf
+        if name == "split":
+            let parts = split(valToStr(a0), valToStr(a1))
+            let mut items = []
+            let mut i = 0
+            loop i < len(parts):
+                items = append(items, textVal(parts[i]))
+                i = i + 1
+            let lv = do listVal(items)
+            return lv
+        if name == "join":
+            let mut out = ""
+            let mut j = 0
+            loop j < len(a0.items):
+                if j > 0:
+                    out = out + valToStr(a1)
+                out = out + valToStr(a0.items[j])
+                j = j + 1
+            let jv = do textVal(out)
+            return jv
+        if name == "charAt":
+            let i2 = do valToInt(a1)
+            if i2 < 0:
+                let e = do textVal("")
+                return e
+            let cv = do textVal(charAt(valToStr(a0), i2))
+            return cv
+        if name == "slice":
+            if a0.kind == "list":
+                let sl = do rtListSlice(a0.items, valToInt(a1), valToInt(a2))
+                let slv = do listVal(sl)
+                return slv
+            let ts = do rtTextSlice(valToStr(a0), valToInt(a1), valToInt(a2))
+            let tsv = do textVal(ts)
+            return tsv
+        if name == "first":
+            if a0.kind == "list" && len(a0.items) > 0:
+                return a0.items[0]
+            let none0 = do noneVal()
+            return none0
+        if name == "append":
+            let mut base = []
+            if a0.kind == "list":
+                base = a0.items
+            let ap = do listVal(append(base, a1))
+            return ap
+        if name == "fromJson":
+            let j = do jsonParse(valToStr(a0))
+            let fj = do rtJValToVal(j)
+            return fj
+        if name == "canonicalJson":
+            let cj = do rtCanonicalJSON(a0)
+            let cjv = do textVal(cj)
+            return cjv
+        if name == "textToBytes":
+            let bs = textToBytes(valToStr(a0))
+            let mut bl2 = []
+            let mut b = 0
+            loop b < len(bs):
+                bl2 = append(bl2, intVal(bs[b]))
+                b = b + 1
+            let blv = do listVal(bl2)
+            return blv
+        if name == "bytesToText":
+            let mut raw = []
+            let mut k = 0
+            loop k < len(a0.items):
+                let mut n2 = do valToInt(a0.items[k])
+                if n2 < 0:
+                    n2 = 0
+                if n2 > 255:
+                    n2 = 255
+                raw = append(raw, n2)
+                k = k + 1
+            let btv = do textVal(bytesToText(raw))
+            return btv
+        if name == "sha256Hex":
+            let hv = do textVal(sha256Hex(valToStr(a0)))
+            return hv
+        if name == "formatIn":
+            let fi = do textVal(formatIn(valToInt(a0), valToStr(a1), valToStr(a2)))
+            return fi
+        if name == "fromLocal":
+            let fl = do intVal(fromLocal(valToStr(a0), valToStr(a1)))
+            return fl
+        if name == "zoneValid":
+            let zv = do boolVal(zoneValid(valToStr(a0)))
+            return zv
+        if name == "shuffleOrder":
+            let order = shuffleOrder(valToStr(a0), valToInt(a1))
+            let mut ol = []
+            let mut o = 0
+            loop o < len(order):
+                ol = append(ol, intVal(order[o]))
+                o = o + 1
+            let olv = do listVal(ol)
+            return olv
+        if name == "randomToken":
+            let rt = do textVal(randomToken(valToInt(a0)))
+            return rt
+        if name == "totpSecret":
+            let ts2 = do textVal(totpSecret())
+            return ts2
+        if name == "totpValid":
+            let tv2 = do boolVal(totpValid(valToStr(a0), valToStr(a1)))
+            return tv2
+        if name == "verifyPassword":
+            # passwordMatches over a hash held as a value (the compiler admits
+            # only a @password field here; a runtime holds rows as values).
+            let h = do valToStr(a0)
+            let pm = do boolVal(h != "" && bcryptMatches(h, valToStr(a1)))
+            return pm
+        if name == "ed25519Verify":
+            let ev = do boolVal(ed25519Verify(valToStr(a0), valToStr(a1), valToStr(a2)))
+            return ev
+        if name == "ecdsaP256Verify":
+            let ecv = do boolVal(ecdsaP256Verify(valToStr(a0), valToStr(a1), valToStr(a2)))
+            return ecv
+        if name == "fileDigest":
+            let fd = do textVal("")
+            return fd
+        let cv2 = do callBuiltin(name, args)
+        return cv2
+
+    proc rtListSlice(xs: [Val], from0: int, to0: int) -> [Val]:
+        let n = len(xs)
+        let mut from = from0
+        let mut to = to0
+        if from < 0:
+            from = 0
+        if to > n:
+            to = n
+        if from >= to:
+            return []
+        return slice(xs, from, to)
+
+    proc rtTextSlice(s: text, from0: int, to0: int) -> text:
+        let n = len(s)
+        let mut from = from0
+        let mut to = to0
+        if from < 0:
+            from = 0
+        if to > n:
+            to = n
+        if from >= to:
+            return ""
+        return slice(s, from, to)
+
+    # ── JSON (encoding/json's Marshal over values) ───────────────────────
+    proc rtSortedIndex(keys: [text]) -> [int]:
+        let mut idx = []
+        let mut i = 0
+        loop i < len(keys):
+            let mut j = len(idx)
+            let mut placed = false
+            loop j > 0 && !placed:
+                if keys[i] < keys[idx[j - 1]]:
+                    j = j - 1
+                else:
+                    placed = true
+            idx = slice(idx, 0, j) + [i] + slice(idx, j, len(idx))
+            i = i + 1
+        return idx
+
+    # rtValJSONWith: a value as JSON; `html` selects encoding/json's
+    # default HTML-safe string escapes (a reply) or the plain ones
+    # (canonicalJson, SetEscapeHTML(false)).
+    proc rtValJSONWith(v: Val, html: bool) -> text:
+        if v.kind == "text":
+            if html:
+                let q = do jsonQuote(v.t)
+                return q
+            let q2 = do rtPlainQuote(v.t)
+            return q2
+        if v.kind == "int":
+            return "" + v.i
+        if v.kind == "float":
+            return "" + v.f
+        if v.kind == "bool":
+            if v.b:
+                return "true"
+            return "false"
+        if v.kind == "list":
+            let mut out = "["
+            let mut i = 0
+            loop i < len(v.items):
+                if i > 0:
+                    out = out + ","
+                let ej = do rtValJSONWith(v.items[i], html)
+                out = out + ej
+                i = i + 1
+            return out + "]"
+        if v.kind == "record":
+            let idx = do rtSortedIndex(v.keys)
+            let mut o = "{"
+            let mut k = 0
+            loop k < len(idx):
+                if k > 0:
+                    o = o + ","
+                let kq = do rtValJSONWith(textVal(v.keys[idx[k]]), html)
+                let vj = do rtValJSONWith(v.items[idx[k]], html)
+                o = o + kq + ":" + vj
+                k = k + 1
+            return o + "}"
+        return "null"
+
+    # rtPlainQuote: jsonQuote without the \u003c/\u003e/\u0026 escapes.
+    proc rtPlainQuote(s: text) -> text:
+        let q = do jsonQuote(s)
+        let a = replace(q, "\\u003c", "<")
+        let b = replace(a, "\\u003e", ">")
+        let c = replace(b, "\\u0026", "&")
+        return c
+
+    proc rtValJSON(v: Val) -> text:
+        let j = do rtValJSONWith(v, true)
+        return j
+
+    # rtValJSONOrdered: encoding/json over a Go STRUCT — its fields in
+    # declaration order, not sorted (only a map's keys are sorted). A
+    # record built in the struct's field order encodes as the struct does.
+    proc rtValJSONOrdered(v: Val) -> text:
+        if v.kind == "list":
+            let mut out = "["
+            let mut i = 0
+            loop i < len(v.items):
+                if i > 0:
+                    out = out + ","
+                out = out + rtValJSONOrdered(v.items[i])
+                i = i + 1
+            return out + "]"
+        if v.kind == "record":
+            let mut o = "{"
+            let mut k = 0
+            loop k < len(v.keys):
+                if k > 0:
+                    o = o + ","
+                o = o + jsonQuote(v.keys[k]) + ":" + rtValJSONOrdered(v.items[k])
+                k = k + 1
+            return o + "}"
+        let j = do rtValJSONWith(v, true)
+        return j
+
+    proc rtCanonicalJSON(v: Val) -> text:
+        let j = do rtValJSONWith(v, false)
+        return j
+
+    proc rtObjectJSON(keys: [text], vals: [Val]) -> text:
+        let rv = do recordVal(keys, vals)
+        let j = do rtValJSON(rv)
+        return j
+
+    proc rtObjectJSONRaw(keys: [text], raws: [text]) -> text:
+        let idx = do rtSortedIndex(keys)
+        let mut out = "{"
+        let mut i = 0
+        loop i < len(idx):
+            if i > 0:
+                out = out + ","
+            let kq = do jsonQuote(keys[idx[i]])
+            out = out + kq + ":" + raws[idx[i]]
+            i = i + 1
+        return out + "}"
+
+    # rtJValToVal: a parsed JSON value as a runtime value (json.Unmarshal
+    # into `any`: every number a float64; a whole one behaves as an int
+    # everywhere here, so only a fractional spelling becomes a float).
+    proc rtJValToVal(j: JVal) -> Val:
+        if j.kind == "str":
+            let tv = do textVal(j.s)
+            return tv
+        if j.kind == "num":
+            let frac = do rtNumHasFraction(j.s)
+            if frac:
+                let fv = do floatVal(toFloat(j.s))
+                return fv
+            let iv = do intVal(toInt(j.s))
+            return iv
+        if j.kind == "bool":
+            let bv = do boolVal(j.s == "true")
+            return bv
+        if j.kind == "arr":
+            let mut items = []
+            let mut i = 0
+            loop i < len(j.vals):
+                let ev = do rtJValToVal(j.vals[i])
+                items = append(items, ev)
+                i = i + 1
+            let lv = do listVal(items)
+            return lv
+        if j.kind == "obj":
+            let mut vals = []
+            let mut k = 0
+            loop k < len(j.vals):
+                let ov = do rtJValToVal(j.vals[k])
+                vals = append(vals, ov)
+                k = k + 1
+            let rv = do recordVal(j.keys, vals)
+            return rv
+        let none = do noneVal()
+        return none
+
+    proc rtNumHasFraction(s: text) -> bool:
+        let mut i = 0
+        loop i < len(s):
+            let c = charAt(s, i)
+            if c == "." || c == "e" || c == "E":
+                return true
+            i = i + 1
+        return false
+
+    # ── the proc engine (runtime/proccompile.go) ─────────────────────────
+    # A proc runs over a frame of locals (an RtScope with no materializer);
+    # its statements are let / assign / indexset / fieldset / do / if /
+    # loop (break, continue) / return / exprstmt, its expressions rtEval's
+    # with a proc's own calls resolved first. The proc table is the one
+    # cell the evaluator reads: it is set once at boot (rtSetProcTable) and
+    # never changes, so a shared cell is the right home — every task reads
+    # the same value and none writes it after.
+    shared rtProcTable: [IRProc]
+
+    proc rtSetProcTable(procs: [IRProc]):
+        rtProcTable = procs
+
+    # rtStoreEntities: the entities the store answers for (every declared
+    # one that is not @ephemeral), with the fields a bare sum/avg/min/max
+    # may be pushed on (numeric, not float) — what aggQuery/storeAnswers
+    # decide from the graph. Set once at boot beside the proc table.
+    shared rtStoreEntNames: [text]
+    shared rtStoreEntNumeric: [text]
+
+    proc rtSetStoreEntities(g: IRGraph):
+        let mut names = []
+        let mut numeric = []
+        let mut i = 0
+        loop i < len(g.entities):
+            let e = g.entities[i]
+            if !e.ephemeral:
+                names = append(names, e.name)
+                let mut cols = ",id,"
+                let mut f = 0
+                loop f < len(e.fields):
+                    let t = e.fields[f].type
+                    if t == "int" || t == "money" || t == "date" || e.fields[f].ref != "":
+                        cols = cols + e.fields[f].name + ","
+                    f = f + 1
+                numeric = append(numeric, cols)
+            i = i + 1
+        rtStoreEntNames = names
+        rtStoreEntNumeric = numeric
+
+    # rtStoreAnswers: storeAnswers — whether this aggregate is asked of the
+    # store (and so has its outer sub-expressions folded first).
+    proc rtStoreAnswers(e: IRExpr) -> bool:
+        let names = rtStoreEntNames
+        let mut at = -1
+        let mut i = 0
+        loop i < len(names):
+            if names[i] == e.name:
+                at = i
+            i = i + 1
+        if at < 0:
+            return false
+        if e.op == "count" || e.op == "exists":
+            return true
+        if e.op == "sum" || e.op == "avg" || e.op == "min" || e.op == "max":
+            if len(e.sel) > 0 || e.field == "":
+                return false
+            let cols = rtStoreEntNumeric
+            let hit = do rtIndexOfText(cols[at], "," + e.field + ",")
+            return hit >= 0
+        return false
+
+    # ── row-read policies and gated fields (fieldauth.go, region.go) ─────
+    # An entity's `read:` clause (a predicate over `$row`) and the fields a
+    # policy gates (@requires(policy), @secret, @password), set at boot.
+    shared rtReadEntNames: [text]
+    shared rtReadExprs: [IRExpr]
+    shared rtGatedEnts: [text]
+    shared rtGatedFields: [text]
+    shared rtGatedPolicies: [text]
+    shared rtPolicyNames: [text]
+    shared rtPolicyExprs: [IRExpr]
+
+    proc rtSetReadRules(g: IRGraph):
+        let mut rn = []
+        let mut rx = []
+        let mut ge = []
+        let mut gf = []
+        let mut gp = []
+        let mut i = 0
+        loop i < len(g.entities):
+            let e = g.entities[i]
+            if len(e.read) > 0:
+                rn = append(rn, e.name)
+                rx = append(rx, e.read[0])
+            let mut f = 0
+            loop f < len(e.fields):
+                let fl = e.fields[f]
+                if fl.password:
+                    ge = append(ge, e.name)
+                    gf = append(gf, fl.name)
+                    gp = append(gp, "")
+                else:
+                    if fl.secret || fl.readPolicy != "":
+                        ge = append(ge, e.name)
+                        gf = append(gf, fl.name)
+                        gp = append(gp, fl.readPolicy)
+                f = f + 1
+            i = i + 1
+        rtReadEntNames = rn
+        rtReadExprs = rx
+        rtGatedEnts = ge
+        rtGatedFields = gf
+        rtGatedPolicies = gp
+        let mut pn = []
+        let mut px = []
+        let mut k = 0
+        loop k < len(g.policies):
+            if len(g.policies[k].expr) > 0 && len(g.policies[k].params) == 0:
+                pn = append(pn, g.policies[k].name)
+                px = append(px, g.policies[k].expr[0])
+            k = k + 1
+        rtPolicyNames = pn
+        rtPolicyExprs = px
+
+    # rtReadPolicyOf: the entity's `read:` predicate, [] when none.
+    proc rtReadPolicyOf(entity: text) -> [IRExpr]:
+        let names = rtReadEntNames
+        let mut i = 0
+        loop i < len(names):
+            if names[i] == entity:
+                let xs = rtReadExprs
+                return [xs[i]]
+            i = i + 1
+        return []
+
+    # rtRenameRowVar: renameRowVar — `$row` re-bound to the item variable.
+    proc rtRenameRowVar(e: IRExpr, to: text) -> IRExpr:
+        let mut ee = e
+        if e.kind == "ref" && e.name == "$row":
+            ee.name = to
+            return ee
+        if e.kind == "get" || e.kind == "index":
+            ee.obj = do rtRenameList(e.obj, to)
+        if e.kind == "eget" || e.kind == "index":
+            ee.key = do rtRenameList(e.key, to)
+        if e.kind == "agg":
+            ee.where = do rtRenameList(e.where, to)
+            ee.sel = do rtRenameList(e.sel, to)
+        if e.kind == "call" || e.kind == "list":
+            ee.args = do rtRenameList(e.args, to)
+        if e.kind == "bin":
+            ee.l = do rtRenameList(e.l, to)
+            ee.r = do rtRenameList(e.r, to)
+        if e.kind == "un":
+            ee.x = do rtRenameList(e.x, to)
+        return ee
+
+    proc rtRenameList(xs: [IRExpr], to: text) -> [IRExpr]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(xs):
+            let r = do rtRenameRowVar(xs[i], to)
+            out = append(out, r)
+            i = i + 1
+        return out
+
+    # rtFilterByReadPolicy: filterByReadPolicy — the rows the entity's
+    # `read:` clause admits for this scope's identity.
+    proc rtFilterByReadPolicy(entity: text, rows: [Val], sc0: RtScope) -> [Val]:
+        let pol = do rtReadPolicyOf(entity)
+        if len(pol) == 0 || len(rows) == 0:
+            return rows
+        let fr = do rtFilterRows(rows, "$row", pol[0], sc0, -1)
+        return fr.v.items
+
+    # rtGateForActor: gateForActor — the gated fields this scope's actor
+    # may NOT read (its policy fails, or the field has none).
+    proc rtGateForActor(entity: text, sc: RtScope) -> [text]:
+        let ents = rtGatedEnts
+        let fields = rtGatedFields
+        let pols = rtGatedPolicies
+        let mut drop = []
+        let mut i = 0
+        loop i < len(ents):
+            if ents[i] == entity:
+                let mut ok = false
+                if pols[i] != "":
+                    ok = do rtPolicyHolds(pols[i], sc)
+                if !ok:
+                    drop = append(drop, fields[i])
+            i = i + 1
+        return drop
+
+    # rtGateAll: every gated field of the entity (a scope with no actor).
+    proc rtGateAll(entity: text) -> [text]:
+        let ents = rtGatedEnts
+        let fields = rtGatedFields
+        let mut drop = []
+        let mut i = 0
+        loop i < len(ents):
+            if ents[i] == entity:
+                drop = append(drop, fields[i])
+            i = i + 1
+        return drop
+
+    proc rtPolicyHolds(name: text, sc: RtScope) -> bool:
+        let names = rtPolicyNames
+        let mut i = 0
+        loop i < len(names):
+            if names[i] == name:
+                let xs = rtPolicyExprs
+                let r = do rtEval(xs[i], sc, -1)
+                let ok = do valTruthy(r.v)
+                return ok
+            i = i + 1
+        return false
+
+    proc rtStripFields(rows: [Val], drop: [text]) -> [Val]:
+        if len(drop) == 0:
+            return rows
+        let mut out = []
+        let mut i = 0
+        loop i < len(rows):
+            let r = do rtStripRow(rows[i], drop)
+            out = append(out, r)
+            i = i + 1
+        return out
+
+    proc rtStripRow(r: Val, drop: [text]) -> Val:
+        if r.kind != "record" || len(drop) == 0:
+            return r
+        let mut keys = []
+        let mut items = []
+        let mut k = 0
+        loop k < len(r.keys):
+            let mut hit = false
+            let mut d = 0
+            loop d < len(drop):
+                if drop[d] == r.keys[k]:
+                    hit = true
+                d = d + 1
+            if !hit:
+                keys = append(keys, r.keys[k])
+                items = append(items, r.items[k])
+            k = k + 1
+        let rv = do recordVal(keys, items)
+        return rv
+
+    # rtVisibleRows: visibleRows — rows with the fields this actor may not
+    # read stripped (every gated field when there is no actor).
+    proc rtVisibleRows(entity: text, rows: [Val], sc: RtScope, noActor: bool) -> [Val]:
+        let mut drop = []
+        if noActor:
+            drop = do rtGateAll(entity)
+        else:
+            drop = do rtGateForActor(entity, sc)
+        let out = do rtStripFields(rows, drop)
+        return out
+
+    proc rtIsStoreEntity(name: text) -> bool:
+        let names = rtStoreEntNames
+        let mut i = 0
+        loop i < len(names):
+            if names[i] == name:
+                return true
+            i = i + 1
+        return false
+
+    # rtMentions: mentions — whether an expression reads the item variable
+    # (or names its collection).
+    proc rtMentions(e: IRExpr, name: text) -> bool:
+        if e.kind == "ref" && e.name == name:
+            return true
+        if e.name == name && (e.kind == "agg" || e.kind == "eget"):
+            return true
+        let kids = e.l + e.r + e.x + e.obj + e.key + e.where + e.sel + e.limit + e.keys + e.args
+        let mut i = 0
+        loop i < len(kids):
+            let m = do rtMentions(kids[i], name)
+            if m:
+                return true
+            i = i + 1
+        return false
+
+    # rtFoldOuter: foldOuter's evaluations — every maximal sub-expression
+    # that does not mention the item variable is evaluated in the
+    # surrounding scope (the store receives its literal), descending only
+    # through `bin` and `un`. During a render that evaluation is addressed,
+    # so an aggregate or lookup it reaches is recorded — which is why a
+    # `Stream(id).owner` inside an `exists` over an empty table still
+    # appears in the page's `@aggs`.
+    proc rtFoldOuter(e: IRExpr, itemVar: text, sc0: RtScope, base: int) -> RtScope:
+        let mut sc = sc0
+        let m = do rtMentions(e, itemVar)
+        if !m:
+            let r = do rtEval(e, sc, base)
+            return r.sc
+        if e.kind == "bin":
+            if len(e.l) > 0:
+                sc = do rtFoldOuter(e.l[0], itemVar, sc, base)
+            let rb = do rtBaseAfter(base, e.l)
+            if len(e.r) > 0:
+                sc = do rtFoldOuter(e.r[0], itemVar, sc, rb)
+            return sc
+        if e.kind == "un":
+            if len(e.x) > 0:
+                sc = do rtFoldOuter(e.x[0], itemVar, sc, base)
+            return sc
+        return sc
+
+    proc rtProcIndex(name: text) -> int:
+        let procs = rtProcTable
+        let mut i = 0
+        loop i < len(procs):
+            if procs[i].name == name:
+                return i
+            i = i + 1
+        return -1
+
+    # RtCtl: a block's outcome — fell off the end, returned, broke or
+    # continued — and the frame it left.
+    struct RtCtl:
+        kind: text
+        v: Val
+        sc: RtScope
+
+    proc rtZeroOf(typ: text) -> Val:
+        if typ == "int" || typ == "money" || typ == "date":
+            let z = do intVal(0)
+            return z
+        if typ == "float":
+            let f = do floatVal(0.0)
+            return f
+        if typ == "bool":
+            let b = do boolVal(false)
+            return b
+        if typ == "text" || typ == "datetime":
+            let t = do textVal("")
+            return t
+        let none = do noneVal()
+        return none
+
+    # rtRunProc: runProcLocked — bind the parameters (an omitted one is its
+    # zero, an omitted list the empty list), run the body, hand back the
+    # returned value or the error.
+    proc rtRunProc(name: text, args: [Val]) -> RtOut:
+        let pi = do rtProcIndex(name)
+        let mut fr = do rtScopeNew()
+        if pi < 0:
+            fr.err = "calls unknown proc \"" + name + "\""
+            let none0 = do noneVal()
+            return RtOut{v: none0, sc: fr}
+        let p = rtProcTable[pi]
+        let mut i = 0
+        loop i < len(p.params):
+            let prm = p.params[i]
+            let mut v = do noneVal()
+            if i < len(args):
+                v = args[i]
+            else:
+                if prm.list:
+                    v = do listVal([])
+                else:
+                    v = do rtZeroOf(prm.type)
+            fr = do rtSet(fr, prm.name, v)
+            i = i + 1
+        let c = do rtProcBlock(p.body, fr)
+        if c.sc.err != "":
+            let none1 = do noneVal()
+            return RtOut{v: none1, sc: c.sc}
+        if c.kind == "return":
+            return RtOut{v: c.v, sc: c.sc}
+        let none2 = do noneVal()
+        return RtOut{v: none2, sc: c.sc}
+
+    proc rtProcBlock(body: [IRStmt], fr0: RtScope) -> RtCtl:
+        let mut fr = fr0
+        let before = fr.names
+        let mut i = 0
+        loop i < len(body):
+            let c = do rtProcStmt(body[i], fr)
+            fr = c.sc
+            if fr.err != "" || c.kind != "":
+                let dropped = do rtDropAfter(fr, before)
+                return RtCtl{kind: c.kind, v: c.v, sc: dropped}
+            i = i + 1
+        let dropped2 = do rtDropAfter(fr, before)
+        let none = do noneVal()
+        return RtCtl{kind: "", v: none, sc: dropped2}
+
+    # rtDropAfter: the block's own `let`s leave scope with it.
+    proc rtDropAfter(fr0: RtScope, before: [text]) -> RtScope:
+        let mut fr = fr0
+        if len(fr.names) <= len(before):
+            return fr
+        fr.names = slice(fr.names, 0, len(before))
+        fr.vals = slice(fr.vals, 0, len(before))
+        return fr
+
+    proc rtCtlNone(fr: RtScope) -> RtCtl:
+        let none = do noneVal()
+        return RtCtl{kind: "", v: none, sc: fr}
+
+    proc rtProcFail(fr0: RtScope, msg: text) -> RtCtl:
+        let mut fr = fr0
+        fr.err = msg
+        let none = do noneVal()
+        return RtCtl{kind: "", v: none, sc: fr}
+
+    proc rtProcStmt(st: IRStmt, fr0: RtScope) -> RtCtl:
+        let mut fr = fr0
+        let op = st.op
+        if op == "let" || op == "assign":
+            let r = do rtEvalOpt(st.value, fr, -1)
+            fr = r.sc
+            if fr.err != "":
+                let f0 = do rtCtlNone(fr)
+                return f0
+            fr = do rtSet(fr, st.target, r.v)
+            let c0 = do rtCtlNone(fr)
+            return c0
+        if op == "indexset":
+            let cur = do rtGet(fr, st.target)
+            if cur.kind != "list" && cur.kind != "record":
+                let f1 = do rtProcFail(fr, "\"" + st.target + "\" is not an array or map")
+                return f1
+            let kr = do rtEvalOpt(st.key, fr, -1)
+            fr = kr.sc
+            let vr = do rtEvalOpt(st.value, fr, -1)
+            fr = vr.sc
+            if fr.err != "":
+                let f2 = do rtCtlNone(fr)
+                return f2
+            if cur.kind == "list":
+                let idx = do valToInt(kr.v)
+                if idx < 0 || idx >= len(cur.items):
+                    let f3 = do rtProcFail(fr, "array index " + idx + " out of bounds (length " + len(cur.items) + ") assigning to \"" + st.target + "\"")
+                    return f3
+                let mut items = cur.items
+                let mut nv = vr.v
+                if st.bytesFlag:
+                    let n = do valToInt(nv)
+                    if n < 0 || n > 255:
+                        let f4 = do rtProcFail(fr, "byte value " + n + " out of range (must be 0-255) assigning to \"" + st.target + "\"[" + idx + "]")
+                        return f4
+                    nv = do intVal(n)
+                items[idx] = nv
+                fr = do rtSet(fr, st.target, listVal(items))
+            else:
+                let ks = do valToStr(kr.v)
+                let updated = do valSet(cur, ks, vr.v)
+                fr = do rtSet(fr, st.target, updated)
+            let c1 = do rtCtlNone(fr)
+            return c1
+        if op == "fieldset":
+            let cur2 = do rtGet(fr, st.target)
+            if cur2.kind != "record":
+                let f5 = do rtProcFail(fr, "\"" + st.target + "\" is not a struct")
+                return f5
+            let has = do valHas(cur2, st.field)
+            if !has:
+                let f6 = do rtProcFail(fr, "struct has no field \"" + st.field + "\"")
+                return f6
+            let vr2 = do rtEvalOpt(st.value, fr, -1)
+            fr = vr2.sc
+            if fr.err != "":
+                let f7 = do rtCtlNone(fr)
+                return f7
+            let updated2 = do valSet(cur2, st.field, vr2.v)
+            fr = do rtSet(fr, st.target, updated2)
+            let c2 = do rtCtlNone(fr)
+            return c2
+        if op == "do":
+            let ar = do rtEvalList(st.args, fr, -1)
+            fr = ar.sc
+            if fr.err != "":
+                let f8 = do rtCtlNone(fr)
+                return f8
+            let res = do rtRunProc(st.service, ar.v.items)
+            if res.sc.err != "":
+                fr.err = res.sc.err
+                let f9 = do rtCtlNone(fr)
+                return f9
+            let cv = do rtCoerceRet(res.v, st.ret, st.retList)
+            if st.bind != "":
+                fr = do rtSet(fr, st.bind, cv)
+            else:
+                if st.target != "":
+                    fr = do rtSet(fr, st.target, cv)
+            let c3 = do rtCtlNone(fr)
+            return c3
+        if op == "exprstmt":
+            let er = do rtEvalOpt(st.value, fr, -1)
+            let c4 = do rtCtlNone(er.sc)
+            return c4
+        if op == "return":
+            let mut rv = do noneVal()
+            if len(st.value) > 0:
+                let rr = do rtEvalOpt(st.value, fr, -1)
+                fr = rr.sc
+                rv = rr.v
+            return RtCtl{kind: "return", v: rv, sc: fr}
+        if op == "break":
+            let none1 = do noneVal()
+            return RtCtl{kind: "break", v: none1, sc: fr}
+        if op == "continue":
+            let none2 = do noneVal()
+            return RtCtl{kind: "continue", v: none2, sc: fr}
+        if op == "if":
+            let cr = do rtEvalOpt(st.value, fr, -1)
+            fr = cr.sc
+            if fr.err != "":
+                let f10 = do rtCtlNone(fr)
+                return f10
+            let t = do valTruthy(cr.v)
+            if t:
+                let b1 = do rtProcBlock(st.body, fr)
+                return b1
+            if len(st.elseBody) > 0:
+                let b2 = do rtProcBlock(st.elseBody, fr)
+                return b2
+            let c5 = do rtCtlNone(fr)
+            return c5
+        if op == "loop":
+            let mut going = true
+            loop going:
+                let lc = do rtEvalOpt(st.value, fr, -1)
+                fr = lc.sc
+                if fr.err != "":
+                    let f11 = do rtCtlNone(fr)
+                    return f11
+                let on = do valTruthy(lc.v)
+                if !on:
+                    going = false
+                else:
+                    let bc = do rtProcBlock(st.body, fr)
+                    fr = bc.sc
+                    if fr.err != "":
+                        let f12 = do rtCtlNone(fr)
+                        return f12
+                    if bc.kind == "return":
+                        return bc
+                    if bc.kind == "break":
+                        going = false
+            let c6 = do rtCtlNone(fr)
+            return c6
+        if op == "spawn" || op == "join" || op == "fileread" || op == "filewrite" || op == "actcall" || op == "call":
+            let f13 = do rtProcFail(fr, op + " is not available in the self-hosted runtime")
+            return f13
+        let c7 = do rtCtlNone(fr)
+        return c7
+
+    # rtCoerceRet: coerceRet — a `do`'s declared return type applied to
+    # what the proc handed back (a list wrapped when one was declared).
+    proc rtCoerceRet(v: Val, ret: text, list: bool) -> Val:
+        if !list:
+            let one = do rtCoerceOne(v, ret)
+            return one
+        let mut items = []
+        if v.kind == "list":
+            items = v.items
+        else:
+            if v.kind != "none":
+                items = [v]
+        let mut out = []
+        let mut i = 0
+        loop i < len(items):
+            let c = do rtCoerceOne(items[i], ret)
+            out = append(out, c)
+            i = i + 1
+        let lv = do listVal(out)
+        return lv
+
+    proc rtCoerceOne(v: Val, typ: text) -> Val:
+        if typ == "int" || typ == "money" || typ == "date":
+            if v.kind == "int":
+                return v
+            let iv = do intVal(valToInt(v))
+            return iv
+        if typ == "float":
+            if v.kind == "float":
+                return v
+            let fv = do floatVal(valToFloat(v))
+            return fv
+        if typ == "bool":
+            if v.kind == "bool":
+                return v
+            let bv = do boolVal(valTruthy(v))
+            return bv
+        if typ == "text" || typ == "datetime":
+            if v.kind == "text":
+                return v
+            let tv = do textVal(valToStr(v))
+            return tv
+        return v
+
+    # ── collections ──────────────────────────────────────────────────────
+    # rtEvalColl: evalColl — an `Entity(id).field` lookup, or an aggregate
+    # over the (filtered) rows of a collection in scope.
+    proc rtEvalColl(e: IRExpr, sc0: RtScope, base: int) -> RtOut:
+        let mut sc = sc0
+        let rows = do rtGet(sc, e.name)
+        if e.kind == "eget":
+            let kb = base + 1
+            let kr = do rtEvalOpt(e.key, sc, kb)
+            sc = kr.sc
+            let mut i = 0
+            loop i < len(rows.items):
+                let m = rows.items[i]
+                if m.kind == "record":
+                    let id = do valGet(m, "id")
+                    let same = do valEqual(id, kr.v)
+                    if same:
+                        if e.field == "":
+                            if sc.matOn:
+                                # gateRow: a whole row handed to the client
+                                # carries only what this actor may read.
+                                let gated = do rtVisibleRows(e.name, [m], sc, false)
+                                return RtOut{v: gated[0], sc: sc}
+                            return RtOut{v: m, sc: sc}
+                        let fv = do valGet(m, e.field)
+                        return RtOut{v: fv, sc: sc}
+                i = i + 1
+            let none0 = do noneVal()
+            return RtOut{v: none0, sc: sc}
+        # filtered form
+        let mut kept = rows.items
+        let wb = base + 1
+        let storeBacked = do rtStoreAnswers(e)
+        # withEntityReadPolicy: during a render the entity's `read:` clause
+        # joins the predicate (bound to the item variable, `$row` when the
+        # aggregate names none); its own parts fold like the rest.
+        let mut policy = []
+        let mut pv = e.itemVar
+        if pv == "":
+            pv = "$row"
+        if sc.matOn:
+            let rp = do rtReadPolicyOf(e.name)
+            if len(rp) > 0:
+                policy = [rtRenameRowVar(rp[0], pv)]
+        if sc.matOn && storeBacked:
+            let mut iv = e.itemVar
+            if iv == "":
+                iv = "item"
+            if len(policy) > 0:
+                sc = do rtFoldOuter(policy[0], iv, sc, -1)
+            if len(e.where) > 0:
+                sc = do rtFoldOuter(e.where[0], iv, sc, wb)
+        if len(policy) > 0:
+            let pr0 = do rtFilterRows(kept, pv, policy[0], sc, -1)
+            sc = pr0.sc
+            kept = pr0.v.items
+        if len(e.where) > 0:
+            let fr = do rtFilterRows(kept, e.itemVar, e.where[0], sc, wb)
+            sc = fr.sc
+            kept = fr.v.items
+        let sb = do rtBaseAfter(wb, e.where)
+        let lb = do rtBaseAfter(sb, e.sel)
+        if e.op == "exists":
+            let ex = do boolVal(len(kept) > 0)
+            return RtOut{v: ex, sc: sc}
+        if e.op == "count":
+            let cv = do intVal(len(kept))
+            return RtOut{v: cv, sc: sc}
+        if e.op == "list":
+            let mut ordered = kept
+            if len(e.orderBy) > 0:
+                let ob = do rtSortRowsBy(kept, e.itemVar, e.orderBy[0], e.desc, sc)
+                ordered = ob
+            else:
+                let os = do rtSortRows(kept, e.order, e.desc)
+                ordered = os
+            if len(e.limit) > 0:
+                let lr = do rtEval(e.limit[0], sc, lb)
+                sc = lr.sc
+                let lim = do valToInt(lr.v)
+                if lim >= 0 && len(ordered) > lim:
+                    ordered = slice(ordered, 0, lim)
+            if len(e.sel) == 0:
+                let lv = do listVal(ordered)
+                return RtOut{v: lv, sc: sc}
+            let prev = do rtGet(sc, e.itemVar)
+            let had = do rtHas(sc, e.itemVar)
+            let mut out = []
+            let mut i = 0
+            loop i < len(ordered):
+                if ordered[i].kind == "record":
+                    sc = do rtSet(sc, e.itemVar, ordered[i])
+                    let sr = do rtEval(e.sel[0], sc, sb)
+                    sc = sr.sc
+                    out = append(out, sr.v)
+                i = i + 1
+            sc = do rtRestore(sc, e.itemVar, had, prev)
+            let lv2 = do listVal(out)
+            return RtOut{v: lv2, sc: sc}
+        # sum / avg / min / max
+        if e.vtype == "text":
+            let tv = do rtReduceText(e.op, kept, e.field)
+            return RtOut{v: tv, sc: sc}
+        if len(e.sel) == 0:
+            let mut nums = []
+            let mut i = 0
+            loop i < len(kept):
+                if kept[i].kind == "record":
+                    let fv = do valGet(kept[i], e.field)
+                    let nv = do rtNumValue(fv)
+                    nums = append(nums, nv)
+                i = i + 1
+            let rv = do rtReduceAgg(e.op, nums)
+            return RtOut{v: rv, sc: sc}
+        let prev2 = do rtGet(sc, e.itemVar)
+        let had2 = do rtHas(sc, e.itemVar)
+        let mut nums2 = []
+        let mut j = 0
+        loop j < len(kept):
+            if kept[j].kind == "record":
+                sc = do rtSet(sc, e.itemVar, kept[j])
+                sc.unaddressed = sc.unaddressed + 1
+                let sr2 = do rtEval(e.sel[0], sc, sb)
+                sc = sr2.sc
+                sc.unaddressed = sc.unaddressed - 1
+                let nv2 = do rtNumValue(sr2.v)
+                nums2 = append(nums2, nv2)
+            j = j + 1
+        sc = do rtRestore(sc, e.itemVar, had2, prev2)
+        let rv2 = do rtReduceAgg(e.op, nums2)
+        return RtOut{v: rv2, sc: sc}
+
+    proc rtRestore(sc0: RtScope, name: text, had: bool, prev: Val) -> RtScope:
+        if had:
+            let s1 = do rtSet(sc0, name, prev)
+            return s1
+        let s2 = do rtDrop(sc0, name)
+        return s2
+
+    # rtFilterRows: the rows a predicate accepts with the item variable bound
+    # to each — evalRowPredicate: the materializer is suspended per row.
+    proc rtFilterRows(rows: [Val], itemVar: text, where: IRExpr, sc0: RtScope, base: int) -> RtOut:
+        let mut sc = sc0
+        let prev = do rtGet(sc, itemVar)
+        let had = do rtHas(sc, itemVar)
+        let mut kept = []
+        let mut i = 0
+        loop i < len(rows):
+            if rows[i].kind == "record":
+                sc = do rtSet(sc, itemVar, rows[i])
+                sc.unaddressed = sc.unaddressed + 1
+                let pr = do rtEval(where, sc, base)
+                sc = pr.sc
+                sc.unaddressed = sc.unaddressed - 1
+                let ok = do valTruthy(pr.v)
+                if ok:
+                    kept = append(kept, rows[i])
+            i = i + 1
+        sc = do rtRestore(sc, itemVar, had, prev)
+        let lv = do listVal(kept)
+        return RtOut{v: lv, sc: sc}
+
+    proc rtNumValue(v: Val) -> Val:
+        if v.kind == "float":
+            return v
+        let iv = do intVal(valToInt(v))
+        return iv
+
+    # rtReduceAgg: reduceAgg — int arithmetic unless a float appears; the
+    # empty reduction is 0 for every op; avg is integer division.
+    proc rtReduceAgg(op: text, nums: [Val]) -> Val:
+        let mut isFloat = false
+        let mut i = 0
+        loop i < len(nums):
+            if nums[i].kind == "float":
+                isFloat = true
+            i = i + 1
+        let n = len(nums)
+        if isFloat:
+            let mut ftotal = 0.0
+            let mut flo = 0.0
+            let mut fhi = 0.0
+            let mut k = 0
+            loop k < n:
+                let f = do valToFloat(nums[k])
+                if k == 0:
+                    flo = f
+                    fhi = f
+                else:
+                    if f < flo:
+                        flo = f
+                    if f > fhi:
+                        fhi = f
+                ftotal = ftotal + f
+                k = k + 1
+            if op == "avg":
+                if n == 0:
+                    let z = do floatVal(0.0)
+                    return z
+                let av = do floatVal(ftotal / toFloat(n))
+                return av
+            if op == "min":
+                let mn = do floatVal(flo)
+                return mn
+            if op == "max":
+                let mx = do floatVal(fhi)
+                return mx
+            let sm = do floatVal(ftotal)
+            return sm
+        let mut total = 0
+        let mut lo = 0
+        let mut hi = 0
+        let mut j = 0
+        loop j < n:
+            let x = do valToInt(nums[j])
+            if j == 0:
+                lo = x
+                hi = x
+            else:
+                if x < lo:
+                    lo = x
+                if x > hi:
+                    hi = x
+            total = total + x
+            j = j + 1
+        if op == "avg":
+            if n == 0:
+                let z2 = do intVal(0)
+                return z2
+            let av2 = do intVal(total / n)
+            return av2
+        if op == "min":
+            let mn2 = do intVal(lo)
+            return mn2
+        if op == "max":
+            let mx2 = do intVal(hi)
+            return mx2
+        let sm2 = do intVal(total)
+        return sm2
+
+    proc rtReduceText(op: text, rows: [Val], field: text) -> Val:
+        let mut best = ""
+        let mut have = false
+        let mut i = 0
+        loop i < len(rows):
+            if rows[i].kind == "record":
+                let fv = do valGet(rows[i], field)
+                let t = do valToStr(fv)
+                if !have || (op == "min" && t < best) || (op == "max" && t > best):
+                    best = t
+                    have = true
+            i = i + 1
+        let tv = do textVal(best)
+        return tv
+
+    # ── ordering ─────────────────────────────────────────────────────────
+    # rtLess: lessVal — two numbers compare as ints, anything else as text.
+    proc rtLess(a: Val, b: Val) -> bool:
+        let an = a.kind == "int" || a.kind == "float"
+        let bn = b.kind == "int" || b.kind == "float"
+        if an && bn:
+            let x = do valToInt(a)
+            let y = do valToInt(b)
+            return x < y
+        let s = do valToStr(a)
+        let t = do valToStr(b)
+        return s < t
+
+    # rtSortRows: sortRows — a stable sort by one field (insertion sort, so
+    # equal keys keep their order exactly as sort.SliceStable keeps it).
+    proc rtSortRows(rows: [Val], order: text, desc: bool) -> [Val]:
+        if order == "":
+            return rows
+        let mut out = []
+        let mut i = 0
+        loop i < len(rows):
+            let r = rows[i]
+            let rk = do valGet(r, order)
+            let mut j = len(out)
+            let mut placed = false
+            loop j > 0 && !placed:
+                let ok = do valGet(out[j - 1], order)
+                let mut after = false
+                if desc:
+                    after = do rtLess(ok, rk)
+                else:
+                    after = do rtLess(rk, ok)
+                if after:
+                    j = j - 1
+                else:
+                    placed = true
+            out = slice(out, 0, j) + [r] + slice(out, j, len(out))
+            i = i + 1
+        return out
+
+    # rtSortRowsBy: sortRowsBy — a `list(... by <expr>)` ordering by a
+    # per-row expression.
+    proc rtSortRowsBy(rows: [Val], itemVar: text, by: IRExpr, desc: bool, sc0: RtScope) -> [Val]:
+        let mut sc = sc0
+        let mut keys = []
+        let mut i = 0
+        loop i < len(rows):
+            sc = do rtSet(sc, itemVar, rows[i])
+            sc.unaddressed = sc.unaddressed + 1
+            let kr = do rtEval(by, sc, -1)
+            sc = kr.sc
+            sc.unaddressed = sc.unaddressed - 1
+            keys = append(keys, kr.v)
+            i = i + 1
+        let mut outRows = []
+        let mut outKeys = []
+        let mut p = 0
+        loop p < len(rows):
+            let mut j = len(outRows)
+            let mut placed = false
+            loop j > 0 && !placed:
+                let mut after = false
+                if desc:
+                    after = do rtLess(outKeys[j - 1], keys[p])
+                else:
+                    after = do rtLess(keys[p], outKeys[j - 1])
+                if after:
+                    j = j - 1
+                else:
+                    placed = true
+            outRows = slice(outRows, 0, j) + [rows[p]] + slice(outRows, j, len(outRows))
+            outKeys = slice(outKeys, 0, j) + [keys[p]] + slice(outKeys, j, len(outKeys))
+            p = p + 1
+        return outRows

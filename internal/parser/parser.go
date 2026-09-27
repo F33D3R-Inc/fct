@@ -128,6 +128,19 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 	// that reads c.Line.Text directly) sees the declaration as if `private `
 	// were never there; the flag itself is threaded onto the parsed node
 	// right after a successful parse.
+	// `expect <declaration>` — what this module needs its host to provide
+	// (ast.Expect). The inner declaration is parsed by the same parser the
+	// real one uses, so an expected entity's fields, an expected action's
+	// signature and an expected cell's type are written exactly as the host
+	// will write them; what the form forbids is what only the host decides:
+	// an action's body, a cell's default value.
+	if strings.HasPrefix(c.Line.Text, "expect ") {
+		ex, err := parseExpect(c)
+		if err == nil {
+			app.Expects = append(app.Expects, ex)
+		}
+		return err
+	}
 	private := false
 	if strings.HasPrefix(c.Line.Text, "private ") {
 		private = true
@@ -291,9 +304,120 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 			app.Views = append(app.Views, v)
 		}
 	default:
-		err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/record/struct/enum/type/message/state/derive/policy/action/proc/job/daemon/service/file/webhook/component/layout/theme/view", firstWord(c.Line.Text))}
+		err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/record/struct/enum/type/message/state/derive/policy/action/proc/job/daemon/service/file/webhook/component/layout/theme/view/expect", firstWord(c.Line.Text))}
 	}
 	return err
+}
+
+// parseActionHead parses an action's header line — `action name(params)
+// [-> Type] [@optimistic]:` — into an Action with no body yet. parseAction
+// reads the body after it; `expect action` (parseExpect) stops here, since
+// the signature is all a fragment can expect of its host.
+func parseActionHead(text string, line int) (*ast.Action, error) {
+	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(text, "action")), ":")
+	optimistic := false
+	if strings.HasSuffix(head, "@optimistic") {
+		optimistic = true
+		head = strings.TrimSpace(strings.TrimSuffix(head, "@optimistic"))
+	}
+	// `-> Type` declares a return value, the same trailing clause a proc header
+	// carries (parseProc).
+	var ret string
+	var retList bool
+	if arrow := strings.Index(head, "->"); arrow >= 0 {
+		rt := strings.TrimSpace(head[arrow+2:])
+		head = strings.TrimSpace(head[:arrow])
+		core, list, optional := splitType(rt)
+		if optional || !isTypeName(core) {
+			return nil, &Error{line, fmt.Sprintf("invalid return type %q", rt)}
+		}
+		ret, retList = core, list
+	}
+	// allowList: an action takes a list the way a client naturally sends one —
+	// `getWorks(ids: [int])`, a JSON array or `?ids=1,2` (runtime/server.go's
+	// paramArg decodes both).
+	name, params, err := parseSignature(head, line, true, false)
+	if err != nil {
+		return nil, err
+	}
+	return &ast.Action{Name: name, Params: params, Optimistic: optimistic, Ret: ret, RetList: retList, Line: line}, nil
+}
+
+// parseExpect parses the four `expect` forms:
+//
+//	expect entity Stream:          the fields a host entity must carry
+//	    title: text
+//	    live: bool
+//	expect action unsubscribe(stream: int)   the signature the host implements
+//	expect state draft: text                 the cell the host declares
+//	expect view at "/profile/:handle"        the route the host serves
+//	expect event notification: NotificationDTO   an event a host stream carries
+//	expect policy member                     a guard the host declares (signature only)
+func parseExpect(c *source.Node) (*ast.Expect, error) {
+	inner := strings.TrimSpace(strings.TrimPrefix(c.Line.Text, "expect "))
+	ex := &ast.Expect{Line: c.Line.No}
+	saved := c.Line.Text
+	c.Line.Text = inner
+	defer func() { c.Line.Text = saved }()
+	switch {
+	case strings.HasPrefix(inner, "entity "):
+		e, err := parseEntity(c)
+		if err != nil {
+			return nil, err
+		}
+		ex.Entity = e
+	case strings.HasPrefix(inner, "action "):
+		if len(c.Children) > 0 {
+			return nil, &Error{c.Line.No, "an expected action has no body — `expect action name(params)` names the signature the host implements"}
+		}
+		a, err := parseActionHead(inner, c.Line.No)
+		if err != nil {
+			return nil, err
+		}
+		ex.Action = a
+	case strings.HasPrefix(inner, "state "):
+		if splitTopByte(inner, '=') >= 0 {
+			return nil, &Error{c.Line.No, "an expected state cell has no default — `expect state name: type` names the cell; the host declares its value"}
+		}
+		st, err := parseState(c)
+		if err != nil {
+			return nil, err
+		}
+		ex.State = st
+	case strings.HasPrefix(inner, "policy "):
+		if len(c.Children) > 0 {
+			return nil, &Error{c.Line.No, "an expected policy has no predicate — `expect policy name(params)` names the guard the host declares"}
+		}
+		head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(inner, "policy")), ":")
+		name, params, err := parseSignature(head, c.Line.No, false, false)
+		if err != nil {
+			return nil, err
+		}
+		ex.Policy = &ast.Policy{Name: name, Params: params, Line: c.Line.No}
+	case strings.HasPrefix(inner, "event "):
+		rest := strings.TrimSpace(strings.TrimPrefix(inner, "event "))
+		colon := strings.IndexByte(rest, ':')
+		if colon < 0 || len(c.Children) > 0 {
+			return nil, &Error{c.Line.No, "expect event names the event and its payload type: `expect event notification: NotificationDTO`"}
+		}
+		name, typ := strings.TrimSpace(rest[:colon]), strings.TrimSpace(rest[colon+1:])
+		if !isIdent(name) || !isIdent(typ) || !isUpper(typ) {
+			return nil, &Error{c.Line.No, fmt.Sprintf("expect event %q: %q — the event is an identifier and the payload a declared wire type", name, typ)}
+		}
+		ex.Event = &ast.StreamEvent{Name: name, Type: typ, Line: c.Line.No}
+	case strings.HasPrefix(inner, "view at "):
+		route := strings.TrimSpace(strings.TrimPrefix(inner, "view at "))
+		if len(route) < 3 || route[0] != '"' || route[len(route)-1] != '"' || !strings.HasPrefix(route[1:], "/") {
+			return nil, &Error{c.Line.No, "expect view at needs a quoted route pattern: `expect view at \"/profile/:handle\"`"}
+		}
+		if len(c.Children) > 0 {
+			return nil, &Error{c.Line.No, "an expected view has no body — `expect view at \"/path\"` names the route the host serves"}
+		}
+		ex.Route = route[1 : len(route)-1]
+	default:
+		return nil, &Error{c.Line.No, fmt.Sprintf("unexpected `expect %s`; expect takes entity <Name>: (fields), action <name>(params), state <name>: <type>, policy <name>(params), event <name>: <Type>, or view at \"/route\"", firstWord(inner))}
+	}
+	return ex, nil
 }
 
 // parsePlayground parses `playground Name:` — the baseplate. It holds global
@@ -1721,33 +1845,11 @@ func parsePolicy(n *source.Node) (*ast.Policy, error) {
 // parseAction: `action name(params) [@optimistic]:` then `requires …`,
 // `check …`, and statement lines.
 func parseAction(n *source.Node) (*ast.Action, error) {
-	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "action")), ":")
-	optimistic := false
-	if strings.HasSuffix(head, "@optimistic") {
-		optimistic = true
-		head = strings.TrimSpace(strings.TrimSuffix(head, "@optimistic"))
-	}
-	// `-> Type` declares a return value, the same trailing clause a proc header
-	// carries (parseProc).
-	var ret string
-	var retList bool
-	if arrow := strings.Index(head, "->"); arrow >= 0 {
-		rt := strings.TrimSpace(head[arrow+2:])
-		head = strings.TrimSpace(head[:arrow])
-		core, list, optional := splitType(rt)
-		if optional || !isTypeName(core) {
-			return nil, &Error{n.Line.No, fmt.Sprintf("invalid return type %q", rt)}
-		}
-		ret, retList = core, list
-	}
-	// allowList: an action takes a list the way a client naturally sends one —
-	// `getWorks(ids: [int])`, a JSON array or `?ids=1,2` (runtime/server.go's
-	// paramArg decodes both).
-	name, params, err := parseSignature(head, n.Line.No, true, false)
+	a, err := parseActionHead(n.Line.Text, n.Line.No)
 	if err != nil {
 		return nil, err
 	}
-	a := &ast.Action{Name: name, Params: params, Optimistic: optimistic, Ret: ret, RetList: retList, Line: n.Line.No}
+	name := a.Name
 	// `requires` is a header-level clause of the action — a policy gate that
 	// runs before the body — so it is pulled out here, in source order, and
 	// everything else is the body. A `requires` written inside a nested block
@@ -2404,8 +2506,13 @@ func parseAPIDecl(n *source.Node) (*ast.API, error) {
 		}
 		if strings.HasPrefix(t, "body ") {
 			b := strings.TrimSpace(t[len("body "):])
+			if b == "form" {
+				// `body form`: the request is a form, not JSON — see ast.API.Form.
+				ap.Form = true
+				continue
+			}
 			if !isIdent(b) || !isUpper(b) {
-				return nil, &Error{no, "body names the wire type the request body is: body V2NumberMintRequest"}
+				return nil, &Error{no, "body names the wire type the request body is (body V2NumberMintRequest), or `body form` for a form-encoded request"}
 			}
 			ap.Body = b
 			continue
@@ -2549,12 +2656,19 @@ func parseAPI(line string, no int) (*ast.API, error) {
 			}
 			ap.Since = d
 		case "auth":
-			// `auth <scheme> bearer <param>` — one clause of four words.
-			if !isIdent(val) || i+3 >= len(tail) || tail[i+2] != "bearer" || !isIdent(tail[i+3]) {
-				return nil, &Error{no, "api auth clause is `auth <scheme> bearer <param>`: the route's credential scheme and the action parameter the bearer token binds to"}
+			// `auth <scheme> bearer <param>` — one clause of four words — or
+			// `auth <scheme> basic <id> <secret>`, five: the HTTP Basic credential's
+			// two halves and the parameters they bind to.
+			switch {
+			case isIdent(val) && i+3 < len(tail) && tail[i+2] == "bearer" && isIdent(tail[i+3]):
+				ap.AuthScheme, ap.Bearer = val, tail[i+3]
+				i += 2
+			case isIdent(val) && i+4 < len(tail) && tail[i+2] == "basic" && isIdent(tail[i+3]) && isIdent(tail[i+4]):
+				ap.AuthScheme, ap.BasicID, ap.BasicSecret = val, tail[i+3], tail[i+4]
+				i += 3
+			default:
+				return nil, &Error{no, "api auth clause is `auth <scheme> bearer <param>` or `auth <scheme> basic <id> <secret>`: the route's credential scheme and the action parameter(s) the credential binds to"}
 			}
-			ap.AuthScheme, ap.Bearer = val, tail[i+3]
-			i += 2
 		default:
 			return nil, &Error{no, fmt.Sprintf("unknown api clause %q (expected status, rate, since or auth)", tail[i])}
 		}
@@ -3313,22 +3427,35 @@ func parseProcBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
 			// `name = do Proc(args)` — a `let mut` local taking a proc call's
 			// result (ast.Do.Reassign). The right-hand side is a statement shape,
 			// not an expression, so it is dispatched before parseExpr sees it.
+			var val ast.Expr
 			if strings.HasPrefix(rhsText, "do ") {
-				if !isIdent(target) {
-					return nil, &Error{c.Line.No, fmt.Sprintf("invalid assignment target %q", target)}
-				}
 				d, err := parseDo(strings.TrimSpace(rhsText[len("do "):]), c.Line.No)
 				if err != nil {
 					return nil, err
 				}
-				d.Bind = target
-				d.Reassign = true
+				if isIdent(target) {
+					d.Bind = target
+					d.Reassign = true
+					body = append(body, d)
+					continue
+				}
+				// `s.f = do P(args)`, `xs[i] = do P(args)`, `a.b.c = do P(args)`:
+				// the call's result lands in a fresh `let mut` temporary (named
+				// and numbered as a nested write's, see nestedWriteTemp), and the
+				// statement is then the ordinary write of that temporary — one
+				// level below, or desugarNestedWrite's chain — so every rule a
+				// plain write obeys (a `let mut` root, a field that exists, the
+				// value's type) is the rule here, with nothing new to lower.
+				tmp := nestedWriteTemp(c.Line.No, &nestedWrites)
+				d.Bind, d.Mut = tmp, true
 				body = append(body, d)
-				continue
-			}
-			val, err := parseExpr(rhsText, c.Line.No)
-			if err != nil {
-				return nil, err
+				val = ast.Ref{Name: tmp}
+			} else {
+				ex, err := parseExpr(rhsText, c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				val = ex
 			}
 			// A write through more than one level — `a.b.c = x`, `a.b[i] = x`,
 			// `a.xs[i].f = x` — is the one-level writes composed: each

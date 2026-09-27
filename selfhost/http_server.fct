@@ -186,21 +186,33 @@ app HttpServerSelfHost:
     proc httpServerTooLarge(req: HttpServerRequest) -> HttpServerRequest:
         return HttpServerRequest{state: -2, err: "", method: req.method, target: req.target, path: req.path, hasQuery: req.hasQuery, query: req.query, version: req.version, headers: req.headers, body: "", rest: []}
 
+    # HttpServerRaw: a request with its body as the bytes that arrived — a
+    # multipart upload or any binary body — beside the request whose `body`
+    # is those bytes read as UTF-8 text.
+    struct HttpServerRaw:
+        req: HttpServerRequest
+        bodyBytes: [int]
+
+    # httpServerReadRequest: one request, its body as text.
     proc httpServerReadRequest(c: int, pending: [int], maxBody: int) -> HttpServerRequest uses io.net.listen:
+        let raw = do httpServerReadRequestRaw(c, pending, maxBody)
+        return raw.req
+
+    proc httpServerReadRequestRaw(c: int, pending: [int], maxBody: int) -> HttpServerRaw uses io.net.listen:
         let mut buf = pending
         let mut scan = 0
         let mut end = do httpFindHeadEnd(buf, 0)
         loop end < 0:
             if len(buf) > 65536:
                 let f = do httpServerRequestFailed(-1, "request head too large")
-                return f
+                return HttpServerRaw{req: f, bodyBytes: []}
             let chunk = readBytes(c, 65536)
             if len(chunk) == 0:
                 if len(buf) == 0:
                     let f = do httpServerRequestFailed(0, "")
-                    return f
+                    return HttpServerRaw{req: f, bodyBytes: []}
                 let f = do httpServerRequestFailed(-1, "connection closed mid-request")
-                return f
+                return HttpServerRaw{req: f, bodyBytes: []}
             scan = len(buf) - 3
             if scan < 0:
                 scan = 0
@@ -208,41 +220,41 @@ app HttpServerSelfHost:
             end = do httpFindHeadEnd(buf, scan)
         let req = do httpServerParseHead(buf, end)
         if req.state != 1:
-            return req
+            return HttpServerRaw{req: req, bodyBytes: []}
         let te = lower(httpHeaderValue(req.headers, "transfer-encoding"))
         if contains(te, "chunked"):
             loop true:
                 let d = do httpServerDechunk(buf, end, maxBody)
                 if d.state == 1:
-                    return HttpServerRequest{state: 1, err: "", method: req.method, target: req.target, path: req.path, hasQuery: req.hasQuery, query: req.query, version: req.version, headers: req.headers, body: bytesToText(d.bytes), rest: httpBytesRange(buf, d.end, len(buf))}
+                    return HttpServerRaw{req: HttpServerRequest{state: 1, err: "", method: req.method, target: req.target, path: req.path, hasQuery: req.hasQuery, query: req.query, version: req.version, headers: req.headers, body: bytesToText(d.bytes), rest: httpBytesRange(buf, d.end, len(buf))}, bodyBytes: d.bytes}
                 if d.state == -1:
                     let f = do httpServerRequestFailed(-1, "invalid chunked body")
-                    return f
+                    return HttpServerRaw{req: f, bodyBytes: []}
                 if d.state == -2:
                     let f = do httpServerTooLarge(req)
-                    return f
+                    return HttpServerRaw{req: f, bodyBytes: []}
                 let chunk = readBytes(c, 65536)
                 if len(chunk) == 0:
                     let f = do httpServerRequestFailed(-1, "connection closed mid-body")
-                    return f
+                    return HttpServerRaw{req: f, bodyBytes: []}
                 buf = buf + chunk
         let cl = do httpContentLength(req.headers)
         if cl == -2:
             let f = do httpServerRequestFailed(-1, "invalid content-length")
-            return f
+            return HttpServerRaw{req: f, bodyBytes: []}
         let mut want = cl
         if want < 0:
             want = 0
         if want > maxBody:
             let f = do httpServerTooLarge(req)
-            return f
+            return HttpServerRaw{req: f, bodyBytes: []}
         loop len(buf) - end < want:
             let chunk = readBytes(c, 65536)
             if len(chunk) == 0:
                 let f = do httpServerRequestFailed(-1, "connection closed mid-body")
-                return f
+                return HttpServerRaw{req: f, bodyBytes: []}
             buf = buf + chunk
-        return HttpServerRequest{state: 1, err: "", method: req.method, target: req.target, path: req.path, hasQuery: req.hasQuery, query: req.query, version: req.version, headers: req.headers, body: bytesToText(httpBytesRange(buf, end, end + want)), rest: httpBytesRange(buf, end + want, len(buf))}
+        return HttpServerRaw{req: HttpServerRequest{state: 1, err: "", method: req.method, target: req.target, path: req.path, hasQuery: req.hasQuery, query: req.query, version: req.version, headers: req.headers, body: bytesToText(httpBytesRange(buf, end, end + want)), rest: httpBytesRange(buf, end + want, len(buf))}, bodyBytes: httpBytesRange(buf, end, end + want)}
 
     # httpServerReason: the canonical reason phrase hyper writes for a status.
     proc httpServerReason(status: int) -> text:
@@ -309,6 +321,20 @@ app HttpServerSelfHost:
     proc httpServerWriteResponse(c: int, method: text, r: HttpServerResponse, keepAlive: bool) -> bool uses io.net.listen:
         let body = textToBytes(r.body)
         let mut head = do httpServerHead(r.status, r.reason, r.headers)
+        head = head + "content-length: " + len(body) + "\r\n"
+        if !keepAlive:
+            head = head + "connection: close\r\n"
+        head = head + "\r\n"
+        if method == "HEAD":
+            let ok = writeBytes(c, textToBytes(head))
+            return ok
+        let ok = writeBytes(c, textToBytes(head) + body)
+        return ok
+
+    # httpServerWriteResponseBytes: httpServerWriteResponse for a body that
+    # is bytes (a stored file), not text.
+    proc httpServerWriteResponseBytes(c: int, method: text, status: int, reason: text, headers: [HttpHeader], body: [int], keepAlive: bool) -> bool uses io.net.listen:
+        let mut head = do httpServerHead(status, reason, headers)
         head = head + "content-length: " + len(body) + "\r\n"
         if !keepAlive:
             head = head + "connection: close\r\n"

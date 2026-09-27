@@ -252,8 +252,10 @@ func (s *Server) ioListen(port int) (any, error) {
 // interface — what a listener that must never be reachable off the machine
 // (a control-plane port) needs. host "" is every interface, i.e. listen().
 func (s *Server) ioListenOn(who, host string, port int) (any, error) {
-	if port <= 0 || port > 65535 {
-		return nil, fmt.Errorf("%s: invalid port %d (must be 1-65535)", who, port)
+	// Port 0 asks the operating system for a free ephemeral port;
+	// listenerPort answers which one it chose.
+	if port < 0 || port > 65535 {
+		return nil, fmt.Errorf("%s: invalid port %d (must be 0-65535)", who, port)
 	}
 	ln, err := net.Listen("tcp", net.JoinHostPort(host, fmt.Sprint(port)))
 	if err != nil {
@@ -270,6 +272,23 @@ func (s *Server) ioListenError(id int) (any, error) {
 		return nil, err
 	}
 	return nl.err, nil
+}
+
+// ioListenerPort implements `listenerPort(l: int) -> int`: the port l is
+// bound to — what listen(0)/listenOn(host, 0)/listenTls(0, …) were given
+// by the operating system — or 0 for a listener whose bind failed.
+func (s *Server) ioListenerPort(id int) (any, error) {
+	nl, err := s.lookupListener(id, "listenerPort")
+	if err != nil {
+		return nil, err
+	}
+	if nl.ln == nil {
+		return 0, nil
+	}
+	if addr, ok := nl.ln.Addr().(*net.TCPAddr); ok {
+		return addr.Port, nil
+	}
+	return 0, nil
 }
 
 // ioCloseListener implements `closeListener(l: int) -> bool`: stops l
@@ -377,12 +396,12 @@ func (s *Server) ioReadBytes(id int, maxLen int) (any, error) {
 	}
 	if nc.c == nil {
 		// A failed dial: nothing will ever arrive; connError says why.
-		return []any{}, nil
+		return bytesVal{}, nil
 	}
 	r := s.netConns
 	if err := nc.c.SetReadDeadline(r.deadline(nc)); err != nil {
 		r.fail(nc, fmt.Sprintf("readBytes: %v", err))
-		return []any{}, nil
+		return bytesVal{}, nil
 	}
 	buf := make([]byte, maxLen)
 	n, err := nc.c.Read(buf)
@@ -398,13 +417,9 @@ func (s *Server) ioReadBytes(id int, maxLen int) (any, error) {
 		} else {
 			r.markEOF(nc)
 		}
-		return []any{}, nil
+		return bytesVal{}, nil
 	}
-	out := make([]any, n)
-	for i := 0; i < n; i++ {
-		out[i] = int(buf[i])
-	}
-	return out, nil
+	return bytesVal(buf[:n:n]), nil
 }
 
 // ioWriteBytes implements the `writeBytes(c: int, data: [int]) -> bool`
@@ -423,17 +438,12 @@ func (s *Server) ioWriteBytes(id int, data any) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	arr, ok := data.([]any)
+	buf, ok := bytesOf(data)
 	if !ok {
-		return nil, fmt.Errorf("writeBytes: data is not a byte buffer")
-	}
-	buf := make([]byte, len(arr))
-	for i, v := range arr {
-		n := toInt(v)
-		if n < 0 || n > 255 {
-			return nil, fmt.Errorf("writeBytes: byte value %d out of range (must be 0-255)", n)
+		if _, isList := data.([]any); isList {
+			return nil, fmt.Errorf("writeBytes: byte value out of range (must be 0-255)")
 		}
-		buf[i] = byte(n)
+		return nil, fmt.Errorf("writeBytes: data is not a byte buffer")
 	}
 	if nc.c == nil {
 		return false, nil
@@ -509,7 +519,7 @@ func (s *Server) ioPollBytes(id int, maxLen int, waitMs int) (any, error) {
 	ended := nc.c == nil || nc.eof || nc.err != ""
 	r.mu.Unlock()
 	if ended {
-		return []any{}, nil
+		return bytesVal{}, nil
 	}
 	wait := time.Duration(waitMs) * time.Millisecond
 	if wait < time.Millisecond {
@@ -517,7 +527,7 @@ func (s *Server) ioPollBytes(id int, maxLen int, waitMs int) (any, error) {
 	}
 	if err := nc.c.SetReadDeadline(time.Now().Add(wait)); err != nil {
 		r.fail(nc, fmt.Sprintf("pollBytes: %v", err))
-		return []any{}, nil
+		return bytesVal{}, nil
 	}
 	buf := make([]byte, maxLen)
 	n, err := nc.c.Read(buf)
@@ -531,13 +541,9 @@ func (s *Server) ioPollBytes(id int, maxLen int, waitMs int) (any, error) {
 		default:
 			r.fail(nc, fmt.Sprintf("pollBytes: %v", err))
 		}
-		return []any{}, nil
+		return bytesVal{}, nil
 	}
-	out := make([]any, n)
-	for i := 0; i < n; i++ {
-		out[i] = int(buf[i])
-	}
-	return out, nil
+	return bytesVal(buf[:n:n]), nil
 }
 
 // ioConnOpen implements `connOpen(c: int) -> bool`: false once c can never

@@ -1,8 +1,11 @@
 package selfhost
 
-// TestDriverFileSweep: every .fct program in this tree — selfhost's own
-// ports (the fabric ones included) and the runtime's test programs —
-// compiled by both compilers, entry file plus everything it imports.
+// TestDriverFileSweep: every .fct program under the trees the self-hosted
+// compiler must own — selfhost's own ports (the fabric ones included) and
+// their testdata, the runtime's test programs, every example, and the
+// product facets — compiled by both compilers, entry file plus everything
+// it imports. A file that is only ever imported (a module) is compiled as
+// an entry too: both compilers then refuse it, or both accept it.
 //
 // TestDriverInlineAppSweep covers the inline apps the Go tests carry; this
 // covers the whole programs the language's newest forms land in first
@@ -16,6 +19,7 @@ package selfhost
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -27,7 +31,8 @@ import (
 	"facet/internal/compile"
 )
 
-var driverFileSweepSources = []string{"*.fct", "../runtime/testdata/*.fct"}
+// driverFileSweepRoots are walked recursively for .fct files.
+var driverFileSweepRoots = []string{".", "../runtime/testdata", "../examples", "../../facets"}
 
 // driverFileSweepUnported: program path → the missing port. Empty: every
 // program matches.
@@ -35,12 +40,19 @@ var driverFileSweepUnported = map[string]string{}
 
 func TestDriverFileSweep(t *testing.T) {
 	var files []string
-	for _, pat := range driverFileSweepSources {
-		m, err := filepath.Glob(pat)
+	for _, root := range driverFileSweepRoots {
+		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() && strings.HasSuffix(path, ".fct") {
+				files = append(files, path)
+			}
+			return nil
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		files = append(files, m...)
 	}
 	sort.Strings(files)
 	// FCT_DRIVER_SWEEP_ONLY narrows the sweep to the named programs, for
@@ -64,7 +76,7 @@ func TestDriverFileSweep(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for f := range jobs {
-				_, werr := compile.File(f)
+				g, werr := compile.File(f)
 				got, gerr := driverGot(t, ts, root, f)
 				problem := ""
 				switch {
@@ -74,7 +86,6 @@ func TestDriverFileSweep(t *testing.T) {
 				case gerr != "":
 					problem = "the real compiler accepts it but the driver refuses it: " + strings.TrimPrefix(gerr, "driver refused the program: ")
 				default:
-					g, _ := compile.File(f)
 					b, _ := json.Marshal(g)
 					var want map[string]interface{}
 					json.Unmarshal(b, &want)

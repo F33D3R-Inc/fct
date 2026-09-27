@@ -1,0 +1,142 @@
+import "runtime_page.fct"
+
+app SSELive:
+    # sse_live.fct — runtime/server.go's live change stream: GET /live
+    # opens an event stream (handleLive) whose first frame is the current
+    # snapshot of every entity a client's own evaluator still reads as a
+    # collection (streamEntities: the union of every page's clientColls)
+    # with the write sequence, and every later frame (broadcast → fanout)
+    # names the entities an action changed and carries the rows of the
+    # streamed ones. A subscriber is a channel the loop sends frames to;
+    # its connection task writes them (runtime_server.fct).
+    struct RtLive:
+        ok: bool
+        resp: HttpServerResponse
+        w: RtWorld
+        chan: int
+
+    proc rtStreamColls(g: IRGraph) -> RtColls:
+        let mut c = RtColls{names: [], all: [], fields: []}
+        let mut i = 0
+        loop i < len(g.pages):
+            let pc = do rtClientColls(g, g.pages[i])
+            let mut k = 0
+            loop k < len(pc.names):
+                if pc.all[k]:
+                    c = do rtCollAll(c, pc.names[k])
+                else:
+                    let fs = split(pc.fields[k], ",")
+                    let mut f = 0
+                    loop f < len(fs):
+                        if fs[f] != "":
+                            c = do rtCollField(c, pc.names[k], fs[f])
+                        f = f + 1
+                k = k + 1
+            i = i + 1
+        return c
+
+    # rtDeltasJSON: the streamed entities' rows for one subscriber —
+    # filtered by each entity's `read:` clause against that subscriber's
+    # identity (filterByReadPolicy), projected to the fields the client
+    # reads, and with every gated field withheld (sseSafe: no actor is
+    # ever authorized over the stream).
+    proc rtDeltasJSON(w: RtWorld, names: [text], sub: RtScope) -> text:
+        let colls = do rtStreamColls(w.g)
+        let mut keys = []
+        let mut vals = []
+        let mut i = 0
+        loop i < len(names):
+            let ent = names[i]
+            let reserved = do rtIsReservedEntity(ent)
+            let ci = do rtCollIndex(colls, ent)
+            if !reserved && ci >= 0:
+                let rows0 = do rtEntRows(w, ent)
+                let rows = do rtFilterByReadPolicy(ent, rows0, sub)
+                let safe = do rtVisibleRows(ent, rows, sub, true)
+                let pr = do rtProjectRows(listVal(safe), colls.all[ci], colls.fields[ci])
+                keys = append(keys, ent)
+                vals = append(vals, pr)
+            i = i + 1
+        let j = do rtObjectJSON(keys, vals)
+        return j
+
+    # rtSubScope: identityScope — what a subscriber's `read:` clauses see.
+    proc rtSubScope(w: RtWorld, sub: RtSub) -> RtScope:
+        let mut sc = do rtScopeNew()
+        sc = do rtSet(sc, "actor", textVal(sub.actor))
+        sc = do rtSet(sc, "role", textVal(sub.role))
+        sc = do rtSet(sc, "verified", boolVal(sub.verified))
+        sc = do rtSet(sc, "tenant", intVal(sub.tenant))
+        sc = do rtSet(sc, "tenantRole", textVal(sub.tenantRole))
+        sc = do rtSet(sc, "session", textVal(sub.session))
+        let mut e = 0
+        loop e < len(w.entNames):
+            sc = do rtSet(sc, w.entNames[e], w.entRows[e])
+            e = e + 1
+        return sc
+
+    proc rtHandleLive(w0: RtWorld, req: HttpServerRequest) -> RtLive:
+        let so = do rtSidForRequest(w0, req)
+        let mut w = so.w
+        let sc = do rtScope(w, so.sid)
+        let actor = do rtGet(sc, "actor")
+        let role = do rtGet(sc, "role")
+        let verified = do rtGet(sc, "verified")
+        let session = do rtGet(sc, "session")
+        let ch = channel()
+        let sub = RtSub{ch: ch, actor: valToStr(actor), role: valToStr(role), verified: valTruthy(verified), tenant: 0, tenantRole: "", session: valToStr(session)}
+        w.subs = append(w.subs, sub)
+        let subSc = do rtSubScope(w, sub)
+        let all = do rtDeltasJSON(w, w.entNames, subSc)
+        let hello = "data: " + rtObjectJSONRaw(["deltas", "media", "seq"], [all, "null", "" + w.writeSeq]) + "\n\n"
+        let headers = [HttpHeader{name: "content-type", value: "text/event-stream"}, HttpHeader{name: "cache-control", value: "no-cache"}, HttpHeader{name: "connection", value: "keep-alive"}]
+        return RtLive{ok: true, resp: HttpServerResponse{status: 200, reason: "", headers: headers, body: hello}, w: w, chan: ch}
+
+    proc rtUnsubscribe(w0: RtWorld, ch: int) -> RtWorld:
+        let mut w = w0
+        let mut out = []
+        let mut i = 0
+        loop i < len(w.subs):
+            if w.subs[i].ch != ch:
+                out = append(out, w.subs[i])
+            i = i + 1
+        w.subs = out
+        let closed = closeChannel(ch)
+        return w
+
+    proc rtSortedTexts(xs: [text]) -> [text]:
+        let idx = do rtSortedIndex(xs)
+        let mut out = []
+        let mut i = 0
+        loop i < len(idx):
+            out = append(out, xs[idx[i]])
+            i = i + 1
+        return out
+
+    # rtBroadcast: broadcast — the write sequence advances and one frame
+    # reaches every subscriber.
+    proc rtBroadcast(w0: RtWorld, changed0: [text]) -> RtWorld:
+        let mut w = w0
+        if len(changed0) == 0:
+            return w
+        w.writeSeq = w.writeSeq + 1
+        let changed = do rtSortedTexts(changed0)
+        let mut cj = "["
+        let mut i = 0
+        loop i < len(changed):
+            if i > 0:
+                cj = cj + ","
+            cj = cj + jsonQuote(changed[i])
+            i = i + 1
+        cj = cj + "]"
+        # One frame per subscriber identity (fanout groups them; the frames
+        # of one identity are byte-identical, so computing per subscriber
+        # is the same wire).
+        let mut s = 0
+        loop s < len(w.subs):
+            let subSc = do rtSubScope(w, w.subs[s])
+            let deltas = do rtDeltasJSON(w, changed, subSc)
+            let frame = "data: " + rtObjectJSONRaw(["deltas", "media", "changed", "seq"], [deltas, "null", cj, "" + w.writeSeq]) + "\n\n"
+            let sent = send(w.subs[s].ch, frame)
+            s = s + 1
+        return w

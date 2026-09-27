@@ -1,0 +1,371 @@
+import "action_exec.fct"
+
+app AuthActions:
+    # auth_actions.fct — runtime/auth.go: the built-in account lifecycle an
+    # app that declares `auth` gets — signup, login, logout, setRole,
+    # requestReset, resetPassword, verifyEmail, enableMFA, confirmMFA,
+    # loginMFA — over the reserved FacetUser rows, with the same replies,
+    # refusals and session rotations (a privilege change mints a new
+    # identifier). Passwords are bcrypt hashes; tokens are stored as their
+    # keyed digest (hashToken) and returned once in the reply, as the Go
+    # build does.
+    proc rtArgStr(args: [Val], i: int) -> text:
+        if i < len(args):
+            let s = do valToStr(args[i])
+            return s
+        return ""
+
+    proc rtFindUserIndex(w: RtWorld, username: text) -> int:
+        let rows = do rtEntRows(w, "FacetUser")
+        let mut i = 0
+        loop i < len(rows):
+            let u = do valGet(rows[i], "username")
+            let un = do valToStr(u)
+            if un == username:
+                return i
+            i = i + 1
+        return -1
+
+    proc rtSaveUser(w0: RtWorld, at: int, row: Val) -> RtWorld:
+        let mut rows = do rtEntRows(w0, "FacetUser")
+        rows[at] = row
+        let w = do rtSetEntRows(w0, "FacetUser", rows)
+        return w
+
+    # rtSignIn: signIn — stamp a session with an identity.
+    proc rtSignIn(w0: RtWorld, sid: text, u: Val) -> RtWorld:
+        let mut w = w0
+        let i = do rtSessionIndex(w, sid)
+        if i >= 0:
+            let mut ses = w.sessions[i]
+            let un = do valGet(u, "username")
+            let role = do valGet(u, "role")
+            let ver = do valGet(u, "verified")
+            ses.actor = do valToStr(un)
+            ses.role = do valToStr(role)
+            ses.verified = do valTruthy(ver)
+            ses.pendingMFA = ""
+            w.sessions[i] = ses
+        return w
+
+    proc rtJSONWith(status: int, keys: [text], raws: [text], cookie: HttpHeader) -> HttpServerResponse:
+        let body = do rtObjectJSONRaw(keys, raws)
+        let mut r = do rtJSONResponse(status, body + "\n")
+        if cookie.name != "":
+            r.headers = append(r.headers, cookie)
+        return r
+
+    proc rtErrWith(status: int, msg: text, cookie: HttpHeader) -> HttpServerResponse:
+        let mut r = do rtTextError(status, msg)
+        if cookie.name != "":
+            r.headers = append(r.headers, cookie)
+        return r
+
+    # ── lockout ─────────────────────────────────────────────────────────
+    proc rtLockIndex(w: RtWorld, name: text) -> int:
+        let mut i = 0
+        loop i < len(w.lockNames):
+            if w.lockNames[i] == name:
+                return i
+            i = i + 1
+        return -1
+
+    proc rtLocked(w: RtWorld, name: text) -> bool:
+        let i = do rtLockIndex(w, name)
+        if i < 0:
+            return false
+        return w.lockUntil[i] != 0 && nowMs() < w.lockUntil[i]
+
+    proc rtLockFail(w0: RtWorld, name: text) -> RtWorld:
+        let mut w = w0
+        let now = nowMs()
+        let mut i = do rtLockIndex(w, name)
+        if i < 0:
+            w.lockNames = append(w.lockNames, name)
+            w.lockCounts = append(w.lockCounts, 0)
+            w.lockFirst = append(w.lockFirst, now)
+            w.lockUntil = append(w.lockUntil, 0)
+            i = len(w.lockNames) - 1
+        if now - w.lockFirst[i] > 15 * 60 * 1000:
+            w.lockCounts[i] = 0
+            w.lockFirst[i] = now
+        w.lockCounts[i] = w.lockCounts[i] + 1
+        if w.lockCounts[i] >= 5:
+            w.lockUntil[i] = now + 15 * 60 * 1000
+        return w
+
+    proc rtLockReset(w0: RtWorld, name: text) -> RtWorld:
+        let mut w = w0
+        let i = do rtLockIndex(w, name)
+        if i >= 0:
+            w.lockCounts[i] = 0
+            w.lockUntil[i] = 0
+        return w
+
+    # rtRunAuth: runAuth — dispatch one built-in auth action.
+    proc rtRunAuth(w0: RtWorld, req: HttpServerRequest, action: text, args: [Val]) -> RtHandled:
+        let so = do rtSession(w0, req)
+        let mut w = so.w
+        let sid = so.sid
+        let ck = so.cookie
+        let none = HttpHeader{name: "", value: ""}
+        if action == "signup":
+            let username = do rtArgStr(args, 0)
+            let password = do rtArgStr(args, 1)
+            if username == "" || password == "":
+                let e = do rtErrWith(400, "username and password are required", ck)
+                return RtHandled{resp: e, w: w}
+            if byteLen(password) > 72:
+                let e2 = do rtErrWith(400, "password must be at most 72 bytes", ck)
+                return RtHandled{resp: e2, w: w}
+            let hash = bcryptHash(password)
+            let verifyToken = base64UrlRaw(randomBytes(24))
+            let taken = do rtFindUserIndex(w, username)
+            if taken >= 0:
+                let e3 = do rtErrWith(409, "username is taken", ck)
+                return RtHandled{resp: e3, w: w}
+            let rows = do rtEntRows(w, "FacetUser")
+            let mut role = "member"
+            if len(rows) == 0:
+                role = "admin"
+            let ei = do rtEntIndex(w, "FacetUser")
+            let id = w.nextIds[ei] + 1
+            w.nextIds[ei] = id
+            let vt = do rtHashToken(w, verifyToken)
+            let row = do recordVal(["id", "username", "password", "role", "email", "verified", "verifyToken", "resetToken", "resetExpires", "mfaSecret", "mfaEnabled"], [intVal(id), textVal(username), textVal(hash), textVal(role), textVal(""), boolVal(false), textVal(vt), textVal(""), intVal(0), textVal(""), boolVal(false)])
+            w = do rtSetEntRows(w, "FacetUser", append(rows, row))
+            let rot = do rtRotateSession(w, sid)
+            w = do rtSignIn(rot.w, rot.sid, row)
+            let tok0 = do rtSignValue(w, rot.sid)
+            let r = do rtJSONWith(200, ["reload", "verifyToken", "token"], ["true", jsonQuote(verifyToken), jsonQuote(tok0)], rot.cookie)
+            return RtHandled{resp: r, w: w}
+        if action == "login":
+            let username = do rtArgStr(args, 0)
+            let password = do rtArgStr(args, 1)
+            let locked = do rtLocked(w, username)
+            if locked:
+                let e = do rtErrWith(429, "account temporarily locked after too many attempts", ck)
+                return RtHandled{resp: e, w: w}
+            let ui = do rtFindUserIndex(w, username)
+            let mut ok = false
+            let mut u = do noneVal()
+            if ui >= 0:
+                let rows = do rtEntRows(w, "FacetUser")
+                u = rows[ui]
+                let hv = do valGet(u, "password")
+                let hash = do valToStr(hv)
+                ok = hash != "" && bcryptMatches(hash, password)
+            if !ok:
+                w = do rtLockFail(w, username)
+                let e2 = do rtErrWith(401, "invalid username or password", ck)
+                return RtHandled{resp: e2, w: w}
+            w = do rtLockReset(w, username)
+            let mfa = do valGet(u, "mfaEnabled")
+            let mfaOn = do valTruthy(mfa)
+            if mfaOn:
+                let si = do rtSessionIndex(w, sid)
+                if si >= 0:
+                    let mut ses = w.sessions[si]
+                    ses.pendingMFA = username
+                    w.sessions[si] = ses
+                let r2 = do rtJSONWith(200, ["mfa"], ["true"], ck)
+                return RtHandled{resp: r2, w: w}
+            let rot = do rtRotateSession(w, sid)
+            w = do rtSignIn(rot.w, rot.sid, u)
+            let tok = do rtSignValue(w, rot.sid)
+            let r3 = do rtJSONWith(200, ["reload", "token"], ["true", jsonQuote(tok)], rot.cookie)
+            return RtHandled{resp: r3, w: w}
+        if action == "loginMFA":
+            let username = do rtArgStr(args, 0)
+            let code = do rtArgStr(args, 1)
+            let locked = do rtLocked(w, username)
+            if locked:
+                let e = do rtErrWith(429, "account temporarily locked after too many attempts", ck)
+                return RtHandled{resp: e, w: w}
+            let si = do rtSessionIndex(w, sid)
+            let mut pending = false
+            if si >= 0:
+                pending = w.sessions[si].pendingMFA == username
+            let ui = do rtFindUserIndex(w, username)
+            let mut ok = false
+            let mut u = do noneVal()
+            if pending && ui >= 0:
+                let rows = do rtEntRows(w, "FacetUser")
+                u = rows[ui]
+                let en = do valGet(u, "mfaEnabled")
+                let enabled = do valTruthy(en)
+                let sec = do valGet(u, "mfaSecret")
+                ok = enabled && totpValid(valToStr(sec), code)
+            if !ok:
+                w = do rtLockFail(w, username)
+                let e2 = do rtErrWith(401, "invalid code", ck)
+                return RtHandled{resp: e2, w: w}
+            w = do rtLockReset(w, username)
+            let rot = do rtRotateSession(w, sid)
+            w = do rtSignIn(rot.w, rot.sid, u)
+            let r = do rtJSONWith(200, ["reload"], ["true"], rot.cookie)
+            return RtHandled{resp: r, w: w}
+        if action == "logout":
+            let si = do rtSessionIndex(w, sid)
+            if si >= 0:
+                let mut ses = w.sessions[si]
+                ses.actor = "guest"
+                ses.role = "guest"
+                ses.verified = false
+                ses.pendingMFA = ""
+                w.sessions[si] = ses
+            let rot = do rtRotateSession(w, sid)
+            w = rot.w
+            let r = do rtJSONWith(200, ["reload"], ["true"], rot.cookie)
+            return RtHandled{resp: r, w: w}
+        if action == "setRole":
+            let username = do rtArgStr(args, 0)
+            let role = do rtArgStr(args, 1)
+            if role != "admin" && role != "member":
+                let e = do rtErrWith(400, "role must be admin or member", ck)
+                return RtHandled{resp: e, w: w}
+            let si = do rtSessionIndex(w, sid)
+            let mut isAdmin = false
+            if si >= 0:
+                isAdmin = w.sessions[si].role == "admin"
+            if !isAdmin:
+                let e2 = do rtErrWith(403, "forbidden: admin only", ck)
+                return RtHandled{resp: e2, w: w}
+            let ui = do rtFindUserIndex(w, username)
+            if ui < 0:
+                let e3 = do rtErrWith(404, "no such user", ck)
+                return RtHandled{resp: e3, w: w}
+            let rows = do rtEntRows(w, "FacetUser")
+            let u = do valSet(rows[ui], "role", textVal(role))
+            w = do rtSaveUser(w, ui, u)
+            let mut k = 0
+            loop k < len(w.sessions):
+                if w.sessions[k].actor == username:
+                    let mut ses2 = w.sessions[k]
+                    ses2.role = role
+                    w.sessions[k] = ses2
+                k = k + 1
+            let r = do rtJSONWith(200, ["ok"], ["true"], ck)
+            return RtHandled{resp: r, w: w}
+        if action == "requestReset":
+            let username = do rtArgStr(args, 0)
+            let token = base64UrlRaw(randomBytes(24))
+            let ui = do rtFindUserIndex(w, username)
+            let mut keys = ["ok"]
+            let mut raws = ["true"]
+            if ui >= 0:
+                let rows = do rtEntRows(w, "FacetUser")
+                let ht = do rtHashToken(w, token)
+                let mut u = do valSet(rows[ui], "resetToken", textVal(ht))
+                u = do valSet(u, "resetExpires", intVal(nowMs() / 1000 + 3600))
+                w = do rtSaveUser(w, ui, u)
+                keys = append(keys, "resetToken")
+                raws = append(raws, jsonQuote(token))
+            let r = do rtJSONWith(200, keys, raws, none)
+            return RtHandled{resp: r, w: w}
+        if action == "resetPassword":
+            let username = do rtArgStr(args, 0)
+            let token = do rtArgStr(args, 1)
+            let password = do rtArgStr(args, 2)
+            if password == "":
+                let e = do rtErrWith(400, "a new password is required", none)
+                return RtHandled{resp: e, w: w}
+            if byteLen(password) > 72:
+                let e2 = do rtErrWith(400, "password must be at most 72 bytes", none)
+                return RtHandled{resp: e2, w: w}
+            let hash = bcryptHash(password)
+            let ui = do rtFindUserIndex(w, username)
+            let mut ok = false
+            if ui >= 0:
+                let rows = do rtEntRows(w, "FacetUser")
+                let u = rows[ui]
+                let stored = do valGet(u, "resetToken")
+                let sv = do valToStr(stored)
+                let want = do rtHashToken(w, token)
+                let exp = do valGet(u, "resetExpires")
+                let ev = do valToInt(exp)
+                ok = sv != "" && sv == want && ev > nowMs() / 1000
+                if ok:
+                    let mut u2 = do valSet(u, "password", textVal(hash))
+                    u2 = do valSet(u2, "resetToken", textVal(""))
+                    u2 = do valSet(u2, "resetExpires", intVal(0))
+                    w = do rtSaveUser(w, ui, u2)
+            if !ok:
+                let e3 = do rtErrWith(400, "invalid or expired reset token", none)
+                return RtHandled{resp: e3, w: w}
+            let r = do rtJSONWith(200, ["ok"], ["true"], none)
+            return RtHandled{resp: r, w: w}
+        if action == "verifyEmail":
+            let token = do rtArgStr(args, 0)
+            let want = do rtHashToken(w, token)
+            let rows = do rtEntRows(w, "FacetUser")
+            let mut found = -1
+            let mut i = 0
+            loop i < len(rows) && found < 0:
+                let vt = do valGet(rows[i], "verifyToken")
+                let vs = do valToStr(vt)
+                if vs != "" && vs == want:
+                    found = i
+                i = i + 1
+            if found < 0:
+                let e = do rtErrWith(400, "invalid verification token", ck)
+                return RtHandled{resp: e, w: w}
+            let mut u = do valSet(rows[found], "verified", boolVal(true))
+            u = do valSet(u, "verifyToken", textVal(""))
+            w = do rtSaveUser(w, found, u)
+            let un = do valGet(u, "username")
+            let uname = do valToStr(un)
+            let mut k = 0
+            loop k < len(w.sessions):
+                if w.sessions[k].actor == uname:
+                    let mut ses3 = w.sessions[k]
+                    ses3.verified = true
+                    w.sessions[k] = ses3
+                k = k + 1
+            let r = do rtJSONWith(200, ["ok", "reload"], ["true", "true"], ck)
+            return RtHandled{resp: r, w: w}
+        if action == "enableMFA":
+            let secret = totpSecret()
+            let si = do rtSessionIndex(w, sid)
+            let mut actor = ""
+            if si >= 0:
+                actor = w.sessions[si].actor
+            if actor == "" || actor == "guest":
+                let e = do rtErrWith(403, "sign in first", ck)
+                return RtHandled{resp: e, w: w}
+            let ui = do rtFindUserIndex(w, actor)
+            if ui < 0:
+                let e2 = do rtErrWith(404, "no such user", ck)
+                return RtHandled{resp: e2, w: w}
+            let rows = do rtEntRows(w, "FacetUser")
+            let mut u = do valSet(rows[ui], "mfaSecret", textVal(secret))
+            u = do valSet(u, "mfaEnabled", boolVal(false))
+            w = do rtSaveUser(w, ui, u)
+            let uri = "otpauth://totp/" + rtPathSegment(w.g.app) + ":" + rtPathSegment(actor) + "?secret=" + secret + "&issuer=" + rtPathSegment(w.g.app)
+            let r = do rtJSONWith(200, ["ok", "secret", "otpauth"], ["true", jsonQuote(secret), jsonQuote(uri)], ck)
+            return RtHandled{resp: r, w: w}
+        if action == "confirmMFA":
+            let code = do rtArgStr(args, 0)
+            let si = do rtSessionIndex(w, sid)
+            let mut actor = ""
+            if si >= 0:
+                actor = w.sessions[si].actor
+            if actor == "" || actor == "guest":
+                let e = do rtErrWith(403, "sign in first", ck)
+                return RtHandled{resp: e, w: w}
+            let ui = do rtFindUserIndex(w, actor)
+            let mut ok = false
+            if ui >= 0:
+                let rows = do rtEntRows(w, "FacetUser")
+                let sec = do valGet(rows[ui], "mfaSecret")
+                ok = totpValid(valToStr(sec), code)
+                if ok:
+                    let u = do valSet(rows[ui], "mfaEnabled", boolVal(true))
+                    w = do rtSaveUser(w, ui, u)
+            if !ok:
+                let e2 = do rtErrWith(400, "invalid code", ck)
+                return RtHandled{resp: e2, w: w}
+            let r = do rtJSONWith(200, ["ok"], ["true"], ck)
+            return RtHandled{resp: r, w: w}
+        let unknown = do rtErrWith(404, "unknown auth action", ck)
+        return RtHandled{resp: unknown, w: w}

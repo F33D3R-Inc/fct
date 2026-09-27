@@ -175,6 +175,16 @@ func compose(facets []*ast.App) (*ast.App, error) {
 		app.CSS = joinCSS(app.CSS, w.CSS)
 		mergeAssets(app, w)
 	}
+	// Expectations are a module-level concern, not a brick-level one: every
+	// facet in the stack may state them, and the flattened graph settles them.
+	for _, f := range facets {
+		for _, ex := range f.Expects {
+			if ex.Source == "" {
+				ex.Source = f.Source
+			}
+		}
+		app.Expects = append(app.Expects, f.Expects...)
+	}
 	for _, b := range bricks {
 		app.Auth = app.Auth || b.Auth
 		app.Entities = append(app.Entities, b.Entities...)

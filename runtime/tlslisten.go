@@ -39,8 +39,8 @@ import (
 // read or write; a failed one reads as a closed connection whose connError
 // names why. Everything else about the handle is listen()'s.
 func (s *Server) ioListenTls(port int, identity, password string) (any, error) {
-	if port <= 0 || port > 65535 {
-		return nil, fmt.Errorf("listenTls: invalid port %d (must be 1-65535)", port)
+	if port < 0 || port > 65535 {
+		return nil, fmt.Errorf("listenTls: invalid port %d (must be 0-65535)", port)
 	}
 	full, err := s.resolveDataPath(identity)
 	if err != nil {

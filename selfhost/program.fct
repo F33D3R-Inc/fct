@@ -544,6 +544,29 @@ app ProgramSelfHost:
         vars: [ThemeVar]
         valid: bool
 
+    # ExpectDecl: one `expect` declaration (ast.Expect) — what this module
+    # needs its host to provide: exactly one of an entity's shape, an
+    # action's signature, a cell's type or a route, by `kind`. The other
+    # three members are fillers (emptyExpectDecl). `source` is the module
+    # file it was written in, stamped when modules merge (compile.go's
+    # mergeInto), for the diagnostic when a host contradicts it.
+    struct ExpectDecl:
+        kind: text
+        entity: EntityDecl
+        action: ActionDecl
+        state: StateDecl
+        route: text
+        # eventName/eventType: `expect event <name>: <Type>` — an event the
+        # module emits and expects a host stream to carry with that payload.
+        eventName: text
+        eventType: text
+        line: int
+        source: text
+
+    struct ExpectBuilt:
+        decl: ExpectDecl
+        err: text
+
     struct Program:
         name: text
         hasAuth: bool
@@ -584,6 +607,21 @@ app ProgramSelfHost:
         contentSrc: text
         unknownKeywords: [text]
         shareds: [SharedDecl]
+        # expects: the module's `expect` declarations, settled by the
+        # driver's driverResolveExpects before any check (compile/expect.go);
+        # expectedRoutes: the expected routes no view serves, for the link
+        # check (App.ExpectedRoutes). entityLines/stateLines/actionLines:
+        # each declaration's source line, parallel to entities/states/
+        # actions — what a contradiction diagnostic names.
+        expects: [ExpectDecl]
+        expectedRoutes: [text]
+        # expectedEventNames/Types: the `expect event`s no stream carries
+        # (App.ExpectedEvents), for the emit checks.
+        expectedEventNames: [text]
+        expectedEventTypes: [text]
+        entityLines: [int]
+        stateLines: [int]
+        actionLines: [int]
 
     # ============================================================
     # STAGE 4: per-kind builders — thin composition over already-ported
@@ -606,6 +644,77 @@ app ProgramSelfHost:
             let parsed = do parseExprTree(exprSrc)
             ex = parsed
         return DeriveDeclFull{name: name, typeCore: core, headerValid: hv, exprSrc: exprSrc, expr: ex, line: lineText, cont: ""}
+
+    proc emptyExpectDecl() -> ExpectDecl:
+        let e = do buildEntityDecl("entity _:", [])
+        let a = do buildActionDecl("action _()", "")
+        let st = do buildStateDecl("state _: int")
+        return ExpectDecl{kind: "", entity: e, action: a, state: st, route: "", eventName: "", eventType: "", line: 0, source: ""}
+
+    # buildExpectDecl: parser.go's parseExpect — the inner declaration is
+    # built by the same builder the real one uses; what the form forbids
+    # is what only the host decides (an action's body, a cell's default).
+    proc buildExpectDecl(header: text, bodyLines: [text], line: int) -> ExpectBuilt:
+        let mut d = do emptyExpectDecl()
+        d.line = line
+        let inner0 = do trimPrefixText(header, "expect ")
+        let inner = trim(inner0)
+        let isEntity = do hasPrefixText(inner, "entity ")
+        if isEntity:
+            let ed = do buildEntityDecl(inner, bodyLines)
+            if len(ed.fields) == 0:
+                return ExpectBuilt{decl: d, err: "entity \"" + ed.name + "\" has no fields"}
+            d.kind = "entity"
+            d.entity = ed
+            return ExpectBuilt{decl: d, err: ""}
+        let isAction = do hasPrefixText(inner, "action ")
+        if isAction:
+            if len(bodyLines) > 0:
+                return ExpectBuilt{decl: d, err: "an expected action has no body — `expect action name(params)` names the signature the host implements"}
+            let ad = do buildActionDecl(inner, "")
+            d.kind = "action"
+            d.action = ad
+            return ExpectBuilt{decl: d, err: ""}
+        let isState = do hasPrefixText(inner, "state ")
+        if isState:
+            if contains(inner, "="):
+                return ExpectBuilt{decl: d, err: "an expected state cell has no default — `expect state name: type` names the cell; the host declares its value"}
+            let sd = do buildStateDecl(inner)
+            d.kind = "state"
+            d.state = sd
+            return ExpectBuilt{decl: d, err: ""}
+        let isEvent = do hasPrefixText(inner, "event ")
+        if isEvent:
+            let rest0 = do trimPrefixText(inner, "event ")
+            let rest = trim(rest0)
+            let colon = do stmtIndexOfText(rest, ":")
+            if colon < 0 || len(bodyLines) > 0:
+                return ExpectBuilt{decl: d, err: "expect event names the event and its payload type: `expect event notification: NotificationDTO`"}
+            let evName = trim(slice(rest, 0, colon))
+            let evType = trim(slice(rest, colon + 1, len(rest)))
+            let nameOk = do stmtIsIdent(evName)
+            let typeOk = do stmtIsIdent(evType)
+            let typeUp = do epIsUpperName(evType)
+            if !nameOk || !typeOk || !typeUp:
+                return ExpectBuilt{decl: d, err: "expect event \"" + evName + "\": \"" + evType + "\" — the event is an identifier and the payload a declared wire type"}
+            d.kind = "event"
+            d.eventName = evName
+            d.eventType = evType
+            return ExpectBuilt{decl: d, err: ""}
+        let isView = do hasPrefixText(inner, "view at ")
+        if isView:
+            let route0 = do trimPrefixText(inner, "view at ")
+            let route = trim(route0)
+            let n = len(route)
+            if n < 3 || charAt(route, 0) != "\"" || charAt(route, n - 1) != "\"" || charAt(route, 1) != "/":
+                return ExpectBuilt{decl: d, err: "expect view at needs a quoted route pattern: `expect view at \"/profile/:handle\"`"}
+            if len(bodyLines) > 0:
+                return ExpectBuilt{decl: d, err: "an expected view has no body — `expect view at \"/path\"` names the route the host serves"}
+            d.kind = "view"
+            d.route = slice(route, 1, n - 1)
+            return ExpectBuilt{decl: d, err: ""}
+        let fw = do nodeFirstWordOf(inner)
+        return ExpectBuilt{decl: d, err: "unexpected `expect " + fw + "`; expect takes entity <Name>: (fields), action <name>(params), state <name>: <type>, event <name>: <Type>, or view at \"/route\""}
 
     proc buildStateDecl(lineText: text) -> StateDecl:
         let name = do stateNameOf(lineText)
@@ -832,7 +941,7 @@ app ProgramSelfHost:
         let h0 = do trimPrefixText(trim(header), "service")
         let rest0 = trim(h0)
         let rest = do trimSuffixText(rest0, ":")
-        let i = do indexOf(rest, " at ")
+        let i = indexOf(rest, " at ", 0)
         if i < 0:
             return ProgServiceHead{err: base, urlEnv: "", headerNames: [], headerEnvs: []}
         let name = trim(slice(rest, 0, i))
@@ -949,7 +1058,7 @@ app ProgramSelfHost:
         return r
 
     proc progViewAtIndex(head: text) -> int:
-        let r = do indexOf(head, " at ")
+        let r = indexOf(head, " at ", 0)
         return r
 
     # progDurationSecs: parseDuration — `30s`/`5m`/`2h`, -1 when invalid.
@@ -984,7 +1093,7 @@ app ProgramSelfHost:
         let h1 = do trimSuffixText(trim(h0), ":")
         let mut head = trim(h1)
         let mut uses = []
-        let ui = do indexOf(head, " uses ")
+        let ui = indexOf(head, " uses ", 0)
         if ui >= 0:
             let usesPart = trim(slice(head, ui + 6, len(head)))
             head = trim(slice(head, 0, ui))
@@ -1001,7 +1110,7 @@ app ProgramSelfHost:
                 uses = append(uses, c)
                 pi = pi + 1
         let mut every = 0
-        let ei = do indexOf(head, " every ")
+        let ei = indexOf(head, " every ", 0)
         if ei >= 0:
             let durS = trim(slice(head, ei + 7, len(head)))
             head = trim(slice(head, 0, ei))
@@ -1089,7 +1198,7 @@ app ProgramSelfHost:
         let r0 = do trimPrefixText(t, "mount ")
         let mut rest = trim(r0)
         let mut guard = ""
-        let ri = do indexOf(rest, " requires ")
+        let ri = indexOf(rest, " requires ", 0)
         if ri >= 0:
             let g0 = trim(slice(rest, ri + 10, len(rest)))
             let g1 = do trimSuffixText(g0, ":")
@@ -1099,7 +1208,7 @@ app ProgramSelfHost:
             if !gok:
                 return ProgMount{wireframe: "", path: "", requires: "", err: "invalid guard policy \"" + guard + "\" after `requires`"}
         let mut path = "/"
-        let ai = do indexOf(rest, " at ")
+        let ai = indexOf(rest, " at ", 0)
         if ai >= 0:
             let q = trim(slice(rest, ai + 4, len(rest)))
             let qn = len(q)
@@ -1118,7 +1227,7 @@ app ProgramSelfHost:
     proc buildProgSocket(t: text) -> ProgSocket:
         let r0 = do trimPrefixText(t, "socket ")
         let rest = trim(r0)
-        let colon = do indexOf(rest, ":")
+        let colon = indexOf(rest, ":", 0)
         if colon < 0:
             return ProgSocket{name: "", accept: "", err: "socket needs a kind: `socket <name>: <ui|data>`"}
         let sname = trim(slice(rest, 0, colon))
@@ -1166,6 +1275,8 @@ app ProgramSelfHost:
         if kw == "auth" || kw == "shared":
             return true
         if kw == "entity":
+            return true
+        if kw == "expect":
             return true
         if kw == "record":
             return true
@@ -1256,6 +1367,10 @@ app ProgramSelfHost:
         let mut hasContent = false
         let mut contentSrc = ""
         let mut shareds = []
+        let mut expects = []
+        let mut entityLines = []
+        let mut stateLines = []
+        let mut actionLines = []
 
         if appHeaderIndex >= 0:
             let nm = do progFacetName(rawLines[appHeaderIndex])
@@ -1335,6 +1450,15 @@ app ProgramSelfHost:
                 if kw == "entity":
                     let ed = do buildEntityDecl(header, bodyLines)
                     entities = append(entities, ed)
+                    entityLines = append(entityLines, lineNos[headerIndex])
+                # `expect …` (parser.go's parseDecl, ahead of every other
+                # declaration): a playground has no expectations to state.
+                if kw == "expect" && kind != "playground":
+                    let exb = do buildExpectDecl(header, bodyLines, lineNos[headerIndex])
+                    if exb.err != "":
+                        parseErrors = append(parseErrors, "line " + lineNos[headerIndex] + ": " + exb.err)
+                    else:
+                        expects = append(expects, exb.decl)
                 if kw == "record":
                     let combined = do combineHeaderBody(header, bodySrc)
                     let rd = do parseRecordDeclSrc(combined)
@@ -1350,6 +1474,7 @@ app ProgramSelfHost:
                 if kw == "state":
                     let st = do buildStateDecl(header)
                     states = append(states, st)
+                    stateLines = append(stateLines, lineNos[headerIndex])
                 if kw == "derive":
                     let dv0 = do buildDeriveDeclFull(header)
                     let dv = DeriveDeclFull{name: dv0.name, typeCore: dv0.typeCore, headerValid: dv0.headerValid, exprSrc: dv0.exprSrc, expr: dv0.expr, line: header, cont: bodySrc}
@@ -1371,6 +1496,7 @@ app ProgramSelfHost:
                 if kw == "action":
                     let ad = do buildActionDecl(header, bodySrc)
                     actions = append(actions, ad)
+                    actionLines = append(actionLines, lineNos[headerIndex])
                 if kw == "webhook":
                     let wh = do buildWebhookDecl(header)
                     webhooks = append(webhooks, WebhookDecl{path: wh.path, action: wh.action, hasSecret: wh.hasSecret, secret: wh.secret, valid: wh.valid, line: lineNos[headerIndex]})
@@ -1441,7 +1567,7 @@ app ProgramSelfHost:
                     # parseShared
                     let lno = lineNos[headerIndex]
                     let rest = trim(slice(header, 6, len(header)))
-                    let colon = do indexOf(rest, ":")
+                    let colon = indexOf(rest, ":", 0)
                     let mut err = ""
                     if trim(bodySrc) != "":
                         err = "a shared cell has no body — write `shared name: Type`"
@@ -1505,13 +1631,35 @@ app ProgramSelfHost:
                     else:
                         css = css + "\n" + block
 
-                let known = do progKnownKeyword(kw)
+                let mut known = do progKnownKeyword(kw)
+                if kw == "expect" && kind == "playground":
+                    known = false
+                # parser.go parses each facet kind with its own reader:
+                # `mount` is a playground's, `socket`/`frame` a wireframe's,
+                # `content` a ui/data facet's — anywhere else the line is an
+                # unknown declaration.
+                if kw == "mount" && kind != "playground":
+                    known = false
+                if (kw == "socket" || kw == "frame") && kind != "wireframe":
+                    known = false
+                if kw == "content" && kind != "ui" && kind != "data":
+                    known = false
                 if !known:
+                    # parseDecl's default arm: a declaration no keyword
+                    # claims is refused, naming its first word.
                     unknownKeywords = append(unknownKeywords, header)
+                    let ufw = do nodeFirstWordOf(header)
+                    let ufq = do goQuote(ufw)
+                    let mut umsg = "unexpected " + ufq + "; expected entity/record/struct/enum/type/message/state/derive/policy/action/proc/job/daemon/service/file/webhook/component/layout/theme/view/expect"
+                    if kind == "playground":
+                        umsg = "unexpected " + ufq + " in playground; a playground takes `auth`, `theme`, and `mount <Wireframe> [at \"/path\"] [requires <policy>]`"
+                    if kind == "wireframe":
+                        umsg = "unexpected " + ufq + " in wireframe; a wireframe takes `socket <name>: <ui|data>`, `frame:`, and `theme:`"
+                    parseErrors = append(parseErrors, "line " + lineNos[headerIndex] + ": " + umsg)
 
                 k = k + 1
 
-        return Program{name: name, hasAuth: hasAuth, entities: entities, records: records, structs: structs, enums: enums, states: states, derives: derives, policies: policies, procs: procs, actions: actions, webhooks: webhooks, jobs: jobs, services: services, components: components, triggers: triggers, views: views, themes: themes, css: css, daemons: daemons, privateProcs: privateProcs, parseErrors: parseErrors, layouts: layouts, rawDecls: rawDecls, kind: kind, into: into, mounts: mounts, sockets: sockets, hasFrame: hasFrame, frameSrc: frameSrc, hasContent: hasContent, contentSrc: contentSrc, unknownKeywords: unknownKeywords, shareds: shareds}
+        return Program{name: name, hasAuth: hasAuth, entities: entities, records: records, structs: structs, enums: enums, states: states, derives: derives, policies: policies, procs: procs, actions: actions, webhooks: webhooks, jobs: jobs, services: services, components: components, triggers: triggers, views: views, themes: themes, css: css, daemons: daemons, privateProcs: privateProcs, parseErrors: parseErrors, layouts: layouts, rawDecls: rawDecls, kind: kind, into: into, mounts: mounts, sockets: sockets, hasFrame: hasFrame, frameSrc: frameSrc, hasContent: hasContent, contentSrc: contentSrc, unknownKeywords: unknownKeywords, shareds: shareds, expects: expects, expectedRoutes: [], expectedEventNames: [], expectedEventTypes: [], entityLines: entityLines, stateLines: stateLines, actionLines: actionLines}
 
     # ============================================================
     # STAGE 7: the live, HTTP-exercisable driver — proof `parseProgramSrc`

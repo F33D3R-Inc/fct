@@ -1,0 +1,918 @@
+import "sse_live.fct"
+
+app ActionExec:
+    # action_exec.fct — runtime/server.go's runActionValue / runActionLocked
+    # / execActionBlock: a server action run against the world — arguments
+    # bound and coerced (paramArg), `requires` policies enforced
+    # (policyPasses), the body executed statement by statement (check,
+    # assign, add, set, remove, clear, let, if, for, foreach, return,
+    # exprstmt, establish), constraints checked before a row lands
+    # (constraintError), and on success the entity changes fanned out to
+    # the live stream and the session deltas handed back. A body that
+    # stops part-way leaves the world exactly as it was: the world is a
+    # value, so the rollback is the caller keeping the one it had.
+    # RtHandled: one endpoint's answer — the response and the world after it.
+    struct RtHandled:
+        resp: HttpServerResponse
+        w: RtWorld
+
+    proc rtJSONResponse(status: int, body: text) -> HttpServerResponse:
+        return HttpServerResponse{status: status, reason: "", headers: [HttpHeader{name: "content-type", value: "application/json"}], body: body}
+
+    struct RtRun:
+        w: RtWorld
+        sid: text
+        deltaKeys: [text]
+        deltaVals: [Val]
+        value: Val
+        status: int
+        msg: text
+        # replyMeta: `return … status N`, the `header` statements, and the
+        # failing check's `code` (statusReply in Go).
+        retStatus: int
+        headerNames: [text]
+        headerVals: [text]
+        code: text
+
+    # RtExec: the state one action's body runs in.
+    struct RtExec:
+        w: RtWorld
+        sc: RtScope
+        ses: RtSession
+        deltaKeys: [text]
+        deltaVals: [Val]
+        changed: [text]
+        retVal: Val
+        returned: bool
+        status: int
+        msg: text
+        bound: [text]
+        retStatus: int
+        headerNames: [text]
+        headerVals: [text]
+        errCode: text
+        revokes: [text]
+        restateActors: [text]
+        restateRoles: [text]
+        rekey: text
+        actName: text
+
+    proc rtParamTypeName(p: IRParam) -> text:
+        if p.list:
+            return "[" + p.type + "]"
+        return p.type
+
+    # rtCoerceParam: coerceParam — a boundary coercion that can refuse.
+    struct RtCoerced:
+        ok: bool
+        v: Val
+
+    proc rtIsNumericText(s: text) -> bool:
+        let t = trim(s)
+        if t == "":
+            return true
+        let mut i = 0
+        let mut digits = 0
+        loop i < len(t):
+            let c = charAt(t, i)
+            let d = c >= "0" && c <= "9"
+            if d:
+                digits = digits + 1
+            else:
+                if !((c == "-" || c == "+") && i == 0) && c != "." && c != "_" && c != ",":
+                    return false
+            i = i + 1
+        return digits > 0
+
+    proc rtCoerceParam(v: Val, typ: text) -> RtCoerced:
+        if typ == "int" || typ == "money" || typ == "date" || typ == "float":
+            if v.kind == "none":
+                if typ == "float":
+                    return RtCoerced{ok: true, v: floatVal(0.0)}
+                return RtCoerced{ok: true, v: intVal(0)}
+            if v.kind == "text":
+                let num = do rtIsNumericText(v.t)
+                if !num:
+                    return RtCoerced{ok: false, v: v}
+            if v.kind == "bool" || v.kind == "record" || v.kind == "list":
+                return RtCoerced{ok: false, v: v}
+        if typ == "bool" || typ == "text":
+            if v.kind == "record" || v.kind == "list":
+                return RtCoerced{ok: false, v: v}
+        let c = do rtCoerce(v, typ)
+        return RtCoerced{ok: true, v: c}
+
+    proc rtParamArg(v: Val, p: IRParam) -> RtCoerced:
+        if !p.list:
+            let c = do rtCoerceParam(v, p.type)
+            return c
+        let mut items = []
+        if v.kind == "list":
+            items = v.items
+        if v.kind == "text":
+            let parts = split(v.t, ",")
+            let mut i = 0
+            loop i < len(parts):
+                let t = trim(parts[i])
+                if t != "":
+                    items = append(items, textVal(t))
+                i = i + 1
+        if v.kind == "record":
+            return RtCoerced{ok: false, v: v}
+        if v.kind == "int" || v.kind == "float" || v.kind == "bool":
+            items = [v]
+        let mut out = []
+        let mut k = 0
+        loop k < len(items):
+            let c = do rtCoerceParam(items[k], p.type)
+            if !c.ok:
+                return RtCoerced{ok: false, v: v}
+            out = append(out, c.v)
+            k = k + 1
+        return RtCoerced{ok: true, v: listVal(out)}
+
+    proc rtParamZero(p: IRParam) -> Val:
+        if p.list:
+            let l = do listVal([])
+            return l
+        if p.type == "int" || p.type == "money" || p.type == "date":
+            let z = do intVal(0)
+            return z
+        if p.type == "float":
+            let f = do floatVal(0.0)
+            return f
+        if p.type == "bool":
+            let b = do boolVal(false)
+            return b
+        let t = do textVal("")
+        return t
+
+    # rtPolicyPasses: policyPasses — a policy's parameters bound from the
+    # `requires` call site.
+    proc rtPolicyPasses(g: IRGraph, req: IRRequire, sc: RtScope) -> bool:
+        let pi = do rtPolicyIndex(g, req.name)
+        if pi < 0:
+            return false
+        let pol = g.policies[pi]
+        if len(pol.params) == 0:
+            let r = do rtEvalOpt(pol.expr, sc, -1)
+            let ok = do valTruthy(r.v)
+            return ok
+        let mut ps = sc
+        let mut i = 0
+        loop i < len(pol.params):
+            let mut v = do noneVal()
+            if i < len(req.args):
+                let ar = do rtEval(req.args[i], sc, -1)
+                v = ar.v
+            let cv = do rtCoerce(v, pol.params[i].type)
+            ps = do rtSet(ps, pol.params[i].name, cv)
+            i = i + 1
+        let r2 = do rtEvalOpt(pol.expr, ps, -1)
+        let ok2 = do valTruthy(r2.v)
+        return ok2
+
+    proc rtFailed(w: RtWorld, sid: text, status: int, msg: text) -> RtRun:
+        return RtRun{w: w, sid: sid, deltaKeys: [], deltaVals: [], value: noneVal(), status: status, msg: msg, retStatus: 0, headerNames: [], headerVals: [], code: ""}
+
+    proc rtFailedCode(w: RtWorld, sid: text, status: int, msg: text, code: text) -> RtRun:
+        return RtRun{w: w, sid: sid, deltaKeys: [], deltaVals: [], value: noneVal(), status: status, msg: msg, retStatus: 0, headerNames: [], headerVals: [], code: code}
+
+    # rtRunActionValue: runActionValue — the whole of one action.
+    proc rtRunActionValue(w0: RtWorld, sid: text, act: IRAction, args: [Val]) -> RtRun:
+        let mut w = w0
+        let si0 = do rtSessionIndex(w, sid)
+        if si0 < 0:
+            let fresh = do rtNewSession(w, sid, "guest", "guest")
+            w = do rtPutSession(w, fresh)
+        let mut sc = do rtScope(w, sid)
+        sc = do rtSet(sc, "sessionToken", textVal(rtSessionToken(w, sid)))
+        let mut given = []
+        let mut i = 0
+        loop i < len(act.params):
+            let p = act.params[i]
+            let mut v = do rtParamZero(p)
+            if i < len(args) && args[i].kind != "none":
+                given = append(given, p.name)
+            if i < len(args):
+                let c = do rtParamArg(args[i], p)
+                if !c.ok:
+                    let bad = do rtFailed(w0, sid, 400, act.name + ": parameter \"" + p.name + "\" expects " + rtParamTypeName(p) + ", got " + valToStr(args[i]))
+                    return bad
+                v = c.v
+            sc = do rtSet(sc, p.name, v)
+            i = i + 1
+        let mut r = 0
+        loop r < len(act.requires):
+            let ok = do rtPolicyPasses(w.g, act.requires[r], sc)
+            if !ok:
+                let denied = do rtFailed(w0, sid, 403, "forbidden: " + act.requires[r].name)
+                return denied
+            r = r + 1
+        sc.given = given
+        let si = do rtSessionIndex(w, sid)
+        let ex0 = RtExec{w: w, sc: sc, ses: w.sessions[si], deltaKeys: [], deltaVals: [], changed: [], retVal: noneVal(), returned: false, status: 200, msg: "", bound: [], retStatus: 0, headerNames: [], headerVals: [], errCode: "", revokes: [], restateActors: [], restateRoles: [], rekey: "", actName: act.name}
+        let ex = do rtExecBlock(act.body, ex0)
+        if ex.status != 200:
+            let failed = do rtFailedCode(w0, sid, ex.status, ex.msg, ex.errCode)
+            return failed
+        w = ex.w
+        let mut after = sid
+        # The action is durable, so its session effects land now: a re-keyed
+        # session (establish), the visitor keys it revoked, the actors it
+        # restated.
+        if ex.rekey != "":
+            let ri = do rtSessionIndex(w, sid)
+            if ri >= 0:
+                let mut moved = ex.ses
+                moved.sid = ex.rekey
+                w.sessions[ri] = moved
+            after = ex.rekey
+        else:
+            w = do rtPutSession(w, ex.ses)
+        let mut rv = 0
+        loop rv < len(ex.revokes):
+            if ex.revokes[rv] != "":
+                let rvo = do rtRevokeVisitor(w, ex.revokes[rv], after)
+                w = rvo.w
+                if rvo.endedOwn:
+                    after = ""
+            rv = rv + 1
+        let mut rs = 0
+        loop rs < len(ex.restateActors):
+            w = do rtRestateActor(w, ex.restateActors[rs], ex.restateRoles[rs])
+            rs = rs + 1
+        if len(ex.changed) > 0:
+            w = do rtBroadcast(w, ex.changed)
+        # replyValue: an entity-typed reply carries only what the caller may
+        # receive (visibleRows).
+        let mut reply = ex.retVal
+        let retEnt = do rtEntityIndex(w.g, act.ret)
+        if retEnt >= 0 && reply.kind != "none":
+            if act.retList && reply.kind == "list":
+                let vis = do rtVisibleRows(act.ret, reply.items, ex.sc, false)
+                reply = do listVal(vis)
+            else:
+                if reply.kind == "record":
+                    let vis1 = do rtVisibleRows(act.ret, [reply], ex.sc, false)
+                    reply = vis1[0]
+        return RtRun{w: w, sid: after, deltaKeys: ex.deltaKeys, deltaVals: ex.deltaVals, value: reply, status: 200, msg: "", retStatus: ex.retStatus, headerNames: ex.headerNames, headerVals: ex.headerVals, code: ""}
+
+    proc rtSessionToken(w: RtWorld, sid: text) -> text:
+        if sid == "" || sid == "__system" || sid == "tool":
+            return ""
+        let t = do rtSignValue(w, sid)
+        return t
+
+    # rtRevokeVisitor: every session sharing the visitor key ends; whether
+    # the caller's own did.
+    struct RtRevoked:
+        w: RtWorld
+        endedOwn: bool
+
+    proc rtRevokeVisitor(w0: RtWorld, key: text, own: text) -> RtRevoked:
+        let mut w = w0
+        let mut kept = []
+        let mut endedOwn = false
+        let mut i = 0
+        loop i < len(w.sessions):
+            let ses = w.sessions[i]
+            let tok = do rtSessionToken(w, ses.sid)
+            if ses.visitor == key && tok != "":
+                if ses.sid == own:
+                    endedOwn = true
+            else:
+                kept = append(kept, ses)
+            i = i + 1
+        w.sessions = kept
+        return RtRevoked{w: w, endedOwn: endedOwn}
+
+    proc rtRestateActor(w0: RtWorld, actor: text, role: text) -> RtWorld:
+        let mut w = w0
+        if actor == "" || actor == "guest":
+            return w
+        let mut i = 0
+        loop i < len(w.sessions):
+            if w.sessions[i].actor == actor && w.sessions[i].sid != "__system" && w.sessions[i].sid != "tool":
+                let mut ses = w.sessions[i]
+                ses.role = role
+                ses = do rtSesSet(ses, "role", textVal(role))
+                w.sessions[i] = ses
+            i = i + 1
+        return w
+
+    # ── constraints ─────────────────────────────────────────────────────
+    proc rtConstraintError(w: RtWorld, entity: text, row: Val, changedField: text, excludeID: Val) -> text:
+        let ei = do rtEntityIndex(w.g, entity)
+        if ei < 0:
+            return ""
+        let def = w.g.entities[ei]
+        let rows = do rtEntRows(w, entity)
+        let mut i = 0
+        loop i < len(def.fields):
+            let f = def.fields[i]
+            let relevant = changedField == "" || f.name == changedField
+            let any = f.required || f.unique || f.hasMin || f.hasMax || f.matches != ""
+            if relevant && any:
+                let present = do valHas(row, f.name)
+                let val = do valGet(row, f.name)
+                let vs = do valToStr(val)
+                if f.required && (!present || val.kind == "none" || vs == ""):
+                    return f.name + " is required"
+                if present && val.kind != "none":
+                    if f.hasMin || f.hasMax:
+                        if f.type == "text":
+                            let n = len(vs)
+                            if f.hasMin && n < f.min:
+                                return f.name + " must be at least " + f.min + " characters"
+                            if f.hasMax && n > f.max:
+                                return f.name + " must be at most " + f.max + " characters"
+                        else:
+                            let n2 = do valToInt(val)
+                            if f.hasMin && n2 < f.min:
+                                return f.name + " must be at least " + f.min
+                            if f.hasMax && n2 > f.max:
+                                return f.name + " must be at most " + f.max
+                    if f.unique:
+                        let mut k = 0
+                        loop k < len(rows):
+                            let m = rows[k]
+                            if m.kind == "record":
+                                let mid = do valGet(m, "id")
+                                let mut skip = false
+                                if excludeID.kind != "none":
+                                    skip = do valEqual(mid, excludeID)
+                                if !skip:
+                                    let mv = do valGet(m, f.name)
+                                    let same = do valEqual(mv, val)
+                                    if same:
+                                        return f.name + " must be unique"
+                            k = k + 1
+            i = i + 1
+        return ""
+
+    proc rtIsHashed(g: IRGraph, entity: text, field: text) -> bool:
+        let ei = do rtEntityIndex(g, entity)
+        if ei < 0:
+            return false
+        let mut i = 0
+        loop i < len(g.entities[ei].fields):
+            let f = g.entities[ei].fields[i]
+            if f.name == field:
+                return f.password
+            i = i + 1
+        return false
+
+    # rtStoreRow: storeRow — a @password field lands as its bcrypt hash.
+    proc rtStoreRow(g: IRGraph, entity: text, row: Val) -> Val:
+        let mut out = row
+        let mut i = 0
+        loop i < len(row.keys):
+            let hashed = do rtIsHashed(g, entity, row.keys[i])
+            if hashed:
+                let pv = do valToStr(row.items[i])
+                out = do valSet(out, row.keys[i], textVal(bcryptHash(pv)))
+            i = i + 1
+        return out
+
+    proc rtMarkChanged(ex0: RtExec, entity: text) -> RtExec:
+        let mut ex = ex0
+        let mut i = 0
+        loop i < len(ex.changed):
+            if ex.changed[i] == entity:
+                return ex
+            i = i + 1
+        ex.changed = append(ex.changed, entity)
+        return ex
+
+    proc rtDelta(ex0: RtExec, name: text, v: Val) -> RtExec:
+        let mut ex = ex0
+        let mut i = 0
+        loop i < len(ex.deltaKeys):
+            if ex.deltaKeys[i] == name:
+                ex.deltaVals[i] = v
+                return ex
+            i = i + 1
+        ex.deltaKeys = append(ex.deltaKeys, name)
+        ex.deltaVals = append(ex.deltaVals, v)
+        return ex
+
+    proc rtSesSet(ses0: RtSession, name: text, v: Val) -> RtSession:
+        let mut ses = ses0
+        let mut i = 0
+        loop i < len(ses.stateKeys):
+            if ses.stateKeys[i] == name:
+                ses.stateVals[i] = v
+                return ses
+            i = i + 1
+        ses.stateKeys = append(ses.stateKeys, name)
+        ses.stateVals = append(ses.stateVals, v)
+        return ses
+
+    proc rtSesGet(ses: RtSession, name: text) -> Val:
+        let v = do lookupRef(name, ses.stateKeys, ses.stateVals)
+        return v
+
+    proc rtSameValue(a: Val, b: Val) -> bool:
+        if a.kind != b.kind:
+            return false
+        let x = do valToStr(a)
+        let y = do valToStr(b)
+        return x == y
+
+    # rtRefresh: keep the entity collections in scope fresh for later
+    # statements.
+    proc rtRefresh(ex0: RtExec) -> RtExec:
+        let mut ex = ex0
+        let mut i = 0
+        loop i < len(ex.changed):
+            let rows = do rtEntRows(ex.w, ex.changed[i])
+            ex.sc = do rtSet(ex.sc, ex.changed[i], listVal(rows))
+            i = i + 1
+        return ex
+
+    proc rtFail(ex0: RtExec, status: int, msg: text) -> RtExec:
+        let mut ex = ex0
+        ex.status = status
+        ex.msg = msg
+        return ex
+
+    # rtExecBlock: execActionBlock — a block's statements in order; names
+    # the block bound are dropped on exit.
+    proc rtExecBlock(body: [IRStmt], ex0: RtExec) -> RtExec:
+        let mut ex = ex0
+        let outerBound = ex.bound
+        ex.bound = []
+        let mut i = 0
+        let mut stop = false
+        loop i < len(body) && !stop:
+            ex = do rtExecStmt(body[i], ex)
+            if ex.status != 200 || ex.returned:
+                stop = true
+            ex = do rtRefresh(ex)
+            i = i + 1
+        let mut k = 0
+        loop k < len(ex.bound):
+            ex.sc = do rtDrop(ex.sc, ex.bound[k])
+            k = k + 1
+        ex.bound = outerBound
+        return ex
+
+    proc rtExecStmt(st: IRStmt, ex0: RtExec) -> RtExec:
+        let mut ex = ex0
+        let op = st.op
+        if op == "check":
+            let cr = do rtEvalOpt(st.value, ex.sc, -1)
+            ex.sc = cr.sc
+            if ex.sc.err != "":
+                let pf = do rtProcError(ex)
+                return pf
+            let ok = do valTruthy(cr.v)
+            if !ok:
+                let mut msg = st.msg
+                if len(st.key) > 0:
+                    let mr = do rtEvalOpt(st.key, ex.sc, -1)
+                    msg = do valToStr(mr.v)
+                ex.errCode = st.target
+                let mut status = 422
+                if st.status != 0:
+                    status = st.status
+                let f = do rtFail(ex, status, msg)
+                return f
+            return ex
+        if op == "header":
+            let hr = do rtEvalOpt(st.value, ex.sc, -1)
+            ex.sc = hr.sc
+            let hv = do valToStr(hr.v)
+            let valid = do rtValidHeaderValue(hv)
+            if !valid:
+                let hf = do rtFail(ex, 500, "header " + st.msg + " has a value that is not a valid HTTP header value")
+                return hf
+            ex.headerNames = append(ex.headerNames, st.msg)
+            ex.headerVals = append(ex.headerVals, hv)
+            return ex
+        if op == "revoke":
+            let rvr = do rtEvalOpt(st.value, ex.sc, -1)
+            ex.sc = rvr.sc
+            ex.revokes = append(ex.revokes, valToStr(rvr.v))
+            return ex
+        if op == "restate":
+            let ra = do rtEvalOpt(st.value, ex.sc, -1)
+            ex.sc = ra.sc
+            let rr0 = do rtEvalOpt(st.role, ex.sc, -1)
+            ex.sc = rr0.sc
+            ex.restateActors = append(ex.restateActors, valToStr(ra.v))
+            ex.restateRoles = append(ex.restateRoles, valToStr(rr0.v))
+            return ex
+        if op == "emit":
+            # Stream events (streams.go's fanoutEvents): the event streams
+            # are not served yet, so nothing subscribes; the payload is still
+            # evaluated for its effect on evaluation order.
+            let er0 = do rtEvalOpt(st.value, ex.sc, -1)
+            ex.sc = er0.sc
+            return ex
+        if op == "assign":
+            let vr = do rtEvalOpt(st.value, ex.sc, -1)
+            ex.sc = vr.sc
+            if ex.sc.err != "":
+                let pf2 = do rtProcError(ex)
+                return pf2
+            let cur = do rtSesGet(ex.ses, st.target)
+            let same = do rtSameValue(cur, vr.v)
+            if !same:
+                ex.ses = do rtSesSet(ex.ses, st.target, vr.v)
+                ex.sc = do rtSet(ex.sc, st.target, vr.v)
+                let priv = do rtIsPrivateState(ex.w.g, st.target)
+                if !priv:
+                    ex = do rtDelta(ex, st.target, vr.v)
+            return ex
+        if op == "establish":
+            let ar = do rtEvalOpt(st.value, ex.sc, -1)
+            ex.sc = ar.sc
+            let na = do valToStr(ar.v)
+            let curTok = do rtSessionToken(ex.w, ex.ses.sid)
+            if ex.rekey == "" && curTok != "":
+                let fresh = do rtNewSessionID()
+                ex.rekey = fresh
+                let tokV = do rtSessionToken(ex.w, fresh)
+                ex.sc = do rtSet(ex.sc, "sessionToken", textVal(tokV))
+            ex.ses.actor = na
+            ex.sc = do rtSet(ex.sc, "actor", textVal(na))
+            ex = do rtDelta(ex, "actor", textVal(na))
+            if len(st.role) > 0:
+                let rr = do rtEvalOpt(st.role, ex.sc, -1)
+                ex.sc = rr.sc
+                let nr = do valToStr(rr.v)
+                ex.ses.role = nr
+                ex.sc = do rtSet(ex.sc, "role", textVal(nr))
+                ex = do rtDelta(ex, "role", textVal(nr))
+            return ex
+        if op == "add":
+            let mut row = do recordVal([], [])
+            let mut fi = 0
+            loop fi < len(st.fieldNames):
+                let fr = do rtEval(st.fieldExprs[fi], ex.sc, -1)
+                ex.sc = fr.sc
+                row = do valSet(row, st.fieldNames[fi], fr.v)
+                fi = fi + 1
+            if ex.sc.err != "":
+                let pf3 = do rtProcError(ex)
+                return pf3
+            let none = do noneVal()
+            let bad = do rtConstraintError(ex.w, st.entity, row, "", none)
+            if bad != "":
+                let f2 = do rtFail(ex, 422, bad)
+                return f2
+            row = do rtStoreRow(ex.w.g, st.entity, row)
+            let ei = do rtEntIndex(ex.w, st.entity)
+            if ei >= 0:
+                let id = ex.w.nextIds[ei] + 1
+                ex.w.nextIds[ei] = id
+                row = do valSet(row, "id", intVal(id))
+                let rows = do rtEntRows(ex.w, st.entity)
+                ex.w = do rtSetEntRows(ex.w, st.entity, append(rows, row))
+                ex = do rtMarkChanged(ex, st.entity)
+                if st.bind != "":
+                    ex.sc = do rtSet(ex.sc, st.bind, intVal(id))
+                    ex.bound = append(ex.bound, st.bind)
+            return ex
+        if op == "set":
+            let sr = do rtExecSet(st, ex)
+            return sr
+        if op == "remove":
+            let rmr = do rtExecRemove(st, ex)
+            return rmr
+        if op == "clear":
+            ex.w = do rtSetEntRows(ex.w, st.entity, [])
+            ex = do rtMarkChanged(ex, st.entity)
+            ex = do rtCascade(ex, st.entity, [])
+            return ex
+        if op == "exprstmt":
+            let er = do rtEvalOpt(st.value, ex.sc, -1)
+            ex.sc = er.sc
+            return ex
+        if op == "return":
+            if len(st.value) > 0:
+                let rv = do rtEvalOpt(st.value, ex.sc, -1)
+                ex.sc = rv.sc
+                if ex.sc.err != "":
+                    let pf4 = do rtProcError(ex)
+                    return pf4
+                ex.retVal = rv.v
+            ex.retStatus = st.status
+            ex.returned = true
+            return ex
+        if op == "let":
+            let lr = do rtEvalOpt(st.value, ex.sc, -1)
+            ex.sc = lr.sc
+            if ex.sc.err != "":
+                let pf5 = do rtProcError(ex)
+                return pf5
+            ex.sc = do rtSet(ex.sc, st.target, lr.v)
+            ex.bound = append(ex.bound, st.target)
+            return ex
+        if op == "if":
+            let cr2 = do rtEvalOpt(st.value, ex.sc, -1)
+            ex.sc = cr2.sc
+            if ex.sc.err != "":
+                let pf6 = do rtProcError(ex)
+                return pf6
+            let t = do valTruthy(cr2.v)
+            if t:
+                let br = do rtExecBlock(st.body, ex)
+                return br
+            if len(st.elseBody) > 0:
+                let er2 = do rtExecBlock(st.elseBody, ex)
+                return er2
+            return ex
+        if op == "for":
+            let fr2 = do rtExecFor(st, ex)
+            return fr2
+        if op == "foreach":
+            let items = do rtEvalOpt(st.value, ex.sc, -1)
+            ex.sc = items.sc
+            let prev = do rtGet(ex.sc, st.itemVar)
+            let had = do rtHas(ex.sc, st.itemVar)
+            let mut i = 0
+            let mut stop = false
+            loop i < len(items.v.items) && !stop:
+                ex.sc = do rtSet(ex.sc, st.itemVar, items.v.items[i])
+                ex = do rtExecBlock(st.body, ex)
+                if ex.status != 200 || ex.returned:
+                    stop = true
+                i = i + 1
+            ex.sc = do rtRestore(ex.sc, st.itemVar, had, prev)
+            return ex
+        if op == "do":
+            let dar = do rtEvalList(st.args, ex.sc, -1)
+            ex.sc = dar.sc
+            if ex.sc.err != "":
+                let pf7 = do rtProcError(ex)
+                return pf7
+            let res = do rtRunProc(st.service, dar.v.items)
+            if res.sc.err != "":
+                let df = do rtFail(ex, 500, ex.actName + ": proc " + st.service + " failed: " + res.sc.err)
+                return df
+            if st.bind != "":
+                let cv = do rtCoerceRet(res.v, st.ret, st.retList)
+                ex.sc = do rtSet(ex.sc, st.bind, cv)
+                ex.bound = append(ex.bound, st.bind)
+            return ex
+        if op == "call":
+            # An external service (callService / callServiceSync): the only
+            # egress the Go runtime makes; a self-hosted runtime has no
+            # brain to post to in this harness, so a bound call fails as an
+            # unreachable service does and a fire-and-forget one is dropped.
+            if st.bind != "":
+                let sf = do rtFail(ex, 502, st.service + "." + st.field + " unavailable")
+                return sf
+            return ex
+        return ex
+
+    # rtProcError: a proc that failed inside an expression fails the action
+    # with its own message (execActionBlockCatching).
+    proc rtProcError(ex0: RtExec) -> RtExec:
+        let mut ex = ex0
+        let msg = ex.sc.err
+        let mut cleared = ex.sc
+        cleared.err = ""
+        ex.sc = cleared
+        let f = do rtFail(ex, 500, msg)
+        return f
+
+    proc rtValidHeaderValue(v: text) -> bool:
+        let bs = textToBytes(v)
+        let mut i = 0
+        loop i < len(bs):
+            let c = bs[i]
+            if (c < 32 && c != 9) || c == 127:
+                return false
+            i = i + 1
+        return true
+
+    proc rtExecSet(st: IRStmt, ex0: RtExec) -> RtExec:
+        let mut ex = ex0
+        let rows = do rtEntRows(ex.w, st.entity)
+        if len(st.where) > 0:
+            let prev = do rtGet(ex.sc, st.itemVar)
+            let had = do rtHas(ex.sc, st.itemVar)
+            let mut out = []
+            let mut matched = false
+            let mut i = 0
+            loop i < len(rows):
+                let m = rows[i]
+                let mut keep = m
+                if m.kind == "record":
+                    ex.sc = do rtSet(ex.sc, st.itemVar, m)
+                    let pr = do rtEval(st.where[0], ex.sc, -1)
+                    ex.sc = pr.sc
+                    let hit = do valTruthy(pr.v)
+                    if hit:
+                        let mut cand = m
+                        let mut fi = 0
+                        loop fi < len(st.fieldNames):
+                            let fr = do rtEval(st.fieldExprs[fi], ex.sc, -1)
+                            ex.sc = fr.sc
+                            cand = do valSet(cand, st.fieldNames[fi], fr.v)
+                            fi = fi + 1
+                        let mid = do valGet(m, "id")
+                        let mut fj = 0
+                        loop fj < len(st.fieldNames):
+                            let bad = do rtConstraintError(ex.w, st.entity, cand, st.fieldNames[fj], mid)
+                            if bad != "":
+                                ex.sc = do rtRestore(ex.sc, st.itemVar, had, prev)
+                                let f = do rtFail(ex, 422, bad)
+                                return f
+                            fj = fj + 1
+                        cand = do rtStoreRow(ex.w.g, st.entity, cand)
+                        keep = cand
+                        matched = true
+                out = append(out, keep)
+                i = i + 1
+            ex.sc = do rtRestore(ex.sc, st.itemVar, had, prev)
+            ex.w = do rtSetEntRows(ex.w, st.entity, out)
+            if matched:
+                ex = do rtMarkChanged(ex, st.entity)
+            return ex
+        let kr = do rtEvalOpt(st.key, ex.sc, -1)
+        ex.sc = kr.sc
+        let mut out2 = []
+        let mut done = false
+        let mut j = 0
+        loop j < len(rows):
+            let m2 = rows[j]
+            let mut keep2 = m2
+            if m2.kind == "record" && !done:
+                let id2 = do valGet(m2, "id")
+                let same = do valEqual(id2, kr.v)
+                if same:
+                    let nv = do rtEvalOpt(st.value, ex.sc, -1)
+                    ex.sc = nv.sc
+                    let mut cand2 = do valSet(m2, st.field, nv.v)
+                    let bad2 = do rtConstraintError(ex.w, st.entity, cand2, st.field, id2)
+                    if bad2 != "":
+                        let f2 = do rtFail(ex, 422, bad2)
+                        return f2
+                    cand2 = do rtStoreRow(ex.w.g, st.entity, cand2)
+                    keep2 = cand2
+                    done = true
+            out2 = append(out2, keep2)
+            j = j + 1
+        if done:
+            ex.w = do rtSetEntRows(ex.w, st.entity, out2)
+            ex = do rtMarkChanged(ex, st.entity)
+        return ex
+
+    proc rtIsSoftDelete(g: IRGraph, entity: text) -> bool:
+        let ei = do rtEntityIndex(g, entity)
+        if ei < 0:
+            return false
+        return g.entities[ei].softDelete
+
+    proc rtExecRemove(st: IRStmt, ex0: RtExec) -> RtExec:
+        let mut ex = ex0
+        let soft = do rtIsSoftDelete(ex.w.g, st.entity)
+        let rows = do rtEntRows(ex.w, st.entity)
+        let mut kept = []
+        let mut removed = []
+        if len(st.where) > 0:
+            let prev = do rtGet(ex.sc, st.itemVar)
+            let had = do rtHas(ex.sc, st.itemVar)
+            let mut i = 0
+            loop i < len(rows):
+                let m = rows[i]
+                if m.kind != "record":
+                    kept = append(kept, m)
+                else:
+                    ex.sc = do rtSet(ex.sc, st.itemVar, m)
+                    let pr = do rtEval(st.where[0], ex.sc, -1)
+                    ex.sc = pr.sc
+                    let hit = do valTruthy(pr.v)
+                    if hit:
+                        let mid = do valGet(m, "id")
+                        removed = append(removed, valToInt(mid))
+                        if soft:
+                            kept = append(kept, valSet(m, "archived", boolVal(true)))
+                    else:
+                        kept = append(kept, m)
+                i = i + 1
+            ex.sc = do rtRestore(ex.sc, st.itemVar, had, prev)
+        else:
+            let kr = do rtEvalOpt(st.key, ex.sc, -1)
+            ex.sc = kr.sc
+            let mut done = false
+            let mut j = 0
+            loop j < len(rows):
+                let m2 = rows[j]
+                let mut drop = false
+                if m2.kind == "record" && !done:
+                    let id2 = do valGet(m2, "id")
+                    let same = do valEqual(id2, kr.v)
+                    if same:
+                        drop = true
+                        done = true
+                        removed = append(removed, valToInt(id2))
+                if !drop:
+                    kept = append(kept, m2)
+                j = j + 1
+        if len(removed) > 0:
+            if soft:
+                let mut live = []
+                let mut k = 0
+                loop k < len(kept):
+                    let av = do valGet(kept[k], "archived")
+                    let arch = do valTruthy(av)
+                    if !arch:
+                        live = append(live, kept[k])
+                    k = k + 1
+                ex.w = do rtSetEntRows(ex.w, st.entity, live)
+            else:
+                ex.w = do rtSetEntRows(ex.w, st.entity, kept)
+                ex = do rtCascade(ex, st.entity, removed)
+            ex = do rtMarkChanged(ex, st.entity)
+        return ex
+
+    # rtCascade: cascadeMem — a hard delete removes the children that
+    # reference the removed rows (a field with `ref` to the parent).
+    proc rtCascade(ex0: RtExec, parent: text, removed: [int]) -> RtExec:
+        let mut ex = ex0
+        let g = ex.w.g
+        let mut e = 0
+        loop e < len(g.entities):
+            let ent = g.entities[e]
+            let mut f = 0
+            loop f < len(ent.fields):
+                let fld = ent.fields[f]
+                if fld.ref == parent:
+                    let rows = do rtEntRows(ex.w, ent.name)
+                    let mut kept = []
+                    let mut gone = []
+                    let mut i = 0
+                    loop i < len(rows):
+                        let fv = do valGet(rows[i], fld.name)
+                        let fid = do valToInt(fv)
+                        let mut hit = false
+                        let mut k = 0
+                        loop k < len(removed):
+                            if removed[k] == fid:
+                                hit = true
+                            k = k + 1
+                        if len(removed) == 0:
+                            hit = false
+                        if hit:
+                            let cid = do valGet(rows[i], "id")
+                            gone = append(gone, valToInt(cid))
+                        else:
+                            kept = append(kept, rows[i])
+                        i = i + 1
+                    if len(gone) > 0:
+                        ex.w = do rtSetEntRows(ex.w, ent.name, kept)
+                        ex = do rtMarkChanged(ex, ent.name)
+                        ex = do rtCascade(ex, ent.name, gone)
+                f = f + 1
+            e = e + 1
+        return ex
+
+    proc rtExecFor(st: IRStmt, ex0: RtExec) -> RtExec:
+        let mut ex = ex0
+        let rows = do rtEntRows(ex.w, st.entity)
+        let prev = do rtGet(ex.sc, st.itemVar)
+        let had = do rtHas(ex.sc, st.itemVar)
+        let mut picked = []
+        let mut i = 0
+        loop i < len(rows):
+            let m = rows[i]
+            if m.kind == "record":
+                ex.sc = do rtSet(ex.sc, st.itemVar, m)
+                let mut hit = true
+                if len(st.where) > 0:
+                    let pr = do rtEval(st.where[0], ex.sc, -1)
+                    ex.sc = pr.sc
+                    hit = do valTruthy(pr.v)
+                if hit:
+                    picked = append(picked, m)
+            i = i + 1
+        ex.sc = do rtRestore(ex.sc, st.itemVar, had, prev)
+        if ex.sc.err != "":
+            let pfe = do rtProcError(ex)
+            return pfe
+        picked = do rtSortRows(picked, st.order, st.desc)
+        if len(st.limit) > 0:
+            let lr = do rtEvalOpt(st.limit, ex.sc, -1)
+            ex.sc = lr.sc
+            let lim = do valToInt(lr.v)
+            if lim <= 0:
+                picked = []
+            else:
+                if len(picked) > lim:
+                    picked = slice(picked, 0, lim)
+        let mut j = 0
+        let mut stop = false
+        loop j < len(picked) && !stop:
+            ex.sc = do rtSet(ex.sc, st.itemVar, picked[j])
+            ex = do rtExecBlock(st.body, ex)
+            if ex.status != 200 || ex.returned:
+                stop = true
+            j = j + 1
+        ex.sc = do rtRestore(ex.sc, st.itemVar, had, prev)
+        return ex

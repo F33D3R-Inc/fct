@@ -104,7 +104,40 @@ import (
 // (left out when empty, maybe-null where present). The published contract
 // also changed shape: OpenAPI 3.1, closed schemas, nullable types, and
 // rate classes with their own budgets and X-RateLimit-* headers.
-var ToolchainVersion = "1.37.0"
+//
+// Bumped 1.37.0 → 1.38.0 for two proc builtins the self-hosted FacetQL
+// engine (selfhost/fq*.fct) needs to match facetql's: `lockFile(path)`
+// (io.file), the exclusive advisory lock a data directory's single writer
+// holds for the life of its process (storage/lock.rs), and
+// `crc32(bs, from, to)`, the IEEE CRC-32 every record frame and page is
+// checksummed with (crc32fast), a table lookup per byte that an
+// interpreted loop made the engine's single largest cost.
+//
+// Bumped 1.38.0 → 1.39.0 for the proc builtins a runtime written in fct
+// signs and stores credentials with (runtime/cryptobuiltins.go):
+// sha256Bytes / hmacSha256 / base64UrlRaw (secret.go's sign() restated over
+// byte buffers, for a session cookie and a CSRF token) and bcryptHash /
+// bcryptMatches (hashPassword / passwordMatches for a hash held in a proc
+// local, which verifyPassword's @password-field-only first argument cannot
+// be). A 1.38.0 toolchain refuses selfhost/session_store.fct on the first
+// of them.
+//
+// Bumped 1.39.0 → 1.40.0 for fileModTime(path) (io.file): a file's last
+// modification time in unix seconds, 0 when it does not exist — what a
+// runtime serving stored uploads needs for the Last-Modified header
+// net/http's ServeFile writes, and which no builtin exposed.
+//
+// Bumped 1.40.0 → 1.41.0 for `indexOf(s, sub, from)`, the proc builtin a
+// parser written in fct scans text with (selfhost/ir_json.fct reads a
+// multi-megabyte IR document at boot: a string is now one search and one
+// slice, not a charAt and an append per byte).
+//
+// Bumped 1.41.0 → 1.42.0 for `listenerPort(l)` (io.net.listen), the port a
+// listener was bound to, so a server started on port 0 — which listen,
+// listenOn and listenTls now accept — can say which ephemeral port the
+// operating system gave it: the one way to start a server with no window
+// in which another process can take its port first.
+var ToolchainVersion = "1.42.0"
 
 // CheckToolchainRange reports whether the running ToolchainVersion satisfies a
 // `facet` manifest range, returning a clear "upgrade the toolchain" error when

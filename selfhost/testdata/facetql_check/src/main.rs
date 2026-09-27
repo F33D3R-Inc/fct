@@ -511,7 +511,10 @@ fn main() {
             });
             rt.block_on(async move {
                 let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.expect("bind");
-                println!("listening");
+                // the port the kernel bound (port 0: the one it chose), as
+                // `facetql start`'s banner names it
+                let bound = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+                println!("FacetQL Server Running on port {bound}");
                 match tls {
                     Some(acceptor) => {
                         facetql::tls_server::serve_tls(listener, app, acceptor, std::future::pending::<()>()).await

@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -209,17 +207,20 @@ func modTime(file string) time.Time {
 // entry file's directory, so a change to any imported module is detected too. It
 // falls back to the entry file alone if the directory cannot be read.
 func projectSig(file string) time.Time {
+	// Every source the program is compiled from — the root, its imports
+	// (however deep, in whichever directory) and its `css from` files — not
+	// the root's directory: an app assembled from wireframes/ and ../facets
+	// changes in files this directory listing never saw, and `facet dev`
+	// went on serving the old build. Resolved on every tick, so an import
+	// added since the last one is watched from then on.
 	latest := modTime(file)
-	entries, err := os.ReadDir(filepath.Dir(file))
+	files, err := compile.Sources(file)
 	if err != nil {
-		return latest
+		files = []string{file}
 	}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".fct") {
-			continue
-		}
-		if info, err := e.Info(); err == nil && info.ModTime().After(latest) {
-			latest = info.ModTime()
+	for _, f := range files {
+		if mt := modTime(f); mt.After(latest) {
+			latest = mt
 		}
 	}
 	return latest

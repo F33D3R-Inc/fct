@@ -413,6 +413,57 @@ app FabricDaemonCases:
             response = daemonAdminAnswer(kind, message)
         return "" + response.status + "|" + response.contentType + "|" + response.allow + "|" + sjQuote(response.body) + "|" + asked
 
+    # A `daemon-movers` line: `;`-separated steps over one supervisor —
+    # `refuse:<id>:<reason>`, `retain:<id,id,...>`, `stop:<id>`, `stop_all`
+    # — then `active=[id>dest,...]|refusals=[id=reason,...]`, ids as the
+    # u64s they are (u64Parse / u64Text: an id past i64::MAX is one int's
+    # bit pattern here and a u64 in the crate).
+    proc dcaMoversCase(line: text) -> text:
+        let mut m = daemonMoversNew()
+        let steps = split(line, ";")
+        let n = len(steps)
+        let mut i = 0
+        loop i < n:
+            let step = steps[i]
+            if step != "":
+                let parts = split(step, ":")
+                if parts[0] == "refuse":
+                    let mut reason = ""
+                    let mut k = 2
+                    loop k < len(parts):
+                        if k > 2:
+                            reason = reason + ":"
+                        reason = reason + parts[k]
+                        k = k + 1
+                    m = daemonMoversRefuse(m, u64Parse(parts[1]), reason)
+                if parts[0] == "retain":
+                    let mut live = []
+                    if len(parts) > 1:
+                        let ids = split(parts[1], ",")
+                        let mut j = 0
+                        loop j < len(ids):
+                            if ids[j] != "":
+                                live = append(live, u64Parse(ids[j]))
+                            j = j + 1
+                    m = daemonMoversRetain(m, live)
+                if parts[0] == "stop":
+                    m = daemonMoversStop(m, u64Parse(parts[1]))
+                if parts[0] == "stop_all":
+                    m = daemonMoversStopAll(m)
+            i = i + 1
+        let status = daemonMoversStatus(m)
+        let mut active = []
+        let mut a = 0
+        loop a < len(status.copying):
+            active = append(active, u64Text(status.copying[a].id) + ">" + status.copying[a].destination)
+            a = a + 1
+        let mut refused = []
+        let mut r = 0
+        loop r < len(status.refused):
+            refused = append(refused, u64Text(status.refused[r].id) + "=" + status.refused[r].reason)
+            r = r + 1
+        return "active=[" + dcaJoin(active, ",") + "]|refusals=[" + dcaJoin(refused, ",") + "]"
+
     proc dcaRun(mode: text, input: text) -> text uses io.net:
         let lines = split(input, "\n")
         let mut out = []
@@ -435,6 +486,8 @@ app FabricDaemonCases:
                 out = append(out, dcaStatusCase(lines[i]))
             if mode == "daemon-settings-debug":
                 out = append(out, dcaConfigCase(lines[i], true))
+            if mode == "daemon-movers":
+                out = append(out, dcaMoversCase(lines[i]))
             i = i + 1
         return dcaJoin(out, "\n")
 

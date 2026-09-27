@@ -37,6 +37,9 @@ func String(src string) (*ir.IR, error) {
 	if len(app.CSSFiles) > 0 {
 		return nil, fmt.Errorf("css from \"...\" is only supported when compiling from a file (run `facet <command> <file.fct>`)")
 	}
+	if err := resolveExpects(app); err != nil {
+		return nil, err
+	}
 	return ir.Build(app)
 }
 
@@ -93,6 +96,12 @@ func File(path string) (*ir.IR, error) {
 		for _, m := range facets[1:] {
 			mergeInto(root, m)
 		}
+	}
+	// What every module expected of its host is settled here, once the whole
+	// graph is in one place: satisfied structurally, contradicted (an error),
+	// or stood in for so a fragment compiles on its own (compile/expect.go).
+	if err := resolveExpects(root); err != nil {
+		return nil, err
 	}
 	if err := checkDuplicates(root); err != nil {
 		return nil, err
@@ -247,6 +256,14 @@ func mergeInto(dst, src *ast.App) {
 	// routes, `stream`s, inbound `webhook`s, `on` triggers and a `contract`
 	// route — joins the app's like its actions do; checkRouteCollisions has
 	// already refused two modules claiming one route.
+	// A module's expectations travel with it, each remembering the file that
+	// wrote it so a host that contradicts one is told which fragment it broke.
+	for _, ex := range src.Expects {
+		if ex.Source == "" {
+			ex.Source = src.Source
+		}
+	}
+	dst.Expects = append(dst.Expects, src.Expects...)
 	dst.APIs = append(dst.APIs, src.APIs...)
 	dst.Streams = append(dst.Streams, src.Streams...)
 	dst.Webhooks = append(dst.Webhooks, src.Webhooks...)
@@ -364,4 +381,59 @@ func checkDuplicates(app *ast.App) error {
 		}
 	}
 	return nil
+}
+
+// Sources is every file a program is compiled from: the root, each module it
+// imports (transitively, local or remote-cached) and each `css from` file,
+// as absolute paths in dependency order. It is what a watcher has to watch:
+// `facet dev` used to fingerprint the root's directory alone, so a wireframe
+// edited under wireframes/ or a facet under ../facets never reloaded.
+//
+// A file that fails to parse still counts (a half-typed edit is exactly the
+// moment a watcher must keep looking), and its imports are skipped rather
+// than the walk failing; the lock is read, never written.
+func Sources(path string) ([]string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	res, err := registry.New(filepath.Dir(abs))
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	visited := map[string]bool{abs: true}
+	var walk func(abs string)
+	walk = func(abs string) {
+		out = append(out, abs)
+		src, err := os.ReadFile(abs)
+		if err != nil {
+			return
+		}
+		app, err := parser.Parse(string(src))
+		if err != nil {
+			return
+		}
+		dir := filepath.Dir(abs)
+		for _, ref := range app.CSSFiles {
+			cssAbs := ref.Path
+			if !filepath.IsAbs(cssAbs) {
+				cssAbs = filepath.Join(dir, ref.Path)
+			}
+			if !visited[cssAbs] {
+				visited[cssAbs] = true
+				out = append(out, cssAbs)
+			}
+		}
+		for _, imp := range app.Imports {
+			impAbs, err := res.Resolve(imp, dir)
+			if err != nil || visited[impAbs] {
+				continue
+			}
+			visited[impAbs] = true
+			walk(impAbs)
+		}
+	}
+	walk(abs)
+	return out, nil
 }

@@ -1,0 +1,257 @@
+import "runtime_eval_ir.fct"
+
+app RenderMarkdown:
+    # render_markdown.fct — runtime/richtext.go: the fixed, safe markdown
+    # subset a `richtext` node renders (fenced code, headings, quotes,
+    # lists, rules, paragraphs; inline code, links, #tags, @handles, bold,
+    # italic, strike), escaped first so the only tags in the output are the
+    # ones written here. Each regexp of the Go file is one left-to-right,
+    # non-overlapping scan below, with the same character classes.
+    proc mdHasPrefix(s: text, p: text) -> bool:
+        if len(s) < len(p):
+            return false
+        return slice(s, 0, len(p)) == p
+
+    proc mdIsDigit(c: text) -> bool:
+        return c >= "0" && c <= "9"
+
+    # mdOrderLen: `^\d+\. ` — the length of the matched prefix, 0 if none.
+    proc mdOrderLen(line: text) -> int:
+        let mut i = 0
+        loop i < len(line) && mdIsDigit(charAt(line, i)):
+            i = i + 1
+        if i == 0:
+            return 0
+        if i + 1 < len(line) && charAt(line, i) == "." && charAt(line, i + 1) == " ":
+            return i + 2
+        return 0
+
+    proc mdBlockStart(line: text) -> bool:
+        let a = do mdHasPrefix(line, "```")
+        let b = do mdHasPrefix(line, "# ")
+        let c = do mdHasPrefix(line, "## ")
+        let d = do mdHasPrefix(line, "### ")
+        let e = do mdHasPrefix(line, "> ")
+        let f = do mdHasPrefix(line, "- ")
+        let g = do mdOrderLen(line)
+        return a || b || c || d || e || f || g > 0 || trim(line) == "---"
+
+    proc mdJoin(xs: [text], sep: text) -> text:
+        let mut out = ""
+        let mut i = 0
+        loop i < len(xs):
+            if i > 0:
+                out = out + sep
+            out = out + xs[i]
+            i = i + 1
+        return out
+
+    proc mdRender(src: text) -> text:
+        let lines = split(src, "\n")
+        let n = len(lines)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            let line = lines[i]
+            let fence = do mdHasPrefix(line, "```")
+            let h3 = do mdHasPrefix(line, "### ")
+            let h2 = do mdHasPrefix(line, "## ")
+            let h1 = do mdHasPrefix(line, "# ")
+            let quote = do mdHasPrefix(line, "> ")
+            let bullet = do mdHasPrefix(line, "- ")
+            let order = do mdOrderLen(line)
+            if fence:
+                i = i + 1
+                let mut code = []
+                let mut more = true
+                loop i < n && more:
+                    let cf = do mdHasPrefix(lines[i], "```")
+                    if cf:
+                        more = false
+                    else:
+                        code = append(code, lines[i])
+                        i = i + 1
+                if i < n:
+                    i = i + 1
+                out = out + "<pre><code>" + rtEsc(mdJoin(code, "\n")) + "</code></pre>"
+            else:
+                if h3:
+                    let t3 = do mdInline(slice(line, 4, len(line)))
+                    out = out + "<h3>" + t3 + "</h3>"
+                    i = i + 1
+                else:
+                    if h2:
+                        let t2 = do mdInline(slice(line, 3, len(line)))
+                        out = out + "<h2>" + t2 + "</h2>"
+                        i = i + 1
+                    else:
+                        if h1:
+                            let t1 = do mdInline(slice(line, 2, len(line)))
+                            out = out + "<h1>" + t1 + "</h1>"
+                            i = i + 1
+                        else:
+                            if quote:
+                                let mut qs = []
+                                let mut moreQ = true
+                                loop i < n && moreQ:
+                                    let qf = do mdHasPrefix(lines[i], "> ")
+                                    if qf:
+                                        let qi = do mdInline(slice(lines[i], 2, len(lines[i])))
+                                        qs = append(qs, qi)
+                                        i = i + 1
+                                    else:
+                                        moreQ = false
+                                out = out + "<blockquote><p>" + mdJoin(qs, "<br>") + "</p></blockquote>"
+                            else:
+                                if bullet:
+                                    out = out + "<ul>"
+                                    let mut moreB = true
+                                    loop i < n && moreB:
+                                        let bf = do mdHasPrefix(lines[i], "- ")
+                                        if bf:
+                                            let bi = do mdInline(slice(lines[i], 2, len(lines[i])))
+                                            out = out + "<li>" + bi + "</li>"
+                                            i = i + 1
+                                        else:
+                                            moreB = false
+                                    out = out + "</ul>"
+                                else:
+                                    if order > 0:
+                                        out = out + "<ol>"
+                                        let mut moreO = true
+                                        loop i < n && moreO:
+                                            let ol = do mdOrderLen(lines[i])
+                                            if ol > 0:
+                                                let oi = do mdInline(slice(lines[i], ol, len(lines[i])))
+                                                out = out + "<li>" + oi + "</li>"
+                                                i = i + 1
+                                            else:
+                                                moreO = false
+                                        out = out + "</ol>"
+                                    else:
+                                        if trim(line) == "---":
+                                            out = out + "<hr>"
+                                            i = i + 1
+                                        else:
+                                            if trim(line) == "":
+                                                i = i + 1
+                                            else:
+                                                let mut para = []
+                                                let mut moreP = true
+                                                loop i < n && moreP:
+                                                    let bs = do mdBlockStart(lines[i])
+                                                    if trim(lines[i]) != "" && !bs:
+                                                        let pi = do mdInline(lines[i])
+                                                        para = append(para, pi)
+                                                        i = i + 1
+                                                    else:
+                                                        moreP = false
+                                                out = out + "<p>" + mdJoin(para, "<br>") + "</p>"
+        return out
+
+    # ── inline ──────────────────────────────────────────────────────────
+    proc mdIsWord(c: text) -> bool:
+        return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "_"
+
+    # mdWrapPairs: `D([^D]+)D` → open + $1 + close, left to right, where D
+    # is a one- or two-character delimiter and the body excludes D's first
+    # character.
+    proc mdWrapPairs(s: text, d: text, open: text, close: text) -> text:
+        let n = len(s)
+        let dl = len(d)
+        let dc = charAt(d, 0)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            let mut matched = false
+            if i + dl <= n && slice(s, i, i + dl) == d:
+                let mut j = i + dl
+                loop j < n && charAt(s, j) != dc:
+                    j = j + 1
+                if j > i + dl && j + dl <= n && slice(s, j, j + dl) == d:
+                    out = out + open + slice(s, i + dl, j) + close
+                    i = j + dl
+                    matched = true
+            if !matched:
+                out = out + charAt(s, i)
+                i = i + 1
+        return out
+
+    # mdLinks: `\[([^\]]+)\]\(((?:https?://|mailto:|/)[^\s)]*)\)`.
+    proc mdLinks(s: text) -> text:
+        let n = len(s)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            let mut matched = false
+            if charAt(s, i) == "[":
+                let mut j = i + 1
+                loop j < n && charAt(s, j) != "]":
+                    j = j + 1
+                if j > i + 1 && j + 1 < n && charAt(s, j + 1) == "(":
+                    let rest = slice(s, j + 2, n)
+                    let mut pl = 0
+                    let p1 = do mdHasPrefix(rest, "https://")
+                    let p2 = do mdHasPrefix(rest, "http://")
+                    let p3 = do mdHasPrefix(rest, "mailto:")
+                    let p4 = do mdHasPrefix(rest, "/")
+                    if p1:
+                        pl = 8
+                    if p2:
+                        pl = 7
+                    if p3:
+                        pl = 7
+                    if p4:
+                        pl = 1
+                    if pl > 0:
+                        let mut k = pl
+                        loop k < len(rest) && charAt(rest, k) != ")" && charAt(rest, k) != " " && charAt(rest, k) != "\t" && charAt(rest, k) != "\n" && charAt(rest, k) != "\r":
+                            k = k + 1
+                        if k < len(rest) && charAt(rest, k) == ")":
+                            out = out + "<a href=\"" + slice(rest, 0, k) + "\" rel=\"noopener\">" + slice(s, i + 1, j) + "</a>"
+                            i = j + 2 + k + 1
+                            matched = true
+            if !matched:
+                out = out + charAt(s, i)
+                i = i + 1
+        return out
+
+    # mdMentions: `(^|[ \t(])X([A-Za-z0-9_]+)` → $1<a href="PREFIX$2">X$2</a>.
+    proc mdMentions(s: text, mark: text, prefix: text) -> text:
+        let n = len(s)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            let c = charAt(s, i)
+            let mut matched = false
+            let mut at = -1
+            if c == mark && i == 0:
+                at = 0
+            if (c == " " || c == "\t" || c == "(") && i + 1 < n && charAt(s, i + 1) == mark:
+                at = i + 1
+            if at >= 0:
+                let mut j = at + 1
+                loop j < n && mdIsWord(charAt(s, j)):
+                    j = j + 1
+                if j > at + 1:
+                    let word = slice(s, at + 1, j)
+                    if at > 0:
+                        out = out + c
+                    out = out + "<a href=\"" + prefix + word + "\">" + mark + word + "</a>"
+                    i = j
+                    matched = true
+            if !matched:
+                out = out + c
+                i = i + 1
+        return out
+
+    proc mdInline(s0: text) -> text:
+        let s = do rtEsc(s0)
+        let a = do mdWrapPairs(s, "`", "<code>", "</code>")
+        let b = do mdLinks(a)
+        let c = do mdMentions(b, "#", "/tag/")
+        let d = do mdMentions(c, "@", "/u/")
+        let e = do mdWrapPairs(d, "**", "<strong>", "</strong>")
+        let f = do mdWrapPairs(e, "*", "<em>", "</em>")
+        let g = do mdWrapPairs(f, "~~", "<del>", "</del>")
+        return g

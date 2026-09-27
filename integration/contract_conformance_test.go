@@ -54,12 +54,22 @@ var contractAllowlist = map[string]string{
 	"/paths/~1api~1v2~1works~1{id}~1captions/post/requestBody/content/multipart~1form-data/schema/properties/captions/format": "a file part is format: binary",
 	"/paths/~1api~1v2~1works~1{id}~1poster/post/requestBody/content/multipart~1form-data/schema/properties/image/format":      "a file part is format: binary",
 
-	// Known app gaps, documented as the app serves them until they are
-	// ported: legacy's token route is the OAuth authorization-code exchange
-	// (HTTP Basic client credentials, form grant_type=authorization_code&code=),
-	// and its track upload is a multipart audio upload; fct's app takes JSON.
-	"/paths/~1api~1v2~1dev~1oauth~1token/post/requestBody": "app gap: the authorization-code exchange is not ported (fct issues tokens for client credentials in a JSON body)",
-	"/paths/~1api~1v2~1music~1tracks/post/requestBody":     "app gap: the multipart audio upload is not ported (fct takes the track's URLs in a JSON body)",
+	// Two routes legacy registered untyped: its route table documented no
+	// request body for the OAuth token exchange and the track upload, and no
+	// credential for the exchange, while its handlers read a form body under
+	// HTTP Basic and a multipart audio upload. fct's app implements both the
+	// way the handlers behave (auth dev_client basic + body form; an `audio`
+	// bytes part) and documents what it reads.
+	"/paths/~1api~1v2~1dev~1oauth~1token/post/requestBody": "legacy documented no body; fct documents the form (grant_type, code) its handler reads",
+	"/paths/~1api~1v2~1dev~1oauth~1token/post/security":    "legacy documented no credential; fct documents the HTTP Basic client credential its handler demands",
+	"/paths/~1api~1v2~1dev~1oauth~1token/post/x-auth":      "legacy documented the route as open; fct names its credential scheme (dev_client)",
+	"/components/securitySchemes/dev_client":               "the HTTP Basic scheme the token exchange uses, undocumented by legacy",
+	"/paths/~1api~1v2~1music~1tracks/post/requestBody":     "legacy documented no body; fct documents the multipart form (audio, cover, title, …) its handler reads",
+	// The consent step that mints an authorization code is a web page in
+	// legacy (Facet(dev_consent)) and an action here; its reply type is a
+	// wire type this app declares and the contract lists every declared one.
+	"/components/schemas/V2DevAuthorizationDTO": "the consent action's reply; legacy's consent is a web page with no schema",
+	"/components/schemas/V2DevAppRegisteredDTO": "the registration action's reply; legacy registers apps from a settings page with no schema",
 }
 
 // The f33d3r API app must publish exactly the golden contract: every path and

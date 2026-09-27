@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime/pprof"
 
 	"facet/internal/compile"
 	"facet/runtime"
@@ -29,6 +30,40 @@ func cmdExec(args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "facet exec: %v\n", err)
 		return 1
+	}
+	// FACET_CPUPROFILE=<path>: a CPU profile of the whole run (the
+	// evaluator and the program it runs), written when the program ends —
+	// by returning from main, by exitProcess, or by its daemons ending.
+	// How the interpretive cost of a long-running program (the self-hosted
+	// FacetQL engine, say) is measured, with `go tool pprof`.
+	if path := os.Getenv("FACET_CPUPROFILE"); path != "" {
+		f, err := os.Create(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "facet exec: FACET_CPUPROFILE: %v\n", err)
+			return 1
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			fmt.Fprintf(os.Stderr, "facet exec: FACET_CPUPROFILE: %v\n", err)
+			return 1
+		}
+		stop := func() {
+			pprof.StopCPUProfile()
+			f.Close()
+			// FACET_MEMPROFILE=<path>, beside it: the allocation profile of
+			// the same run (`go tool pprof -sample_index=alloc_space`).
+			if mp := os.Getenv("FACET_MEMPROFILE"); mp != "" {
+				if mf, err := os.Create(mp); err == nil {
+					_ = pprof.Lookup("allocs").WriteTo(mf, 0)
+					mf.Close()
+				}
+			}
+		}
+		defer stop()
+		srv.SetProfiling(true)
+		srv.SetExit(func(code int) {
+			stop()
+			os.Exit(code)
+		})
 	}
 	if os.Getenv("FACET_DATA_DIR") == "" {
 		if cwd, err := os.Getwd(); err == nil {

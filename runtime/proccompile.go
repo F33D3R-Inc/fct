@@ -46,8 +46,10 @@ package runtime
 // callProcBuiltin, coerceRet, …) wherever a value is actually computed.
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -304,6 +306,19 @@ func (ps *procSite) call(args []any, owned uint64) (any, bool, error) {
 		pc = ps.s.codeFor(ps.p, ps.p.Params, ps.p.Body)
 		ps.code.Store(pc)
 	}
+	if ps.s.profiling {
+		// Under a CPU profile (SetProfiling), every sample carries the fct
+		// proc it was taken in — the innermost one — as the `proc` label,
+		// so `go tool pprof -tags` reads as a profile of the program rather
+		// than of the evaluator. Off, this costs one branch per call.
+		var out any
+		var ok bool
+		var err error
+		pprof.Do(context.Background(), pprof.Labels("proc", ps.p.Name), func(context.Context) {
+			out, ok, err = ps.s.runCodeOwned(pc, ps.p, args, owned)
+		})
+		return out, ok, err
+	}
 	return ps.s.runCodeOwned(pc, ps.p, args, owned)
 }
 
@@ -523,6 +538,18 @@ func (c *procCompiler) stmt(st *ir.Stmt) cstmt {
 					fr.slots[slot] = append(arr, ev)
 					return ctlSignal{}, nil
 				}
+				if b, isBytes := fr.slots[slot].(bytesVal); isBytes && fr.own[slot] {
+					ev, err := elem(fr)
+					if err != nil {
+						return ctlSignal{}, err
+					}
+					if x, ok := isByteInt(ev); ok {
+						fr.slots[slot] = append(b, x)
+					} else {
+						fr.slots[slot] = append(promoteBytes(b), ev)
+					}
+					return ctlSignal{}, nil
+				}
 				nv, err := whole(fr)
 				if err != nil {
 					return ctlSignal{}, err
@@ -548,16 +575,15 @@ func (c *procCompiler) stmt(st *ir.Stmt) cstmt {
 			// An int written into an int list at an int index: all native.
 			key, val := c.intExpr(st.Key), c.intExpr(st.Value)
 			return func(fr *pfr) (ctlSignal, error) {
-				if _, ok := fr.slots[slot].([]any); !ok {
+				if listLen(fr.slots[slot]) < 0 {
 					return ctlSignal{}, fmt.Errorf("%q is not an array or map", name)
 				}
-				coll := fr.mutable(slot).([]any)
 				idx, err := key(fr)
 				if err != nil {
 					return ctlSignal{}, err
 				}
-				if idx < 0 || idx >= len(coll) {
-					return ctlSignal{}, fmt.Errorf("array index %d out of bounds (length %d) assigning to %q", idx, len(coll), name)
+				if n := listLen(fr.slots[slot]); idx < 0 || idx >= n {
+					return ctlSignal{}, fmt.Errorf("array index %d out of bounds (length %d) assigning to %q", idx, n, name)
 				}
 				n, err := val(fr)
 				if err != nil {
@@ -566,18 +592,53 @@ func (c *procCompiler) stmt(st *ir.Stmt) cstmt {
 				if isBytes && (n < 0 || n > 255) {
 					return ctlSignal{}, fmt.Errorf("byte value %d out of range (must be 0-255) assigning to %q[%d]", n, name, idx)
 				}
-				coll[idx] = boxInt(n)
+				switch coll := fr.mutable(slot).(type) {
+				case bytesVal:
+					if n >= 0 && n <= 255 {
+						coll[idx] = byte(n)
+					} else {
+						// a value a byte cannot hold, into a buffer the
+						// compiler types as a plain [int]: promoted
+						p := promoteBytes(coll)
+						p[idx] = boxInt(n)
+						fr.slots[slot] = p
+					}
+				case []any:
+					coll[idx] = boxInt(n)
+				}
 				return ctlSignal{}, nil
 			}
 		}
 		key, val := c.use(st.Key), c.expr(st.Value)
 		return func(fr *pfr) (ctlSignal, error) {
 			switch fr.slots[slot].(type) {
-			case []any, map[any]any:
+			case []any, map[any]any, bytesVal:
 			default:
 				return ctlSignal{}, fmt.Errorf("%q is not an array or map", name)
 			}
 			switch coll := fr.mutable(slot).(type) {
+			case bytesVal:
+				idxV, err := key(fr)
+				if err != nil {
+					return ctlSignal{}, err
+				}
+				idx := toInt(idxV)
+				if idx < 0 || idx >= len(coll) {
+					return ctlSignal{}, fmt.Errorf("array index %d out of bounds (length %d) assigning to %q", idx, len(coll), name)
+				}
+				v, err := val(fr)
+				if err != nil {
+					return ctlSignal{}, err
+				}
+				if x, ok := isByteInt(v); ok {
+					coll[idx] = x
+				} else if isBytes {
+					return ctlSignal{}, fmt.Errorf("byte value %d out of range (must be 0-255) assigning to %q[%d]", toInt(v), name, idx)
+				} else {
+					p := promoteBytes(coll)
+					p[idx] = v
+					fr.slots[slot] = p
+				}
 			case []any:
 				idxV, err := key(fr)
 				if err != nil {
@@ -677,22 +738,88 @@ func (c *procCompiler) stmt(st *ir.Stmt) cstmt {
 		}
 	case "fieldset":
 		slot := c.target(st.Target)
-		val := c.expr(st.Value)
 		name, field := st.Target, st.Field
+		v := st.Value
+		if v != nil && v.Kind == "call" && v.Name == "append" && c.s.byProc["append"] == nil && len(v.Args) == 2 && v.Args[0] != nil && v.Args[0].Kind == "get" && v.Args[0].Field == field && v.Args[0].Obj != nil && v.Args[0].Obj.Kind == "ref" && v.Args[0].Obj.Name == st.Target {
+			// `s.f = append(s.f, e)` grows the field's list in place when
+			// the slot owns the struct and the struct owns the list
+			// (structVal.own); otherwise the builtin's copy, which the
+			// struct then owns.
+			c.lookup(st.Target)
+			elem := c.expr(v.Args[1])
+			return func(fr *pfr) (ctlSignal, error) {
+				sv, ok := fr.slots[slot].(structVal)
+				if !ok {
+					return ctlSignal{}, fmt.Errorf("%q is not a struct", name)
+				}
+				i, has := sv.lay.index[field]
+				if !has {
+					return ctlSignal{}, fmt.Errorf("struct %q has no field %q", sv.lay.name, field)
+				}
+				ev, err := elem(fr)
+				if err != nil {
+					return ctlSignal{}, err
+				}
+				sv = fr.slots[slot].(structVal)
+				if fr.own[slot] && i < 64 && sv.own&(1<<uint(i)) != 0 {
+					if arr, isList := sv.vals[i].([]any); isList {
+						sv.vals[i] = append(arr, ev)
+						return ctlSignal{}, nil
+					}
+					if b, isBytes := sv.vals[i].(bytesVal); isBytes {
+						if x, ok := isByteInt(ev); ok {
+							sv.vals[i] = append(b, x)
+						} else {
+							sv.vals[i] = append(promoteBytes(b), ev)
+						}
+						return ctlSignal{}, nil
+					}
+				}
+				sv = fr.mutable(slot).(structVal)
+				sv.vals[i] = appendCopy(sv.vals[i], ev)
+				if i < 64 && sv.own&(1<<uint(i)) == 0 {
+					sv.own |= 1 << uint(i)
+					fr.slots[slot] = sv
+				}
+				return ctlSignal{}, nil
+			}
+		}
+		val := c.expr(v)
+		fresh := c.fresh(v)
+		// The field's position, cached against the layout last written
+		// here as a read's is (the "get" case).
+		var cache atomic.Pointer[fieldPos]
 		return func(fr *pfr) (ctlSignal, error) {
 			sv, ok := fr.slots[slot].(structVal)
 			if !ok {
 				return ctlSignal{}, fmt.Errorf("%q is not a struct", name)
 			}
-			i, has := sv.lay.index[field]
-			if !has {
-				return ctlSignal{}, fmt.Errorf("struct %q has no field %q", sv.lay.name, field)
+			var i int
+			if fp := cache.Load(); fp != nil && fp.lay == sv.lay {
+				i = fp.i
+			} else {
+				var has bool
+				i, has = sv.lay.index[field]
+				if !has {
+					return ctlSignal{}, fmt.Errorf("struct %q has no field %q", sv.lay.name, field)
+				}
+				cache.Store(&fieldPos{lay: sv.lay, i: i})
 			}
-			v, err := val(fr)
+			nv, err := val(fr)
 			if err != nil {
 				return ctlSignal{}, err
 			}
-			fr.mutable(slot).(structVal).vals[i] = v
+			sv = fr.mutable(slot).(structVal)
+			sv.vals[i] = nv
+			// The struct owns the field's value exactly when it was created
+			// for this store (structVal.own).
+			if i < 64 {
+				bit := uint64(1) << uint(i)
+				if (sv.own&bit != 0) != fresh {
+					sv.own ^= bit
+					fr.slots[slot] = sv
+				}
+			}
 			return ctlSignal{}, nil
 		}
 	case "actcall":
@@ -917,6 +1044,114 @@ func (s *Server) structLayout(name string, literal []string) *structLayout {
 	return newStructLayout(name, append([]string{}, literal...))
 }
 
+// procArgValue converts an argument to the shape a proc's parameter of type
+// typ (a list of it when list) reads: a map — the row an action's projection or
+// a decoded JSON body produced — becomes a structVal in the declared struct's
+// or wire type's field order, recursively through struct-typed fields and
+// lists of them. A value that is already a structVal, a scalar, or a name that
+// is no composite type passes through untouched.
+//
+// The type is looked up first (one map read: compositeFields), because
+// only a struct- or wire-typed parameter can be handed a map at all: a
+// list of ints — a page, a byte buffer, a key — or of texts passes through
+// with no look at its elements, so a proc handing a 16 KB page down a call
+// chain costs nothing per call. A list of a composite type is scanned for
+// a map and copied only from the first one on; nearly every such argument
+// (every proc-to-proc call's) is already a list of structVals and is
+// shared, as slot ownership (see the header) expects.
+func (s *Server) procArgValue(typ string, list bool, v any) any {
+	if v == nil {
+		return v
+	}
+	if list {
+		xs, ok := v.([]any)
+		if !ok || len(xs) == 0 || s.compositeFields(typ) == nil {
+			return v
+		}
+		first := -1
+		for i, x := range xs {
+			if _, isMap := x.(map[string]any); isMap {
+				first = i
+				break
+			}
+		}
+		if first < 0 {
+			return v
+		}
+		out := make([]any, len(xs))
+		copy(out, xs[:first])
+		for i := first; i < len(xs); i++ {
+			out[i] = s.procArgValue(typ, false, xs[i])
+		}
+		return out
+	}
+	m, ok := v.(map[string]any) // `record` is this same type
+	if !ok {
+		return v
+	}
+	fields := s.compositeFields(typ)
+	if fields == nil {
+		return v
+	}
+	names := make([]string, len(fields))
+	vals := make([]any, len(fields))
+	for i, f := range fields {
+		names[i] = f.Name
+		vals[i] = s.procArgValue(f.Type, f.List, m[f.Name])
+	}
+	return structVal{lay: s.structLayout(typ, names), vals: vals}
+}
+
+// plainValue is procArgValue's inverse for a value leaving the proc engine
+// for an action: every structVal becomes the record its fields spell, lists
+// element-wise, so the action's reply JSON-encodes as an object and its own
+// `.field` reads (eval.go) work on it. Anything else passes through.
+func plainValue(v any) any {
+	switch t := v.(type) {
+	case structVal:
+		out := record{}
+		for i, name := range t.lay.fields {
+			if i < len(t.vals) {
+				out[name] = plainValue(t.vals[i])
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, x := range t {
+			out[i] = plainValue(x)
+		}
+		return out
+	case bytesVal:
+		return promoteBytes(t)
+	}
+	return v
+}
+
+// compositeFields is the declared field list of a proc `struct` or a wire
+// `type` named typ, or nil when typ names neither (a scalar, an entity, an
+// enum): the two declaration kinds a proc parameter can be typed with. One
+// map read: it is asked on every parameter of every proc call, and a
+// program the size of the self-hosted engine declares hundreds of structs.
+func (s *Server) compositeFields(typ string) []ir.RecordField {
+	s.compOnce.Do(func() {
+		s.composites = map[string][]ir.RecordField{}
+		for _, t := range s.ir.Types {
+			out := make([]ir.RecordField, len(t.Fields))
+			for i, f := range t.Fields {
+				out[i] = ir.RecordField{Name: f.Name, Type: f.Type, List: f.List, Optional: f.Optional}
+			}
+			s.composites[t.Name] = out
+		}
+		// A struct wins over a wire type of the same name, as the linear
+		// search this replaces found it first.
+		for _, st := range s.ir.Structs {
+			s.composites[st.Name] = st.Fields
+		}
+	})
+	return s.composites[typ]
+}
+
 func constExpr(v any) cexpr { return func(*pfr) (any, error) { return v, nil } }
 
 // expr compiles e where its value may be retained (bound, stored, passed on);
@@ -937,10 +1172,10 @@ func (c *procCompiler) uses(xs []*ir.Expr) []cexpr {
 // returning or storing them (append keeps its second argument, so only its
 // first is inspected — see the "call" case).
 var inspectOnly = map[string]bool{
-	"len": true, "byteLen": true, "bytesToText": true, "join": true, "contains": true,
+	"len": true, "byteLen": true, "bytesToText": true, "join": true, "contains": true, "indexOf": true,
 	"charAt": true, "writeFileAt": true, "writeBytes": true, "writeFile": true,
 	"aesGcmSeal": true, "aesGcmOpen": true, "aesGcmAuthentic": true,
-	"appendFile": true, "sha256Hex": true, "canonicalJson": true, "awaitAny": true,
+	"appendFile": true, "sha256Hex": true, "canonicalJson": true, "awaitAny": true, "crc32": true,
 }
 
 // fresh reports whether e always evaluates to a composite value created by
@@ -1004,6 +1239,16 @@ func (c *procCompiler) compileExpr(e *ir.Expr, escapes bool) cexpr {
 	case "lit":
 		return constExpr(litValue(e))
 	case "list":
+		if !escapes {
+			if cv, ok := constList(e); ok {
+				// An all-literal list that is only inspected (`c in [...]`,
+				// `len([...])`, a loop bound) is one value built when the
+				// body is compiled, not a fresh slice per evaluation: no
+				// binding can retain or mutate it from here, so sharing it
+				// is unobservable.
+				return constExpr(cv)
+			}
+		}
 		elems := c.exprs(e.Args)
 		return func(fr *pfr) (any, error) {
 			return evalAll(elems, fr)
@@ -1064,6 +1309,14 @@ func (c *procCompiler) compileExpr(e *ir.Expr, escapes bool) cexpr {
 			pos[i] = p
 		}
 		width := len(lay.fields)
+		// The fields a literal fills with values created for it are the
+		// struct's own from the start (structVal.own).
+		var ownMask uint64
+		for i, a := range e.Args {
+			if pos[i] < 64 && c.fresh(a) {
+				ownMask |= 1 << uint(pos[i])
+			}
+		}
 		return func(fr *pfr) (any, error) {
 			out := make([]any, width)
 			for i, val := range vals {
@@ -1073,11 +1326,19 @@ func (c *procCompiler) compileExpr(e *ir.Expr, escapes bool) cexpr {
 				}
 				out[pos[i]] = v
 			}
-			return structVal{lay: lay, vals: out}, nil
+			return structVal{lay: lay, vals: out, own: ownMask}, nil
 		}
 	case "get":
 		obj := c.use(e.Obj)
 		field := e.Field
+		// A retained read of a local's field gives its value a second
+		// holder: the struct in that slot no longer owns it (structVal.own).
+		disown := -1
+		if escapes && e.Obj != nil && e.Obj.Kind == "ref" {
+			if slot, ok := c.resolve(e.Obj.Name); ok && !c.ints[slot] {
+				disown = slot
+			}
+		}
 		// The field's position is cached against the layout last read here
 		// (almost always the only one), so a read is a pointer compare and
 		// an index; the cache is an atomic pointer because a spawned task
@@ -1092,14 +1353,21 @@ func (c *procCompiler) compileExpr(e *ir.Expr, escapes bool) cexpr {
 			if !ok {
 				return nil, fmt.Errorf("cannot read field %q of a value that is not a struct", field)
 			}
+			var i int
 			if fp := cache.Load(); fp != nil && fp.lay == sv.lay {
-				return sv.vals[fp.i], nil
+				i = fp.i
+			} else {
+				var has bool
+				i, has = sv.lay.index[field]
+				if !has {
+					return nil, nil
+				}
+				cache.Store(&fieldPos{lay: sv.lay, i: i})
 			}
-			i, has := sv.lay.index[field]
-			if !has {
-				return nil, nil
+			if disown >= 0 && i < 64 && sv.own&(1<<uint(i)) != 0 && fr.own[disown] {
+				sv.own &^= 1 << uint(i)
+				fr.slots[disown] = sv
 			}
-			cache.Store(&fieldPos{lay: sv.lay, i: i})
 			return sv.vals[i], nil
 		}
 	case "ref":
@@ -1135,6 +1403,12 @@ func (c *procCompiler) compileExpr(e *ir.Expr, escapes bool) cexpr {
 					return nil, fmt.Errorf("array index %d out of bounds (length %d)", idx, len(coll))
 				}
 				return coll[idx], nil
+			case bytesVal:
+				idx := toInt(idxV)
+				if idx < 0 || idx >= len(coll) {
+					return nil, fmt.Errorf("array index %d out of bounds (length %d)", idx, len(coll))
+				}
+				return bytesElem(coll, idx), nil
 			case map[string]any:
 				return coll[toStr(idxV)], nil
 			case map[any]any:
@@ -1195,6 +1469,54 @@ func (c *procCompiler) compileExpr(e *ir.Expr, escapes bool) cexpr {
 				}
 				v, _, err := site.call(vals, mask)
 				return v, err
+			}
+		}
+		// charAt / slice over native int positions: the builtin's own
+		// cases, with no boxing of a position (a position past 65535 into a
+		// long text would allocate on every read) and no name dispatch —
+		// a lexer's every step.
+		if e.Name == "charAt" && len(e.Args) == 2 && c.isInt(e.Args[1]) {
+			x, at := c.use(e.Args[0]), c.intExpr(e.Args[1])
+			return func(fr *pfr) (any, error) {
+				sv, err := x(fr)
+				if err != nil {
+					return nil, err
+				}
+				i, err := at(fr)
+				if err != nil {
+					return nil, err
+				}
+				if i < 0 {
+					return "", nil
+				}
+				return boxStr(runeSlice(toStr(sv), i, i+1)), nil
+			}
+		}
+		if e.Name == "slice" && len(e.Args) == 3 && c.isInt(e.Args[1]) && c.isInt(e.Args[2]) {
+			x, lo, hi := c.use(e.Args[0]), c.intExpr(e.Args[1]), c.intExpr(e.Args[2])
+			return func(fr *pfr) (any, error) {
+				sv, err := x(fr)
+				if err != nil {
+					return nil, err
+				}
+				a, err := lo(fr)
+				if err != nil {
+					return nil, err
+				}
+				b, err := hi(fr)
+				if err != nil {
+					return nil, err
+				}
+				if xs, ok := sv.([]any); ok {
+					return listSlice(xs, a, b), nil
+				}
+				if bs, ok := sv.(bytesVal); ok {
+					lo, hi := listBounds(len(bs), a, b)
+					out := make(bytesVal, hi-lo)
+					copy(out, bs[lo:hi])
+					return out, nil
+				}
+				return boxStr(runeSlice(toStr(sv), a, b)), nil
 			}
 		}
 		var args []cexpr
@@ -1266,12 +1588,17 @@ func (o *operand) get(fr *pfr) (any, error) {
 // sameList reports whether coercion handed res back as it was (the same
 // list, or an equal scalar), so its ownership carries over.
 func sameList(v, res any) bool {
-	a, okA := v.([]any)
-	b, okB := res.([]any)
-	if okA && okB {
-		return len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0])
+	switch a := v.(type) {
+	case []any:
+		b, ok := res.([]any)
+		return ok && len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0])
+	case bytesVal:
+		b, ok := res.(bytesVal)
+		return ok && len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0])
 	}
-	return !okA && !okB
+	_, okB := res.([]any)
+	_, okC := res.(bytesVal)
+	return !okB && !okC
 }
 
 // ── native int evaluation ───────────────────────────────────────────────
@@ -1376,7 +1703,7 @@ func (c *procCompiler) isInt(e *ir.Expr) bool {
 		if c.s.byProc[e.Name] != nil {
 			return false
 		}
-		return e.Name == "len" || e.Name == "byteLen"
+		return e.Name == "len" || e.Name == "byteLen" || e.Name == "indexOf"
 	}
 	return false
 }
@@ -1495,17 +1822,59 @@ func (c *procCompiler) intExpr(e *ir.Expr) iexpr {
 			if err != nil {
 				return 0, err
 			}
-			coll, ok := o.([]any)
-			if !ok {
-				return 0, fmt.Errorf("cannot index a value that is not an array or map")
+			switch coll := o.(type) {
+			case bytesVal:
+				if idx < 0 || idx >= len(coll) {
+					return 0, fmt.Errorf("array index %d out of bounds (length %d)", idx, len(coll))
+				}
+				return int(coll[idx]), nil
+			case []any:
+				if idx < 0 || idx >= len(coll) {
+					return 0, fmt.Errorf("array index %d out of bounds (length %d)", idx, len(coll))
+				}
+				return asInt(coll[idx]), nil
 			}
-			if idx < 0 || idx >= len(coll) {
-				return 0, fmt.Errorf("array index %d out of bounds (length %d)", idx, len(coll))
-			}
-			return asInt(coll[idx]), nil
+			return 0, fmt.Errorf("cannot index a value that is not an array or map")
 		}
 	}
-	// len / byteLen: the builtin, its result read as an int.
+	// len / indexOf: computed natively (the builtin's own cases, without
+	// callBuiltin's dispatch or a boxed result); byteLen through the builtin.
+	if e.Kind == "call" && e.Name == "len" && len(e.Args) == 1 && c.s.byProc["len"] == nil {
+		x := c.use(e.Args[0])
+		return func(fr *pfr) (int, error) {
+			v, err := x(fr)
+			if err != nil {
+				return 0, err
+			}
+			switch t := v.(type) {
+			case []any:
+				return len(t), nil
+			case bytesVal:
+				return len(t), nil
+			case map[any]any:
+				return len(t), nil
+			}
+			return runeLen(toStr(v)), nil
+		}
+	}
+	if e.Kind == "call" && e.Name == "indexOf" && len(e.Args) == 3 && c.s.byProc["indexOf"] == nil && c.isInt(e.Args[2]) {
+		x, sub, from := c.use(e.Args[0]), c.use(e.Args[1]), c.intExpr(e.Args[2])
+		return func(fr *pfr) (int, error) {
+			sv, err := x(fr)
+			if err != nil {
+				return 0, err
+			}
+			bv, err := sub(fr)
+			if err != nil {
+				return 0, err
+			}
+			f, err := from(fr)
+			if err != nil {
+				return 0, err
+			}
+			return runeIndexOf(toStr(sv), toStr(bv), f), nil
+		}
+	}
 	g := c.use(e)
 	return func(fr *pfr) (int, error) {
 		v, err := g(fr)
@@ -1572,6 +1941,11 @@ func (c *procCompiler) bin(e *ir.Expr) cexpr {
 	// once — compiling it twice at every level would make compile time
 	// exponential in an expression's depth (a long `a + b + c + …` chain).
 	op := e.Op
+	if op == "+" {
+		if cat := c.textConcat(e); cat != nil {
+			return cat
+		}
+	}
 	switch op {
 	case "&&":
 		l, r := c.use(e.L), c.use(e.R)
@@ -1606,7 +1980,26 @@ func (c *procCompiler) bin(e *ir.Expr) cexpr {
 			return truthy(rv), nil
 		}
 	}
+	if op == "in" {
+		if set := constSet(e.R); set != nil {
+			// `x in [literals]`: a hash lookup when x is the elements' own
+			// kind (where equal() is plain equality); any other x takes
+			// applyBin's scan, so mixed-kind matches (`1 in ["1"]`) stay.
+			lo := c.operand(e.L)
+			return func(fr *pfr) (any, error) {
+				lv, err := lo.get(fr)
+				if err != nil {
+					return nil, err
+				}
+				if hit, ok := set.lookup(lv); ok {
+					return hit, nil
+				}
+				return applyBin(op, lv, set.list), nil
+			}
+		}
+	}
 	fast, hasFast := intOp(op)
+	sfast, hasSfast := strOp(op)
 	lo, ro := c.operand(e.L), c.operand(e.R)
 	return func(fr *pfr) (any, error) {
 		lv, err := lo.get(fr)
@@ -1624,6 +2017,164 @@ func (c *procCompiler) bin(e *ir.Expr) cexpr {
 				}
 			}
 		}
+		if hasSfast {
+			if a, ok := lv.(string); ok {
+				if b, ok := rv.(string); ok {
+					return sfast(a, b), nil
+				}
+			}
+		}
 		return applyBin(op, lv, rv), nil
 	}
+}
+
+// textConcat compiles a `+` chain whose leftmost leaf is a text literal
+// (`"" + n`, `"line " + n + ": " + msg`) as one concatenation: every step
+// of the chain is applyBin's text + toStr(right), so the result is the
+// parts' texts joined, built once — not a new string per `+`, each
+// copying everything before it. nil when the chain is not that shape.
+func (c *procCompiler) textConcat(e *ir.Expr) cexpr {
+	var leaves []*ir.Expr
+	n := e
+	for n != nil && n.Kind == "bin" && n.Op == "+" {
+		leaves = append(leaves, n.R)
+		n = n.L
+	}
+	if n == nil || n.Kind != "lit" || n.VType != "text" || len(leaves) < 2 {
+		return nil
+	}
+	head := toStr(litValue(n))
+	parts := make([]cexpr, len(leaves))
+	for i, l := range leaves {
+		parts[len(leaves)-1-i] = c.use(l)
+	}
+	return func(fr *pfr) (any, error) {
+		var buf [8]string
+		var texts []string
+		if len(parts) <= len(buf) {
+			texts = buf[:len(parts)]
+		} else {
+			texts = make([]string, len(parts))
+		}
+		total := len(head)
+		for i, p := range parts {
+			v, err := p(fr)
+			if err != nil {
+				return nil, err
+			}
+			texts[i] = toStr(v)
+			total += len(texts[i])
+		}
+		var b strings.Builder
+		b.Grow(total)
+		b.WriteString(head)
+		for _, t := range texts {
+			b.WriteString(t)
+		}
+		return b.String(), nil
+	}
+}
+
+// strOp is applyBin's result for op on two texts, chosen once per operator
+// so the common text comparison skips applyBin's dispatch and equal's
+// conversions; false for an operator applyBin does not define on texts.
+func strOp(op string) (func(a, b string) any, bool) {
+	switch op {
+	case "==":
+		return func(a, b string) any { return a == b }, true
+	case "!=":
+		return func(a, b string) any { return a != b }, true
+	case "<":
+		return func(a, b string) any { return a < b }, true
+	case "<=":
+		return func(a, b string) any { return a <= b }, true
+	case ">":
+		return func(a, b string) any { return a > b }, true
+	case ">=":
+		return func(a, b string) any { return a >= b }, true
+	case "+":
+		return func(a, b string) any { return a + b }, true
+	}
+	return nil, false
+}
+
+// constList is e's value when e is a list literal whose elements are all
+// literals (or such lists themselves), built once at compile time.
+func constList(e *ir.Expr) ([]any, bool) {
+	if e == nil || e.Kind != "list" {
+		return nil, false
+	}
+	out := make([]any, len(e.Args))
+	for i, a := range e.Args {
+		switch {
+		case a != nil && a.Kind == "lit":
+			out[i] = litValue(a)
+		case a != nil && a.Kind == "list":
+			inner, ok := constList(a)
+			if !ok {
+				return nil, false
+			}
+			out[i] = inner
+		default:
+			return nil, false
+		}
+	}
+	return out, true
+}
+
+// litSet is a literal list compiled for `in`: the list itself (applyBin's
+// operand when the lookup cannot decide) and, when every element is a text
+// or every element is an int, the set of them.
+type litSet struct {
+	list []any
+	strs map[string]struct{}
+	ints map[int]struct{}
+}
+
+func constSet(e *ir.Expr) *litSet {
+	list, ok := constList(e)
+	if !ok {
+		return nil
+	}
+	set := &litSet{list: list}
+	allStr, allInt := true, true
+	for _, v := range list {
+		if _, ok := v.(string); !ok {
+			allStr = false
+		}
+		if _, ok := v.(int); !ok {
+			allInt = false
+		}
+	}
+	if allStr {
+		set.strs = make(map[string]struct{}, len(list))
+		for _, v := range list {
+			set.strs[v.(string)] = struct{}{}
+		}
+	}
+	if allInt {
+		set.ints = make(map[int]struct{}, len(list))
+		for _, v := range list {
+			set.ints[v.(int)] = struct{}{}
+		}
+	}
+	return set
+}
+
+// lookup answers `v in set` when v is the elements' own kind; ok is false
+// when only applyBin's equal()-by-equal() scan can answer.
+func (ls *litSet) lookup(v any) (hit, ok bool) {
+	switch t := v.(type) {
+	case string:
+		if ls.strs != nil {
+			_, hit = ls.strs[t]
+			return hit, true
+		}
+	case int:
+		if ls.ints != nil {
+			_, hit = ls.ints[t]
+			return hit, true
+		}
+	}
+	return false, false
 }

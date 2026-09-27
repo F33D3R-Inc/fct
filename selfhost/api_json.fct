@@ -1,0 +1,596 @@
+import "auth_actions.fct"
+
+app APIJSON:
+    # api_json.fct — runtime/server.go's JSON projection: GET /api (the
+    # schema), GET /api/<Entity> (rows, only when published through
+    # FACET_API_READ — apiread.go's refusal text otherwise), POST
+    # /api/<action> (a server action, `{"ok":true,"deltas":…}`), and the
+    # browser channel POST /event (`{"deltas":…}`, CSRF-gated), the two
+    # doors runActionValue answers behind. The built-in auth actions go to
+    # auth_actions.fct.
+    proc rtHandleAPISchema(w: RtWorld, req: HttpServerRequest) -> HttpServerResponse:
+        let g = w.g
+        let mut keys = ["app"]
+        let mut raws = [jsonQuote(g.app)]
+        let mut ents = []
+        let mut i = 0
+        loop i < len(g.entities):
+            let reserved = do rtIsReservedEntity(g.entities[i].name)
+            if !reserved:
+                ents = append(ents, g.entities[i])
+            i = i + 1
+        let mut ej = "null"
+        if len(ents) > 0:
+            ej = "["
+            let mut k = 0
+            loop k < len(ents):
+                if k > 0:
+                    ej = ej + ","
+                let one = do irEntityJSON(ents[k])
+                ej = ej + one
+                k = k + 1
+            ej = ej + "]"
+        keys = append(keys, "entities")
+        raws = append(raws, ej)
+        let mut dj = "null"
+        if len(g.derives) > 0:
+            dj = "["
+            let mut d = 0
+            loop d < len(g.derives):
+                if d > 0:
+                    dj = dj + ","
+                let dd = do irDeriveJSON(g.derives[d], false)
+                dj = dj + dd
+                d = d + 1
+            dj = dj + "]"
+        keys = append(keys, "derives")
+        raws = append(raws, dj)
+        let mut aj = "null"
+        let mut any = false
+        let mut a = 0
+        loop a < len(g.actions):
+            let act = g.actions[a]
+            if act.placement == "server":
+                if !any:
+                    aj = "["
+                else:
+                    aj = aj + ","
+                any = true
+                aj = aj + "{\"name\":" + jsonQuote(act.name) + ",\"params\":"
+                if len(act.params) == 0:
+                    aj = aj + "null"
+                else:
+                    aj = aj + "["
+                    let mut p = 0
+                    loop p < len(act.params):
+                        if p > 0:
+                            aj = aj + ","
+                        aj = aj + "{\"name\":" + jsonQuote(act.params[p].name) + ",\"type\":" + jsonQuote(act.params[p].type) + "}"
+                        p = p + 1
+                    aj = aj + "]"
+                if len(act.requires) > 0:
+                    aj = aj + ",\"requires\":["
+                    let mut r = 0
+                    loop r < len(act.requires):
+                        if r > 0:
+                            aj = aj + ","
+                        aj = aj + jsonQuote(act.requires[r].name)
+                        r = r + 1
+                    aj = aj + "]"
+                aj = aj + "}"
+            a = a + 1
+        if any:
+            aj = aj + "]"
+        keys = append(keys, "actions")
+        raws = append(raws, aj)
+        let readable = do rtSortedTexts(w.apiReadNames)
+        let mut rj = "["
+        let mut ri = 0
+        loop ri < len(readable):
+            if ri > 0:
+                rj = rj + ","
+            rj = rj + jsonQuote(readable[ri])
+            ri = ri + 1
+        rj = rj + "]"
+        keys = append(keys, "readable")
+        raws = append(raws, rj)
+        let body = do rtObjectJSONRaw(keys, raws)
+        let r2 = do rtJSONResponse(200, body + "\n")
+        return r2
+
+    proc rtActionIndex(g: IRGraph, name: text) -> int:
+        let mut i = 0
+        loop i < len(g.actions):
+            if g.actions[i].name == name:
+                return i
+            i = i + 1
+        return -1
+
+    proc rtIsAuthAction(name: text) -> bool:
+        return name == "signup" || name == "login" || name == "logout" || name == "setRole" || name == "requestReset" || name == "resetPassword" || name == "verifyEmail" || name == "enableMFA" || name == "confirmMFA" || name == "loginMFA"
+
+    # rtArgsOf: the `args` of a JSON request body, as values.
+    struct RtArgs:
+        ok: bool
+        args: [Val]
+        action: text
+
+    proc rtArgsOf(body: text) -> RtArgs:
+        if body == "":
+            return RtArgs{ok: true, args: [], action: ""}
+        let j = do jsonParse(body)
+        if j.kind != "obj":
+            return RtArgs{ok: false, args: [], action: ""}
+        let av = do jGet(j, "args")
+        let mut args = []
+        let mut i = 0
+        loop i < len(av.vals):
+            let v = do rtJValToVal(av.vals[i])
+            args = append(args, v)
+            i = i + 1
+        let action = do jStr(j, "action")
+        return RtArgs{ok: true, args: args, action: action}
+
+    # rtCheckCSRF: checkCSRF — a cookie-authenticated request must present
+    # its session's token in X-Facet-CSRF; one with no valid cookie has no
+    # ambient authority and passes.
+    proc rtCheckCSRF(w: RtWorld, req: HttpServerRequest) -> bool:
+        let raw = do rtCookieValue(req.headers, "fa_sid")
+        if raw == "":
+            return true
+        let v = do rtVerifySigned(w, raw)
+        if !v.ok:
+            return true
+        let want = do rtCsrfToken(w, v.value)
+        let got = do rtHeaderValue(req.headers, "x-facet-csrf")
+        return got == want
+
+    proc rtHandleEvent(w0: RtWorld, req: HttpServerRequest) -> RtHandled:
+        let mut w = w0
+        if req.method != "POST":
+            let m = do rtTextError(405, "POST only")
+            return RtHandled{resp: m, w: w}
+        let csrf = do rtCheckCSRF(w, req)
+        if !csrf:
+            let f = do rtTextError(403, "missing or invalid CSRF token")
+            return RtHandled{resp: f, w: w}
+        let a = do rtArgsOf(req.body)
+        if !a.ok || req.body == "":
+            let b = do rtTextError(400, "bad request")
+            return RtHandled{resp: b, w: w}
+        let isAuth = do rtIsAuthAction(a.action)
+        if w.g.auth && isAuth:
+            let ar = do rtRunAuth(w, req, a.action, a.args)
+            return ar
+        let ai = do rtActionIndex(w.g, a.action)
+        if ai < 0:
+            let u = do rtTextError(404, "unknown action")
+            return RtHandled{resp: u, w: w}
+        let act = w.g.actions[ai]
+        if act.placement != "server":
+            let cp = do rtTextError(400, "action is client-placed")
+            return RtHandled{resp: cp, w: w}
+        let so = do rtSession(w, req)
+        w = so.w
+        let run = do rtRunActionValue(w, so.sid, act, a.args)
+        w = run.w
+        if run.status != 200:
+            let mut e = do rtTextError(run.status, run.msg)
+            e.headers = append(e.headers, so.cookie)
+            return RtHandled{resp: e, w: w}
+        let mut keys = ["deltas"]
+        let mut raws = [rtObjectJSON(run.deltaKeys, run.deltaVals)]
+        if act.ret != "":
+            keys = append(keys, "value")
+            raws = append(raws, rtValJSON(run.value))
+        let body = do rtObjectJSONRaw(keys, raws)
+        let mut resp = do rtJSONResponse(200, body + "\n")
+        resp.headers = append(resp.headers, so.cookie)
+        return RtHandled{resp: resp, w: w}
+
+    proc rtHandleAPI(w0: RtWorld, req: HttpServerRequest) -> RtHandled:
+        let mut w = w0
+        let name = slice(req.path, 5, len(req.path))
+        let slash = do rtIndexOfText(name, "/")
+        let reserved = do rtIsReservedEntity(name)
+        if name == "" || slash >= 0 || reserved:
+            let nf = do rtNotFound()
+            return RtHandled{resp: nf, w: w}
+        if req.method == "GET":
+            let ei = do rtEntityIndex(w.g, name)
+            if ei < 0:
+                let ue = do rtTextError(404, "unknown entity")
+                return RtHandled{resp: ue, w: w}
+            let so = do rtSidForRequest(w, req)
+            w = so.w
+            let sc = do rtScope(w, so.sid)
+            let mut rule = -1
+            let mut ri = 0
+            loop ri < len(w.apiReadNames):
+                if w.apiReadNames[ri] == name:
+                    rule = ri
+                ri = ri + 1
+            if rule < 0:
+                let why = name + " is not published over the JSON API: no read authorization is declared for it, and an entity list served without one hands every row to every caller. Publish it with FACET_API_READ=" + name + " (rows are public) or FACET_API_READ=" + name + ":<zero-argument policy> (rows are served only to an actor that policy admits)."
+                let fb = do rtTextError(403, why)
+                return RtHandled{resp: fb, w: w}
+            if w.apiReadGuards[rule] != "":
+                let ok = do rtGuardOK(w.g, w.apiReadGuards[rule], sc)
+                if !ok:
+                    let fb2 = do rtTextError(403, "forbidden: " + w.apiReadGuards[rule])
+                    return RtHandled{resp: fb2, w: w}
+            let q = do rtBuildAPIQuery(w.g.entities[ei], req.query, req.hasQuery)
+            if !q.ok:
+                let bq = do rtTextError(400, q.err)
+                return RtHandled{resp: bq, w: w}
+            let page = do rtStoreQuery(w, name, q, sc)
+            let visible = do rtVisibleRows(name, page.rows, sc, false)
+            let mut keys = ["rows"]
+            let mut raws = [rtValJSON(listVal(visible))]
+            if page.next != "":
+                keys = append(keys, "next")
+                raws = append(raws, jsonQuote(page.next))
+            let body = do rtObjectJSONRaw(keys, raws)
+            let lr = do rtJSONResponse(200, body)
+            return RtHandled{resp: lr, w: w}
+        if req.method == "POST":
+            let a = do rtArgsOf(req.body)
+            if !a.ok:
+                let b = do rtTextError(400, "bad request")
+                return RtHandled{resp: b, w: w}
+            let isAuth = do rtIsAuthAction(name)
+            if w.g.auth && isAuth:
+                let ar = do rtRunAuth(w, req, name, a.args)
+                return ar
+            let ai = do rtActionIndex(w.g, name)
+            if ai < 0:
+                let u = do rtTextError(404, "unknown action")
+                return RtHandled{resp: u, w: w}
+            let act = w.g.actions[ai]
+            if act.placement != "server":
+                let cp = do rtTextError(400, "action is client-placed and not callable over the API")
+                return RtHandled{resp: cp, w: w}
+            let so = do rtActionSession(w, req)
+            w = so.w
+            if !so.ok:
+                let mut ua = do rtTextError(401, "invalid or expired bearer token")
+                ua.headers = append(ua.headers, HttpHeader{name: "www-authenticate", value: "Bearer"})
+                return RtHandled{resp: ua, w: w}
+            let run = do rtRunActionValue(w, so.sid, act, a.args)
+            w = run.w
+            if run.status != 200:
+                let mut e = do rtTextError(run.status, run.msg)
+                if so.hasCookie:
+                    e.headers = append(e.headers, so.cookie)
+                return RtHandled{resp: e, w: w}
+            let mut keys = ["ok", "deltas"]
+            let mut raws = ["true", rtObjectJSON(run.deltaKeys, run.deltaVals)]
+            if act.ret != "":
+                keys = append(keys, "value")
+                raws = append(raws, rtValJSON(run.value))
+            let body = do rtObjectJSONRaw(keys, raws)
+            let mut resp = do rtJSONResponse(200, body + "\n")
+            if so.hasCookie:
+                resp.headers = append(resp.headers, so.cookie)
+            return RtHandled{resp: resp, w: w}
+        let mna = do rtTextError(405, "GET or POST only")
+        return RtHandled{resp: mna, w: w}
+
+    # rtActionSession: actionSession — a bearer token names a live session
+    # (no cookie stamped); otherwise the cookie session, minted if absent.
+    struct RtActionSession:
+        ok: bool
+        sid: text
+        w: RtWorld
+        hasCookie: bool
+        cookie: HttpHeader
+
+    proc rtActionSession(w0: RtWorld, req: HttpServerRequest) -> RtActionSession:
+        let auth = do rtHeaderValue(req.headers, "authorization")
+        let none = HttpHeader{name: "", value: ""}
+        if len(auth) > 7 && slice(auth, 0, 7) == "Bearer ":
+            let so = do rtSidForRequest(w0, req)
+            if so.sid == "":
+                return RtActionSession{ok: false, sid: "", w: so.w, hasCookie: false, cookie: none}
+            return RtActionSession{ok: true, sid: so.sid, w: so.w, hasCookie: false, cookie: none}
+        let ss = do rtSession(w0, req)
+        return RtActionSession{ok: true, sid: ss.sid, w: ss.w, hasCookie: true, cookie: ss.cookie}
+
+    # ── the entity list: buildAPIQuery + memStore.Query ─────────────────
+    # RtAPIQuery: `?by=field&desc=1&limit=20&after=cursor` and `field=value`
+    # filters, or the 400 that refuses them.
+    struct RtAPIQuery:
+        ok: bool
+        err: text
+        order: text
+        desc: bool
+        limit: int
+        after: text
+        where: [IRExpr]
+
+    struct RtQueryParam:
+        names: [text]
+        vals: [text]
+
+    # rtQueryParams: url.ParseQuery — every key in order of appearance, the
+    # value percent-decoded with `+` as a space.
+    proc rtQueryParams(query: text, hasQuery: bool) -> RtQueryParam:
+        let mut names = []
+        let mut vals = []
+        if !hasQuery || query == "":
+            return RtQueryParam{names: names, vals: vals}
+        let parts = split(query, "&")
+        let mut i = 0
+        loop i < len(parts):
+            let p = parts[i]
+            if p != "":
+                let eq = do rtIndexOfText(p, "=")
+                let mut k = p
+                let mut v = ""
+                if eq >= 0:
+                    k = slice(p, 0, eq)
+                    v = slice(p, eq + 1, len(p))
+                names = append(names, rtPathUnescape(replace(k, "+", " ")))
+                vals = append(vals, rtPathUnescape(replace(v, "+", " ")))
+            i = i + 1
+        return RtQueryParam{names: names, vals: vals}
+
+    proc rtParamFirst(qp: RtQueryParam, name: text) -> text:
+        let mut i = 0
+        loop i < len(qp.names):
+            if qp.names[i] == name:
+                return qp.vals[i]
+            i = i + 1
+        return ""
+
+    proc rtFieldTypeOf(e: IREntity, name: text) -> text:
+        if name == "id":
+            return "int"
+        let mut i = 0
+        loop i < len(e.fields):
+            if e.fields[i].name == name:
+                if e.fields[i].ref != "":
+                    return "int"
+                return e.fields[i].type
+            i = i + 1
+        return ""
+
+    proc rtIsPositiveInt(s: text) -> bool:
+        if s == "":
+            return false
+        let mut i = 0
+        loop i < len(s):
+            let c = charAt(s, i)
+            if !(c >= "0" && c <= "9"):
+                if !(i == 0 && (c == "-" || c == "+")):
+                    return false
+            i = i + 1
+        return toInt(s) > 0
+
+    proc rtBuildAPIQuery(e: IREntity, query: text, hasQuery: bool) -> RtAPIQuery:
+        let qp = do rtQueryParams(query, hasQuery)
+        let after = do rtParamFirst(qp, "after")
+        let by = do rtParamFirst(qp, "by")
+        let mut order = ""
+        if by != "":
+            let bt = do rtFieldTypeOf(e, by)
+            if bt == "":
+                return RtAPIQuery{ok: false, err: "unknown order field \"" + by + "\"", order: "", desc: false, limit: 0, after: "", where: []}
+            order = by
+        let d = do rtParamFirst(qp, "desc")
+        let desc = d == "1" || d == "true"
+        let mut limit = 0
+        let l = do rtParamFirst(qp, "limit")
+        if l != "":
+            let pos = do rtIsPositiveInt(l)
+            if !pos:
+                return RtAPIQuery{ok: false, err: "limit must be a positive integer", order: "", desc: false, limit: 0, after: "", where: []}
+            limit = toInt(l)
+        let mut preds = []
+        let mut seen = []
+        let mut i = 0
+        loop i < len(qp.names):
+            let k = qp.names[i]
+            let reserved = k == "by" || k == "desc" || k == "limit" || k == "after"
+            let mut dup = false
+            let mut si = 0
+            loop si < len(seen):
+                if seen[si] == k:
+                    dup = true
+                si = si + 1
+            if !reserved && !dup:
+                seen = append(seen, k)
+                let ft = do rtFieldTypeOf(e, k)
+                if ft == "":
+                    return RtAPIQuery{ok: false, err: "unknown filter field \"" + k + "\"", order: "", desc: false, limit: 0, after: "", where: []}
+                let mut lit = irLit(qp.vals[i], "text")
+                if ft == "int":
+                    let num = do rtIsNumericText(qp.vals[i])
+                    let mut n = 0
+                    if num:
+                        n = toInt(qp.vals[i])
+                    lit = irLit("" + n, "int")
+                if ft == "bool":
+                    let mut b = "false"
+                    if qp.vals[i] == "true" || qp.vals[i] == "1":
+                        b = "true"
+                    lit = irLit(b, "bool")
+                preds = append(preds, irBin("==", irGet(irRef("r"), k), lit))
+            i = i + 1
+        let mut where = []
+        if len(preds) > 0:
+            let mut pred = preds[0]
+            let mut pi = 1
+            loop pi < len(preds):
+                pred = irBin("&&", pred, preds[pi])
+                pi = pi + 1
+            where = [pred]
+        return RtAPIQuery{ok: true, err: "", order: order, desc: desc, limit: limit, after: after, where: where}
+
+    struct RtQueryPage:
+        rows: [Val]
+        next: text
+
+    # rtCursor: encodeCursor — base64url of {"o":<order value>,"i":<id>}.
+    proc rtCursor(orderVal: Val, id: int) -> text:
+        let oj = do rtValJSON(orderVal)
+        return base64UrlRaw(textToBytes("{\"o\":" + oj + ",\"i\":" + id + "}"))
+
+    proc rtCursorID(after: text) -> int:
+        let bs = do rtBase64UrlDecode(after)
+        if len(bs) == 0:
+            return -1
+        let j = do jsonParse(bytesToText(bs))
+        if j.kind != "obj":
+            return -1
+        let iv = do jGet(j, "i")
+        if iv.kind != "num":
+            return -1
+        return toInt(iv.s)
+
+    proc rtBase64UrlDecode(s: text) -> [int]:
+        let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        let mut out = []
+        let mut acc = 0
+        let mut bits = 0
+        let mut i = 0
+        loop i < len(s):
+            let c = charAt(s, i)
+            let v = do rtIndexOfText(alphabet, c)
+            if v < 0 || len(c) != 1:
+                return []
+            acc = acc * 64 + v
+            bits = bits + 6
+            if bits >= 8:
+                bits = bits - 8
+                out = append(out, (acc / (1 << bits)) % 256)
+                acc = acc % (1 << bits)
+            i = i + 1
+        return out
+
+    # rtStoreQuery: memStore.Query — filter, order (field then id, reversed
+    # for desc), skip past the cursor's row, cap at limit (50 by default),
+    # and mint the next cursor when the page is full.
+    proc rtStoreQuery(w: RtWorld, entity: text, q: RtAPIQuery, caller: RtScope) -> RtQueryPage:
+        # the predicate sees every table and the row (memStore.Query's scope)
+        let mut sc = do rtScopeNew()
+        let mut e = 0
+        loop e < len(w.entNames):
+            sc = do rtSet(sc, w.entNames[e], w.entRows[e])
+            e = e + 1
+        let mut filtered = []
+        let src0 = do rtEntRows(w, entity)
+        # apiQueryRows: the entity's `read:` clause is the residual every
+        # page is filtered through, against the caller's identity.
+        let src = do rtFilterByReadPolicy(entity, src0, caller)
+        if len(q.where) > 0:
+            let fr = do rtFilterRows(src, "r", q.where[0], sc, -1)
+            filtered = fr.v.items
+        else:
+            filtered = src
+        let mut sorted = do rtStoreSortRows(filtered, q.order, q.desc)
+        if q.after != "":
+            let afterID = do rtCursorID(q.after)
+            if afterID >= 0:
+                let mut at = -1
+                let mut i = 0
+                loop i < len(sorted) && at < 0:
+                    let idv = do valGet(sorted[i], "id")
+                    let idn = do valToInt(idv)
+                    if idn == afterID:
+                        at = i
+                    i = i + 1
+                if at >= 0:
+                    sorted = slice(sorted, at + 1, len(sorted))
+        let mut limit = q.limit
+        if limit <= 0:
+            limit = 50
+        if len(sorted) > limit:
+            sorted = slice(sorted, 0, limit)
+        let mut next = ""
+        if len(sorted) == limit:
+            let last = sorted[len(sorted) - 1]
+            let mut ov = do noneVal()
+            if q.order != "":
+                ov = do valGet(last, q.order)
+            let lid = do valGet(last, "id")
+            next = do rtCursor(ov, valToInt(lid))
+        return RtQueryPage{rows: sorted, next: next}
+
+    # ── POST /region: re-answer one region ──────────────────────────────
+    proc rtHandleRegion(w0: RtWorld, req: HttpServerRequest) -> RtHandled:
+        let mut w = w0
+        if req.method != "POST":
+            let m = do rtTextError(405, "POST only")
+            return RtHandled{resp: m, w: w}
+        let csrf = do rtCheckCSRF(w, req)
+        if !csrf:
+            let f = do rtTextError(403, "missing or invalid CSRF token")
+            return RtHandled{resp: f, w: w}
+        let j = do jsonParse(req.body)
+        if j.kind != "obj":
+            let b = do rtTextError(400, "bad request")
+            return RtHandled{resp: b, w: w}
+        let path = do jStr(j, "path")
+        let key = do jStr(j, "key")
+        let st = do jGet(j, "state")
+        let m2 = do rtPageFor(w.g, path)
+        if !m2.found:
+            let up = do rtTextError(404, "unknown page")
+            return RtHandled{resp: up, w: w}
+        let so = do rtSession(w, req)
+        w = so.w
+        let mut sc = do rtFullStore(w, so.sid)
+        let mut i = 0
+        loop i < len(m2.names):
+            sc = do rtSet(sc, m2.names[i], textVal(m2.vals[i]))
+            i = i + 1
+        sc = do rtSet(sc, "route", textVal(path))
+        let mut k = 0
+        loop k < len(w.g.states):
+            let cell = w.g.states[k]
+            if cell.placement == "client":
+                let has = do jHas(st, cell.name)
+                if has:
+                    let jv = do jGet(st, cell.name)
+                    let v = do rtJValToVal(jv)
+                    let mut cv = v
+                    if !cell.list:
+                        cv = do rtCoerce(v, cell.type)
+                    sc = do rtSet(sc, cell.name, cv)
+            k = k + 1
+        let page = m2.page
+        if page.requires != "":
+            let ok = do rtGuardOK(w.g, page.requires, sc)
+            if !ok:
+                let mut fb = do rtTextError(403, "forbidden")
+                fb.headers = append(fb.headers, so.cookie)
+                return RtHandled{resp: fb, w: w}
+        let pg = do rtPageSetup(w.g, page)
+        sc.matOn = true
+        let rd0 = do rtRenderNew(sc)
+        let rd = do rtChildren(pg, rd0, page.view, "", 0)
+        let mut keys = ["regions", "more", "aggs"]
+        let mut moreVals = []
+        let mut mi = 0
+        loop mi < len(rd.moreVals):
+            moreVals = append(moreVals, boolVal(rd.moreVals[mi]))
+            mi = mi + 1
+        let mut raws = [rtObjectJSON(rd.regKeys, rd.regVals), rtObjectJSON(rd.moreKeys, moreVals), rtObjectJSON(rd.sc.matKeys, rd.sc.matVals)]
+        if key != "":
+            let mut at = -1
+            let mut ri = 0
+            loop ri < len(rd.regKeys):
+                if rd.regKeys[ri] == key:
+                    at = ri
+                ri = ri + 1
+            if at < 0:
+                let mut ur = do rtTextError(404, "unknown region")
+                ur.headers = append(ur.headers, so.cookie)
+                return RtHandled{resp: ur, w: w}
+            keys = append(keys, "rows")
+            raws = append(raws, rtValJSON(rd.regVals[at]))
+        let body = do rtObjectJSONRaw(keys, raws)
+        let mut resp = do rtJSONResponse(200, body + "\n")
+        resp.headers = append(resp.headers, so.cookie)
+        return RtHandled{resp: resp, w: w}

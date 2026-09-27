@@ -1,0 +1,495 @@
+import "session_store.fct"
+
+app RuntimePage:
+    # runtime_page.fct — runtime/server.go's handlePage: the route match
+    # (pageFor/matchRoute), the guard (guardOK, a screen's redirect to the
+    # first enterable screen), the first paint (render_html.fct), the
+    # page's own IR (the graph with this page's view/bindings/depGraph, no
+    # pages, only the components it reaches, no css — the `#fa-ir` script),
+    # the client bootstrap (clientState: the render scope minus @private
+    # cells and entity collections, plus @regions/@more/@aggs/@seq — the
+    # `#fa-state` script) and the document around them (the `page`
+    # template, headMeta).
+    struct RtPageMatch:
+        found: bool
+        page: IRPage
+        names: [text]
+        vals: [text]
+
+    proc rtEmptyPage() -> IRPage:
+        return IRPage{name: "", path: "", params: [], requires: "", screen: false, view: [], bindings: [], depKeys: [], depVals: [], title: [], desc: []}
+
+    # rtPageFor: pageFor — an exact path first, then the first pattern that
+    # matches.
+    proc rtPageFor(g: IRGraph, path: text) -> RtPageMatch:
+        let mut i = 0
+        loop i < len(g.pages):
+            if g.pages[i].path == path:
+                return RtPageMatch{found: true, page: g.pages[i], names: [], vals: []}
+            i = i + 1
+        let mut j = 0
+        loop j < len(g.pages):
+            let m = do rtMatchRoute(g.pages[j].path, path)
+            if m.ok:
+                return RtPageMatch{found: true, page: g.pages[j], names: m.names, vals: m.vals}
+            j = j + 1
+        let none = do rtEmptyPage()
+        return RtPageMatch{found: false, page: none, names: [], vals: []}
+
+    # rtFirstEnterableScreen: the first screen (other than exceptPath)
+    # whose guard admits this scope, "" when none.
+    proc rtFirstEnterableScreen(g: IRGraph, exceptPath: text, sc: RtScope) -> text:
+        let mut i = 0
+        loop i < len(g.pages):
+            let p = g.pages[i]
+            if p.screen && p.path != exceptPath:
+                if p.requires == "":
+                    return p.path
+                let ok = do rtGuardOK(g, p.requires, sc)
+                if ok:
+                    return p.path
+            i = i + 1
+        return ""
+
+    # ── client collections ──────────────────────────────────────────────
+    # RtColls: clientColls — per entity, whether the client reads it whole
+    # (all) or which fields; parallel lists.
+    struct RtColls:
+        names: [text]
+        all: [bool]
+        fields: [text]
+
+    proc rtCollIndex(c: RtColls, name: text) -> int:
+        let mut i = 0
+        loop i < len(c.names):
+            if c.names[i] == name:
+                return i
+            i = i + 1
+        return -1
+
+    proc rtCollAll(c0: RtColls, name: text) -> RtColls:
+        let mut c = c0
+        let i = do rtCollIndex(c, name)
+        if i >= 0:
+            c.all[i] = true
+            return c
+        c.names = append(c.names, name)
+        c.all = append(c.all, true)
+        c.fields = append(c.fields, "")
+        return c
+
+    proc rtCollField(c0: RtColls, name: text, field: text) -> RtColls:
+        let mut c = c0
+        let i = do rtCollIndex(c, name)
+        if i >= 0:
+            let has = do rtCsvHas(c.fields[i], field)
+            if !has && field != "" && !c.all[i]:
+                c.fields[i] = c.fields[i] + field + ","
+            return c
+        # readOf: identity is read by every aggregate that compares or joins
+        # rows, so a new field read starts with id.
+        c.names = append(c.names, name)
+        c.all = append(c.all, false)
+        let mut fs = ",id,"
+        if field != "id" && field != "":
+            fs = fs + field + ","
+        c.fields = append(c.fields, fs)
+        return c
+
+    proc rtCsvHas(csv: text, field: text) -> bool:
+        let i = do rtIndexOfText(csv, "," + field + ",")
+        return i >= 0
+
+    proc rtIsEnt(g: IRGraph, name: text) -> bool:
+        let reserved = do rtIsReservedEntity(name)
+        if reserved:
+            return false
+        let ei = do rtEntityIndex(g, name)
+        return ei >= 0
+
+    proc rtKidsOf(e: IRExpr) -> [IRExpr]:
+        return e.l + e.r + e.x + e.obj + e.key + e.where + e.sel + e.limit + e.keys + e.args
+
+    proc rtCollectBareRefs(g: IRGraph, e: IRExpr, c0: RtColls) -> RtColls:
+        let mut c = c0
+        if e.kind == "ref":
+            let ent = do rtIsEnt(g, e.name)
+            if ent:
+                c = do rtCollAll(c, e.name)
+        let kids = do rtKidsOf(e)
+        let mut i = 0
+        loop i < len(kids):
+            c = do rtCollectBareRefs(g, kids[i], c)
+            i = i + 1
+        return c
+
+    proc rtCollectBareRefsList(g: IRGraph, xs: [IRExpr], c0: RtColls) -> RtColls:
+        let mut c = c0
+        let mut i = 0
+        loop i < len(xs):
+            c = do rtCollectBareRefs(g, xs[i], c)
+            i = i + 1
+        return c
+
+    proc rtItemFieldsOf(e: IRExpr, itemVar: text) -> [text]:
+        let mut out = []
+        if e.kind == "get" && len(e.obj) > 0 && e.obj[0].kind == "ref" && e.obj[0].name == itemVar:
+            out = append(out, e.field)
+        let kids = do rtKidsOf(e)
+        let mut i = 0
+        loop i < len(kids):
+            let sub = do rtItemFieldsOf(kids[i], itemVar)
+            out = out + sub
+            i = i + 1
+        return out
+
+    proc rtCollectReads(g: IRGraph, e: IRExpr, c0: RtColls) -> RtColls:
+        let mut c = c0
+        let ent = do rtIsEnt(g, e.name)
+        if e.kind == "agg" && ent:
+            c = do rtCollField(c, e.name, e.field)
+            let mut fs = []
+            if len(e.sel) > 0:
+                let sf = do rtItemFieldsOf(e.sel[0], e.itemVar)
+                fs = fs + sf
+            if len(e.where) > 0:
+                let wf = do rtItemFieldsOf(e.where[0], e.itemVar)
+                fs = fs + wf
+            let mut k = 0
+            loop k < len(fs):
+                c = do rtCollField(c, e.name, fs[k])
+                k = k + 1
+        if e.kind == "eget" && ent:
+            if e.field == "":
+                c = do rtCollAll(c, e.name)
+            else:
+                c = do rtCollField(c, e.name, e.field)
+        if e.kind == "ref" && ent:
+            c = do rtCollAll(c, e.name)
+        let kids = do rtKidsOf(e)
+        let mut i = 0
+        loop i < len(kids):
+            c = do rtCollectReads(g, kids[i], c)
+            i = i + 1
+        return c
+
+    proc rtCollectReadsList(g: IRGraph, xs: [IRExpr], c0: RtColls) -> RtColls:
+        let mut c = c0
+        let mut i = 0
+        loop i < len(xs):
+            c = do rtCollectReads(g, xs[i], c)
+            i = i + 1
+        return c
+
+    proc rtSegExprs(segs: [IRSeg]) -> [IRExpr]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(segs):
+            out = out + segs[i].expr
+            i = i + 1
+        return out
+
+    proc rtWalkNodeExprs(g: IRGraph, nodes: [IRNode], c0: RtColls) -> RtColls:
+        let mut c = c0
+        let mut i = 0
+        loop i < len(nodes):
+            let n = nodes[i]
+            let segLists = [n.segs, n.label, n.placeholder, n.pathSegs, n.classSegs, n.alt, n.poster]
+            let mut s = 0
+            loop s < len(segLists):
+                let es = do rtSegExprs(segLists[s])
+                c = do rtCollectBareRefsList(g, es, c)
+                s = s + 1
+            let mut o = 0
+            loop o < len(n.options):
+                let oes = do rtSegExprs(n.options[o].label)
+                c = do rtCollectBareRefsList(g, oes, c)
+                o = o + 1
+            c = do rtCollectBareRefsList(g, n.cond, c)
+            let collEnt = do rtIsEnt(g, n.coll)
+            if n.coll != "" && !collEnt:
+                c = do rtCollectReadsList(g, n.where, c)
+            else:
+                c = do rtCollectBareRefsList(g, n.where, c)
+            c = do rtCollectBareRefsList(g, n.limit, c)
+            c = do rtCollectBareRefsList(g, n.val, c)
+            if n.kind == "use":
+                c = do rtCollectBareRefsList(g, n.args, c)
+            else:
+                c = do rtCollectReadsList(g, n.args, c)
+            if n.kind == "typeahead" && collEnt:
+                c = do rtCollField(c, n.coll, n.value)
+            c = do rtWalkNodeExprs(g, n.children, c)
+            i = i + 1
+        return c
+
+    proc rtWalkStmtExprs(g: IRGraph, body: [IRStmt], c0: RtColls) -> RtColls:
+        let mut c = c0
+        let mut i = 0
+        loop i < len(body):
+            let st = body[i]
+            c = do rtCollectReadsList(g, st.value, c)
+            c = do rtCollectReadsList(g, st.key, c)
+            c = do rtCollectReadsList(g, st.where, c)
+            c = do rtCollectReadsList(g, st.limit, c)
+            c = do rtCollectReadsList(g, st.fieldExprs, c)
+            c = do rtCollectReadsList(g, st.args, c)
+            if st.op == "for":
+                c = do rtCollectReads(g, irRef(st.entity), c)
+            c = do rtWalkStmtExprs(g, st.body, c)
+            c = do rtWalkStmtExprs(g, st.elseBody, c)
+            i = i + 1
+        return c
+
+    # rtClientColls: clientColls — the collections a page's client still
+    # reads whole (or in part), which is what crosses in the bootstrap.
+    proc rtClientColls(g: IRGraph, page: IRPage) -> RtColls:
+        let mut c = RtColls{names: [], all: [], fields: []}
+        c = do rtWalkNodeExprs(g, page.view, c)
+        let mut b = 0
+        loop b < len(page.bindings):
+            c = do rtCollectBareRefsList(g, page.bindings[b].expr, c)
+            b = b + 1
+        let mut k = 0
+        loop k < len(g.components):
+            c = do rtWalkNodeExprs(g, g.components[k].view, c)
+            k = k + 1
+        let mut r = 0
+        loop r < len(g.routes):
+            let pi = do rtPolicyIndex(g, g.routes[r].requires)
+            if pi >= 0:
+                c = do rtCollectReadsList(g, g.policies[pi].expr, c)
+            r = r + 1
+        let mut a = 0
+        loop a < len(g.actions):
+            if g.actions[a].placement == "client":
+                c = do rtWalkStmtExprs(g, g.actions[a].body, c)
+            a = a + 1
+        return c
+
+    # rtProjectRows: projectRows — rows narrowed to `keep` (every field when
+    # all) minus `drop`, the gated fields this actor fails.
+    proc rtProjectRows(rows: Val, all: bool, fields: text) -> Val:
+        let r = do rtProjectRowsDrop(rows, all, fields, [])
+        return r
+
+    proc rtProjectRowsDrop(rows: Val, all: bool, fields: text, drop: [text]) -> Val:
+        if all && len(drop) == 0:
+            return rows
+        let mut out = []
+        let mut i = 0
+        loop i < len(rows.items):
+            let r = rows.items[i]
+            if r.kind != "record":
+                out = append(out, r)
+            else:
+                let mut keys = []
+                let mut items = []
+                let mut k = 0
+                loop k < len(r.keys):
+                    let mut keep = all
+                    if !all:
+                        keep = do rtCsvHas(fields, r.keys[k])
+                    let mut d = 0
+                    loop d < len(drop):
+                        if drop[d] == r.keys[k]:
+                            keep = false
+                        d = d + 1
+                    if keep:
+                        keys = append(keys, r.keys[k])
+                        items = append(items, r.items[k])
+                    k = k + 1
+                let rv = do recordVal(keys, items)
+                out = append(out, rv)
+            i = i + 1
+        let lv = do listVal(out)
+        return lv
+
+    proc rtIsPrivateState(g: IRGraph, name: text) -> bool:
+        let mut i = 0
+        loop i < len(g.states):
+            if g.states[i].name == name:
+                return g.states[i].private
+            i = i + 1
+        return false
+
+    # rtClientStateJSON: clientState, encoded.
+    proc rtClientStateJSON(w: RtWorld, page: IRPage, rd: RtRender) -> text:
+        let colls = do rtClientColls(w.g, page)
+        let mut keys = []
+        let mut raws = []
+        let mut i = 0
+        loop i < len(rd.sc.names):
+            let k = rd.sc.names[i]
+            let v = rd.sc.vals[i]
+            let priv = do rtIsPrivateState(w.g, k)
+            if !priv && charAt(k, 0) != "@":
+                let ei = do rtEntityIndex(w.g, k)
+                if ei >= 0:
+                    let ci = do rtCollIndex(colls, k)
+                    if ci >= 0:
+                        let drop = do rtGateForActor(k, rd.sc)
+                        let pr = do rtProjectRowsDrop(v, colls.all[ci], colls.fields[ci], drop)
+                        let pj = do rtValJSON(pr)
+                        keys = append(keys, k)
+                        raws = append(raws, pj)
+                else:
+                    let vj = do rtValJSON(v)
+                    keys = append(keys, k)
+                    raws = append(raws, vj)
+            i = i + 1
+        let regs = do rtObjectJSON(rd.regKeys, rd.regVals)
+        keys = append(keys, "@regions")
+        raws = append(raws, regs)
+        let mut moreVals = []
+        let mut m = 0
+        loop m < len(rd.moreVals):
+            moreVals = append(moreVals, boolVal(rd.moreVals[m]))
+            m = m + 1
+        let more = do rtObjectJSON(rd.moreKeys, moreVals)
+        keys = append(keys, "@more")
+        raws = append(raws, more)
+        let aggs = do rtObjectJSON(rd.sc.matKeys, rd.sc.matVals)
+        keys = append(keys, "@aggs")
+        raws = append(raws, aggs)
+        keys = append(keys, "@seq")
+        raws = append(raws, "" + w.writeSeq)
+        let out = do rtObjectJSONRaw(keys, raws)
+        return out
+
+    # rtPageIRJSON: the IR a page ships — this page's view, bindings and
+    # depGraph, no pages, the components it reaches, no css.
+    proc rtPageIRJSON(g0: IRGraph, pg: RtPage) -> text:
+        let mut g = g0
+        g.view = pg.page.view
+        g.bindings = pg.page.bindings
+        let mut dk = []
+        let mut dv = []
+        let mut i = 0
+        loop i < len(pg.page.depKeys):
+            dk = append(dk, pg.page.depKeys[i])
+            let parsed = do jsonParse(pg.page.depVals[i])
+            dv = append(dv, parsed)
+            i = i + 1
+        g.depGraph = JVal{kind: "obj", s: "", keys: dk, vals: dv}
+        g.pages = []
+        let mut comps = []
+        let mut c = 0
+        loop c < len(g0.components):
+            if pg.compUsed[c]:
+                comps = append(comps, g0.components[c])
+            c = c + 1
+        g.components = comps
+        g.css = ""
+        let j = do irGraphJSON(g)
+        return j
+
+    # rtHeadMeta: headMeta — the title and the description/OpenGraph tags.
+    proc rtHeadMeta(pg: RtPage, sc: RtScope) -> text:
+        let mut title = pg.g.app + " — Facet"
+        if len(pg.page.title) > 0:
+            let tr = do rtSegsToString(pg, sc, pg.page.title, -1)
+            title = tr.v.t
+        let mut out = "<title>" + rtEsc(title) + "</title>"
+        out = out + "\n<meta property=\"og:title\" content=\"" + rtEsc(title) + "\">"
+        if len(pg.page.desc) > 0:
+            let dr = do rtSegsToString(pg, sc, pg.page.desc, -1)
+            out = out + "\n<meta name=\"description\" content=\"" + rtEsc(dr.v.t) + "\">"
+            out = out + "\n<meta property=\"og:description\" content=\"" + rtEsc(dr.v.t) + "\">"
+            out = out + "\n<meta property=\"og:type\" content=\"website\">"
+        return out
+
+    proc rtValidThemeName(s: text) -> bool:
+        if s == "":
+            return true
+        if len(s) > 64 || charAt(s, 0) == "-" || charAt(s, len(s) - 1) == "-":
+            return false
+        let mut i = 0
+        loop i < len(s):
+            let c = charAt(s, i)
+            if !((c >= "a" && c <= "z") || (c >= "0" && c <= "9") || c == "-"):
+                return false
+            i = i + 1
+        return true
+
+    proc rtGuardedPage(app: text) -> text:
+        return "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>" + rtEsc(app) + " — Facet</title>\n<style>body{font:16px/1.5 system-ui,sans-serif;margin:4rem auto;max-width:30rem;color:#111;padding:0 1rem}</style>\n</head><body><h1>Not available</h1><p>You don't have access to this page.</p><p><a href=\"/\">Home</a></p></body></html>\n"
+
+    # RtPageOut: handlePage's answer — the response, and the world with the
+    # session it minted or slid.
+    struct RtPageOut:
+        resp: HttpServerResponse
+        w: RtWorld
+
+    proc rtNotFound() -> HttpServerResponse:
+        let r = do rtTextError(404, "404 page not found")
+        return r
+
+    # rtTextError: http.Error — text/plain, nosniff, the message and a newline.
+    proc rtTextError(status: int, msg: text) -> HttpServerResponse:
+        return HttpServerResponse{status: status, reason: "", headers: [HttpHeader{name: "content-type", value: "text/plain; charset=utf-8"}, HttpHeader{name: "x-content-type-options", value: "nosniff"}], body: msg + "\n"}
+
+    proc rtHandlePage(w0: RtWorld, req: HttpServerRequest) -> RtPageOut:
+        let mut w = w0
+        let m = do rtPageFor(w.g, req.path)
+        if !m.found:
+            let nf = do rtNotFound()
+            return RtPageOut{resp: nf, w: w}
+        let so = do rtSession(w, req)
+        w = so.w
+        let sid = so.sid
+        let mut sc = do rtFullStore(w, sid)
+        let mut i = 0
+        loop i < len(m.names):
+            sc = do rtSet(sc, m.names[i], textVal(m.vals[i]))
+            i = i + 1
+        sc = do rtSet(sc, "route", textVal(req.path))
+        let mut themeAttr = ""
+        let switchable = do rtHas(sc, "theme")
+        if switchable:
+            let ft = do rtCookieValue(req.headers, "fa_theme")
+            let hasCookie = do rtCookieHas(req.headers, "fa_theme")
+            let valid = do rtValidThemeName(ft)
+            if hasCookie && valid:
+                sc = do rtSet(sc, "theme", textVal(ft))
+                if ft != "":
+                    themeAttr = " data-theme=\"" + ft + "\""
+        let page = m.page
+        if page.requires != "":
+            let ok = do rtGuardOK(w.g, page.requires, sc)
+            if !ok:
+                if page.screen:
+                    let to = do rtFirstEnterableScreen(w.g, page.path, sc)
+                    if to != "":
+                        let redirect = HttpServerResponse{status: 302, reason: "", headers: [HttpHeader{name: "location", value: to}, HttpHeader{name: "content-type", value: "text/html; charset=utf-8"}, so.cookie], body: "<a href=\"" + rtEsc(to) + "\">Found</a>.\n\n"}
+                        return RtPageOut{resp: redirect, w: w}
+                let gp = do rtGuardedPage(w.g.app)
+                let forbidden = HttpServerResponse{status: 403, reason: "", headers: [HttpHeader{name: "content-type", value: "text/html; charset=utf-8"}, so.cookie], body: gp}
+                return RtPageOut{resp: forbidden, w: w}
+        let pg = do rtPageSetup(w.g, page)
+        sc.matOn = true
+        let rd0 = do rtRenderNew(sc)
+        let rd = do rtChildren(pg, rd0, page.view, "", 0)
+        let irJSON = do rtPageIRJSON(w.g, pg)
+        let stateJSON = do rtClientStateJSON(w, page, rd)
+        let head = do rtHeadMeta(pg, rd.sc)
+        let csrf = do rtCsrfToken(w, sid)
+        let mut html = "<!doctype html>\n<html lang=\"en\"" + themeAttr + ">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        html = html + head + "\n<meta name=\"fa-csrf\" content=\"" + csrf + "\">\n<link rel=\"stylesheet\" href=\"/facet.css?v=" + w.cssVer + "\">\n</head>\n<body>\n<div id=\"fa-root\" data-fa-mount>" + rd.html + "</div>\n<script type=\"application/json\" id=\"fa-ir\">" + irJSON + "</script>\n<script type=\"application/json\" id=\"fa-state\">" + stateJSON + "</script>\n<script src=\"/facet.js\"></script>\n</body>\n</html>\n"
+        let resp = HttpServerResponse{status: 200, reason: "", headers: [HttpHeader{name: "content-type", value: "text/html; charset=utf-8"}, HttpHeader{name: "content-language", value: "en"}, so.cookie], body: html}
+        return RtPageOut{resp: resp, w: w}
+
+    proc rtCookieHas(headers: [HttpHeader], name: text) -> bool:
+        let mut i = 0
+        loop i < len(headers):
+            if headers[i].name == "cookie":
+                let parts = split(headers[i].value, ";")
+                let mut k = 0
+                loop k < len(parts):
+                    let p = trim(parts[k])
+                    let eq = do rtIndexOfText(p, "=")
+                    if eq > 0 && slice(p, 0, eq) == name:
+                        return true
+                    k = k + 1
+            i = i + 1
+        return false

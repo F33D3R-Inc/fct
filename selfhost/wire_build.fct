@@ -749,9 +749,13 @@ app WireBuildSelfHost:
         since: text
         authScheme: text
         bearer: text
+        # basicId / basicSecret: `auth <scheme> basic <id> <secret>` — the
+        # action parameters the HTTP Basic credential's two halves bind to.
+        basicId: text
+        basicSecret: text
 
     proc wApiErr(msg: text) -> WAPI:
-        return WAPI{err: msg, method: "", path: "", action: "", status: 0, rate: "", since: "", authScheme: "", bearer: ""}
+        return WAPI{err: msg, method: "", path: "", action: "", status: 0, rate: "", since: "", authScheme: "", bearer: "", basicId: "", basicSecret: ""}
 
     proc wUnquoteDate(v: text) -> text:
         let ok = do vpUnquoteOk(v)
@@ -772,9 +776,11 @@ app WireBuildSelfHost:
         paramDocs: [WField]
         title: text
         bearer: text
+        # form: `body form` — the request is a form, not JSON (ast.API.Form).
+        form: bool
 
     proc wDocsErr(msg: text) -> WDocs:
-        return WDocs{err: msg, summary: "", description: "", body: "", errors: [], operation: "", paramDocs: [], title: "", bearer: ""}
+        return WDocs{err: msg, summary: "", description: "", body: "", errors: [], operation: "", paramDocs: [], title: "", bearer: "", form: false}
 
     struct WDocStr:
         is: bool
@@ -833,7 +839,7 @@ app WireBuildSelfHost:
             let e0 = do wDocsErr(he)
             return e0
         let lines = do vpLinesOf(bodySrc)
-        let mut d = WDocs{err: "", summary: "", description: "", body: "", errors: [], operation: "", paramDocs: [], title: "", bearer: ""}
+        let mut d = WDocs{err: "", summary: "", description: "", body: "", errors: [], operation: "", paramDocs: [], title: "", bearer: "", form: false}
         let nl = len(lines)
         let mut j = 0
         loop j < nl:
@@ -847,13 +853,13 @@ app WireBuildSelfHost:
                 if sm.err != "":
                     let e1 = do wDocsErr(sm.err)
                     return e1
-                d = WDocs{err: "", summary: sm.s, description: d.description, body: d.body, errors: d.errors, operation: d.operation, paramDocs: d.paramDocs, title: "", bearer: ""}
+                d = WDocs{err: "", summary: sm.s, description: d.description, body: d.body, errors: d.errors, operation: d.operation, paramDocs: d.paramDocs, title: "", bearer: "", form: d.form}
             else:
                 if de.is:
                     if de.err != "":
                         let e2 = do wDocsErr(de.err)
                         return e2
-                    d = WDocs{err: "", summary: d.summary, description: de.s, body: d.body, errors: d.errors, operation: d.operation, paramDocs: d.paramDocs, title: "", bearer: ""}
+                    d = WDocs{err: "", summary: d.summary, description: de.s, body: d.body, errors: d.errors, operation: d.operation, paramDocs: d.paramDocs, title: "", bearer: "", form: d.form}
                 else:
                     if op.is:
                         if op.err != "":
@@ -863,23 +869,26 @@ app WireBuildSelfHost:
                         if !oi:
                             let e4 = do wDocsErr("operation \"" + op.s + "\" must be an identifier (the operationId clients generate a method from)")
                             return e4
-                        d = WDocs{err: "", summary: d.summary, description: d.description, body: d.body, errors: d.errors, operation: op.s, paramDocs: d.paramDocs, title: "", bearer: ""}
+                        d = WDocs{err: "", summary: d.summary, description: d.description, body: d.body, errors: d.errors, operation: op.s, paramDocs: d.paramDocs, title: "", bearer: "", form: d.form}
                     else:
                         if isBody:
                             let b = trim(slice(t, 5, len(t)))
-                            let bi = do vpIsIdent(b)
-                            let bu = do vpIsUpper(b)
-                            if !bi || !bu:
-                                let e5 = do wDocsErr("body names the wire type the request body is: body V2NumberMintRequest")
-                                return e5
-                            d = WDocs{err: "", summary: d.summary, description: d.description, body: b, errors: d.errors, operation: d.operation, paramDocs: d.paramDocs, title: "", bearer: ""}
+                            if b == "form":
+                                d.form = true
+                            else:
+                                let bi = do vpIsIdent(b)
+                                let bu = do vpIsUpper(b)
+                                if !bi || !bu:
+                                    let e5 = do wDocsErr("body names the wire type the request body is (body V2NumberMintRequest), or `body form` for a form-encoded request")
+                                    return e5
+                                d = WDocs{err: "", summary: d.summary, description: d.description, body: b, errors: d.errors, operation: d.operation, paramDocs: d.paramDocs, title: "", bearer: "", form: d.form}
                         else:
                             if isErr:
                                 let ec = do wErrorCodes(t)
                                 if ec.err != "":
                                     let e6 = do wDocsErr(ec.err)
                                     return e6
-                                d = WDocs{err: "", summary: d.summary, description: d.description, body: d.body, errors: ec.codes, operation: d.operation, paramDocs: d.paramDocs, title: "", bearer: ""}
+                                d = WDocs{err: "", summary: d.summary, description: d.description, body: d.body, errors: ec.codes, operation: d.operation, paramDocs: d.paramDocs, title: "", bearer: "", form: d.form}
                             else:
                                 if contains(t, ":"):
                                     let fr = do wVariantField(t, methodPath)
@@ -893,7 +902,7 @@ app WireBuildSelfHost:
                                             let e8 = do wDocsErr("parameter \"" + fr.field.name + "\" documented twice")
                                             return e8
                                         k = k + 1
-                                    d = WDocs{err: "", summary: d.summary, description: d.description, body: d.body, errors: d.errors, operation: d.operation, paramDocs: append(d.paramDocs, fr.field), title: "", bearer: ""}
+                                    d = WDocs{err: "", summary: d.summary, description: d.description, body: d.body, errors: d.errors, operation: d.operation, paramDocs: append(d.paramDocs, fr.field), title: "", bearer: "", form: d.form}
                                 else:
                                     let e9 = do wDocsErr("an api block holds summary \"…\", description \"…\", body Type, errors N, …, operation \"…\", or `param: type \"description\"` lines")
                                     return e9
@@ -935,7 +944,7 @@ app WireBuildSelfHost:
                 let e1 = do wDocsErr(msg)
                 return e1
             j = j + 1
-        return WDocs{err: "", summary: "", description: desc, body: "", errors: [], operation: "", paramDocs: [], title: title, bearer: bearer}
+        return WDocs{err: "", summary: "", description: desc, body: "", errors: [], operation: "", paramDocs: [], title: title, bearer: bearer, form: false}
 
     struct WAPIDocs:
         err: text
@@ -964,7 +973,7 @@ app WireBuildSelfHost:
             let mut pi = 0
             loop pi < np:
                 let p = act.params[pi]
-                if !(p.name in pathParams) && p.name != ap.bearer:
+                if !(p.name in pathParams) && p.name != ap.bearer && p.name != ap.basicId && p.name != ap.basicSecret:
                     let mut fi = -1
                     let nf = len(wt.fields)
                     let mut f = 0
@@ -1052,6 +1061,8 @@ app WireBuildSelfHost:
         let mut since = ""
         let mut scheme = ""
         let mut bearer = ""
+        let mut basicId = ""
+        let mut basicSecret = ""
         let nt = len(tail)
         let mut i = 1
         loop i < nt:
@@ -1082,22 +1093,36 @@ app WireBuildSelfHost:
                         since = d
                     else:
                         if key == "auth":
+                            # `auth <scheme> bearer <param>` (four words) or
+                            # `auth <scheme> basic <id> <secret>` (five).
                             let vi = do vpIsIdent(val)
-                            let mut ok = vi && i + 3 < nt
-                            if ok:
+                            let mut okBearer = vi && i + 3 < nt
+                            if okBearer:
                                 let bi = do vpIsIdent(tail[i + 3])
-                                ok = tail[i + 2] == "bearer" && bi
-                            if !ok:
-                                let e10 = do wApiErr("api auth clause is `auth <scheme> bearer <param>`: the route's credential scheme and the action parameter the bearer token binds to")
-                                return e10
-                            scheme = val
-                            bearer = tail[i + 3]
-                            i = i + 2
+                                okBearer = tail[i + 2] == "bearer" && bi
+                            let mut okBasic = vi && i + 4 < nt
+                            if okBasic:
+                                let bi2 = do vpIsIdent(tail[i + 3])
+                                let bi3 = do vpIsIdent(tail[i + 4])
+                                okBasic = tail[i + 2] == "basic" && bi2 && bi3
+                            if okBearer:
+                                scheme = val
+                                bearer = tail[i + 3]
+                                i = i + 2
+                            else:
+                                if okBasic:
+                                    scheme = val
+                                    basicId = tail[i + 3]
+                                    basicSecret = tail[i + 4]
+                                    i = i + 3
+                                else:
+                                    let e10 = do wApiErr("api auth clause is `auth <scheme> bearer <param>` or `auth <scheme> basic <id> <secret>`: the route's credential scheme and the action parameter(s) the credential binds to")
+                                    return e10
                         else:
                             let e11 = do wApiErr("unknown api clause \"" + key + "\" (expected status, rate, since or auth)")
                             return e11
             i = i + 2
-        return WAPI{err: "", method: method, path: path, action: tail[0], status: status, rate: rate, since: since, authScheme: scheme, bearer: bearer}
+        return WAPI{err: "", method: method, path: path, action: tail[0], status: status, rate: rate, since: since, authScheme: scheme, bearer: bearer, basicId: basicId, basicSecret: basicSecret}
 
     struct WContract:
         err: text
@@ -1541,11 +1566,11 @@ app WireBuildSelfHost:
                     return WDispatch{err: "line " + line + ": " + msg.name + " variant " + wq + " does not carry action " + aq + "'s required parameter " + rq, actions: actions0}
                 pk = pk + 1
             if act.placement != "server":
-                actions[ai] = IRAction{name: act.name, params: act.params, requires: act.requires, optimistic: act.optimistic, ret: act.ret, retList: act.retList, placement: "server", reason: "serves " + ap.method + " " + ap.path + " (" + wn + ") — an endpoint runs on the authority", writes: act.writes, reads: act.reads, seal: act.seal, body: act.body}
+                actions[ai] = IRAction{name: act.name, params: act.params, requires: act.requires, optimistic: act.optimistic, ret: act.ret, retList: act.retList, placement: "server", reason: "serves " + ap.method + " " + ap.path + " (" + wn + ") — an endpoint runs on the authority", writes: act.writes, reads: act.reads, seal: act.seal, body: act.body, builtin: act.builtin}
             vi = vi + 1
         return WDispatch{err: "", actions: actions}
 
-    proc wBuildRoutes(actions0: [IRAction], raws: [RawDecl], clientStates: [text], policyNames: [text], policyCounts: [int], wireNames: [text], messages: [IRWireMessage], wireTypes: [IRWireType]) -> WRoutes:
+    proc wBuildRoutes(actions0: [IRAction], raws: [RawDecl], clientStates: [text], policyNames: [text], policyCounts: [int], wireNames: [text], messages: [IRWireMessage], wireTypes: [IRWireType], expectedEventNames: [text], expectedEventTypes: [text]) -> WRoutes:
         let mut actions = actions0
         let mut apis = []
         let mut apiKeys = []
@@ -1578,7 +1603,7 @@ app WireBuildSelfHost:
                     if docs.body != "" || len(docs.errors) > 0 || len(docs.paramDocs) > 0:
                         let edd = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\" -> " + messages[mi].name + ": a dispatching route documents its variants in the message — its block takes only summary, description and operation")
                         return edd
-                    apis = append(apis, IRAPI{method: ap.method, path: ap.path, params: [], action: "", status: 200, rate: ap.rate, since: ap.since, auth: "none", ret: "", retList: false, bearer: "", dispatch: messages[mi].name, summary: docs.summary, description: docs.description, body: "", errors: [], operation: docs.operation, paramDocs: []})
+                    apis = append(apis, IRAPI{method: ap.method, path: ap.path, params: [], action: "", status: 200, rate: ap.rate, since: ap.since, auth: "none", ret: "", retList: false, bearer: "", basicId: "", basicSecret: "", form: false, dispatch: messages[mi].name, summary: docs.summary, description: docs.description, body: "", errors: [], operation: docs.operation, paramDocs: []})
                     ri = ri + 1
                     continue
                 let ai = do wFindAction(actions, ap.action)
@@ -1595,7 +1620,7 @@ app WireBuildSelfHost:
                             let e2 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\" targets action \"" + ap.action + "\", which reads or writes client-only state \"" + touched[ti] + "\"; an endpoint runs on the authority, which cannot see ephemeral client state")
                             return e2
                         ti = ti + 1
-                    actions[ai] = IRAction{name: act.name, params: act.params, requires: act.requires, optimistic: act.optimistic, ret: act.ret, retList: act.retList, placement: "server", reason: "serves api " + ap.method + " " + ap.path + " — an endpoint runs on the authority", writes: act.writes, reads: act.reads, seal: act.seal, body: act.body}
+                    actions[ai] = IRAction{name: act.name, params: act.params, requires: act.requires, optimistic: act.optimistic, ret: act.ret, retList: act.retList, placement: "server", reason: "serves api " + ap.method + " " + ap.path + " — an endpoint runs on the authority", writes: act.writes, reads: act.reads, seal: act.seal, body: act.body, builtin: act.builtin}
                 let key = ap.method + " " + ap.path
                 if key in apiKeys:
                     let e3 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\" redeclared")
@@ -1669,11 +1694,56 @@ app WireBuildSelfHost:
                         let e12 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": auth scheme \"" + ap.authScheme + "\" is reserved; name the credential (e.g. dev_token)")
                         return e12
                     auth = ap.authScheme
+                if ap.basicId != "":
+                    # The Basic credential is the app's own client id and
+                    # secret, verified by the action — never a session.
+                    if len(act.requires) > 0:
+                        let e9b = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\" authenticates with " + ap.authScheme + " basic credentials, so action \"" + ap.action + "\" cannot also require a session policy")
+                        return e9b
+                    let creds = [ap.basicId, ap.basicSecret]
+                    let mut ci = 0
+                    loop ci < 2:
+                        let cname = creds[ci]
+                        let mut cok = false
+                        let npc = len(act.params)
+                        let mut ck = 0
+                        loop ck < npc:
+                            if act.params[ck].name == cname && act.params[ck].type == "text" && !act.params[ck].list:
+                                cok = true
+                            ck = ck + 1
+                        if !cok:
+                            let e10b = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": basic credential parameter \"" + cname + "\" must be a text parameter of action \"" + ap.action + "\"")
+                            return e10b
+                        if cname in pathParams:
+                            let e11b = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": {" + cname + "} is a path parameter, not a basic credential")
+                            return e11b
+                        ci = ci + 1
+                    if ap.basicId == ap.basicSecret:
+                        let e12b = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": the basic id and secret bind to two different parameters")
+                        return e12b
+                    if ap.authScheme == "none" || ap.authScheme == "session" || ap.authScheme == "bearer":
+                        let e13b = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": auth scheme \"" + ap.authScheme + "\" is reserved; name the credential (e.g. dev_client)")
+                        return e13b
+                    auth = ap.authScheme
+                if docs.form:
+                    if ap.method == "GET":
+                        let ef1 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": a GET carries no request body — drop `body form`")
+                        return ef1
+                    if docs.body != "":
+                        let ef2 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": `body form` and `body " + docs.body + "` name two different request bodies")
+                        return ef2
+                    let npf = len(act.params)
+                    let mut fk = 0
+                    loop fk < npf:
+                        if act.params[fk].type == "bytes":
+                            let ef3 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": a `bytes` parameter (\"" + act.params[fk].name + "\") already makes the request a multipart form — drop `body form`")
+                            return ef3
+                        fk = fk + 1
                 let adc = do wAPIDocsCheck(ap, docs, act, pathParams, wireTypes)
                 if adc.err != "":
                     let eadc = do wRoutesErr(adc.err)
                     return eadc
-                apis = append(apis, IRAPI{method: ap.method, path: ap.path, params: pathParams, action: ap.action, status: status, rate: ap.rate, since: ap.since, auth: auth, ret: act.ret, retList: act.retList, bearer: ap.bearer, dispatch: "", summary: docs.summary, description: docs.description, body: docs.body, errors: docs.errors, operation: docs.operation, paramDocs: adc.docs})
+                apis = append(apis, IRAPI{method: ap.method, path: ap.path, params: pathParams, action: ap.action, status: status, rate: ap.rate, since: ap.since, auth: auth, ret: act.ret, retList: act.retList, bearer: ap.bearer, basicId: ap.basicId, basicSecret: ap.basicSecret, form: docs.form, dispatch: "", summary: docs.summary, description: docs.description, body: docs.body, errors: docs.errors, operation: docs.operation, paramDocs: adc.docs})
             ri = ri + 1
         # the contract route
         let mut rc = 0
@@ -1798,7 +1868,7 @@ app WireBuildSelfHost:
                                 let e29 = do wRoutesErr("stream \"" + st.path + "\" " + kind + " -> " + hname + ": parameter \"" + ha.params[hp].name + "\" is not one of the path's {params}")
                                 return e29
                             hp = hp + 1
-                        actions[hi] = IRAction{name: ha.name, params: ha.params, requires: ha.requires, optimistic: ha.optimistic, ret: ha.ret, retList: ha.retList, placement: "server", reason: "runs on " + kind + " of stream " + st.path + " — the authority holds the connection", writes: ha.writes, reads: ha.reads, seal: ha.seal, body: ha.body}
+                        actions[hi] = IRAction{name: ha.name, params: ha.params, requires: ha.requires, optimistic: ha.optimistic, ret: ha.ret, retList: ha.retList, placement: "server", reason: "runs on " + kind + " of stream " + st.path + " — the authority holds the connection", writes: ha.writes, reads: ha.reads, seal: ha.seal, body: ha.body, builtin: ha.builtin}
                         if hevent != "":
                             let mut evType = ""
                             let ne2 = len(st.events)
@@ -1830,6 +1900,15 @@ app WireBuildSelfHost:
                     sdi = sdi + 1
                 streams = append(streams, IRStream{path: st.path, events: st.events, requires: st.requires, auth: auth, rate: st.rate, since: st.since, params: sparams, connects: st.connects, disconnect: st.disconnect, hello: st.hello, summary: st.summary, description: st.description, paramDocs: sdocs2, errors: st.errors})
             rs = rs + 1
+        # Events a module expected some host stream to carry and none here
+        # does (`expect event`, compile/expect.go): the module is compiled
+        # on its own, and the stream is its host's to declare.
+        let nxe = len(expectedEventNames)
+        let mut xe = 0
+        loop xe < nxe:
+            carriedNamed = append(carriedNamed, expectedEventNames[xe] + "\t" + expectedEventTypes[xe])
+            carried = append(carried, expectedEventTypes[xe])
+            xe = xe + 1
         let nsp = len(streamParamPaths)
         let mut gs = 0
         loop gs < nsp:

@@ -1,0 +1,625 @@
+import "contract_doc.fct"
+
+app ContractHistory:
+    # contract_history.fct — runtime/contracthistory.go: the contract this
+    # process serves is recorded once, under its version, in the reserved
+    # FacetContractVersion table (recordContractVersion: the data schema's
+    # ordinal is the first row whose schema hash matches, else one past
+    # the highest), and served at `contract "/path"`: the document, its
+    # /version, every version the deployment has served (/history, newest
+    # first) and what changed between two of them (/diff?from=&to=) —
+    # every one a GET-only, rate-metered, conditional GET (a strong ETag
+    # over the bytes; 304 on If-None-Match).
+    #
+    # The diff reads two documents back as shapes — a route's parameters,
+    # request and response fields, a stream event's payload, a mutation's
+    # fields/body/result, a component schema's fields, each field a type
+    # name and whether it is required — and reports what was added,
+    # removed or changed, keys sorted, exactly as contractDiff does.
+    # ── the schema hash and the version row ─────────────────────────────
+    proc cEntitySchemaHash(g: IRGraph) -> text:
+        let mut names = []
+        let mut i = 0
+        loop i < len(g.entities):
+            let e = g.entities[i]
+            let reserved = do rtIsReservedEntity(e.name)
+            if !e.ephemeral && !reserved:
+                names = append(names, e.name)
+            i = i + 1
+        let idx = do rtSortedIndex(names)
+        let mut out = "{"
+        let mut k = 0
+        loop k < len(idx):
+            let ei = do rtEntityIndex(g, names[idx[k]])
+            let e2 = g.entities[ei]
+            if k > 0:
+                out = out + ","
+            out = out + jsonQuote(e2.name) + ":"
+            if len(e2.fields) == 0:
+                out = out + "null"
+            else:
+                out = out + "["
+                let mut f = 0
+                loop f < len(e2.fields):
+                    if f > 0:
+                        out = out + ","
+                    out = out + "{\"Name\":" + jsonQuote(e2.fields[f].name) + ",\"Type\":" + jsonQuote(e2.fields[f].type) + ",\"Ref\":" + jsonQuote(e2.fields[f].ref) + "}"
+                    f = f + 1
+                out = out + "]"
+            k = k + 1
+        out = out + "}"
+        return sha256Hex(out)
+
+    # cRecordContractVersion: build the document once and record it.
+    proc cRecordContractVersion(w0: RtWorld) -> RtWorld:
+        let mut w = w0
+        if len(w.g.contract) == 0:
+            return w
+        let hash = do cEntitySchemaHash(w.g)
+        let rows = do rtEntRows(w, "FacetContractVersion")
+        let mut sv = 0
+        let mut max = 0
+        let mut i = 0
+        loop i < len(rows):
+            let nv = do valGet(rows[i], "schema_version")
+            let n = do valToInt(nv)
+            if n > max:
+                max = n
+            let hv = do valGet(rows[i], "schema_hash")
+            let hs = do valToStr(hv)
+            if hs == hash && sv == 0:
+                sv = n
+            i = i + 1
+        if sv == 0:
+            sv = max + 1
+        w.schemaVersion = sv
+        let built = do cBuildContract(w, sv)
+        w.contractRaw = built.raw
+        w.contractVersion = built.version
+        w.contractGenerated = nowMs() / 1000
+        let mut k = 0
+        loop k < len(rows):
+            let vv = do valGet(rows[k], "version")
+            let vs = do valToStr(vv)
+            if vs == built.version:
+                return w
+            k = k + 1
+        let ei = do rtEntIndex(w, "FacetContractVersion")
+        if ei >= 0:
+            let id = w.nextIds[ei] + 1
+            w.nextIds[ei] = id
+            let row = do recordVal(["version", "schema_version", "schema_hash", "first_seen", "document", "id"], [textVal(built.version), intVal(sv), textVal(hash), intVal(w.contractGenerated), textVal(built.raw), intVal(id)])
+            w = do rtSetEntRows(w, "FacetContractVersion", append(rows, row))
+        return w
+
+    # ── the routes ──────────────────────────────────────────────────────
+    proc cIsContractPath(w: RtWorld, path: text) -> bool:
+        if len(w.g.contract) == 0:
+            return false
+        let c = w.g.contract[0].path
+        return path == c || path == c + "/version" || path == c + "/history" || path == c + "/diff"
+
+    # cWriteConditional: writeConditional — the ETag over the bytes, the
+    # cache policy, a 304 for a matching If-None-Match.
+    proc cWriteConditional(req: HttpServerRequest, body: text, cacheControl: text, extra: [HttpHeader]) -> HttpServerResponse:
+        let etag = "\"" + slice(sha256Hex(body), 0, 32) + "\""
+        let mut headers = extra + [HttpHeader{name: "etag", value: etag}, HttpHeader{name: "cache-control", value: cacheControl}]
+        let inm = do rtHeaderValue(req.headers, "if-none-match")
+        let hit = do rtIndexOfText(inm, etag)
+        if hit >= 0:
+            return HttpServerResponse{status: 304, reason: "", headers: headers, body: ""}
+        headers = append(headers, HttpHeader{name: "content-type", value: "application/json"})
+        return HttpServerResponse{status: 200, reason: "", headers: headers, body: body}
+
+    proc cRFC3339(unix: int) -> text:
+        let s = iso(unix)
+        return s
+
+    proc cHandleContract(w0: RtWorld, req: HttpServerRequest, peer: text) -> RtHandled:
+        let mut w = w0
+        let c = w.g.contract[0]
+        if req.method != "GET":
+            let m = do rtAPIError(405, "method not allowed")
+            return RtHandled{resp: m, w: w}
+        let ip = do rtClientIP(req, peer)
+        let rate = do rtMeterRate(w, c.rate, ip)
+        w = rate.w
+        if !rate.allowed:
+            let limited = do rtAPIError(429, "rate limited")
+            let lr = do rtWithHeaders(limited, rate.headers)
+            return RtHandled{resp: lr, w: w}
+        if req.path == c.path:
+            let doc = do cWriteConditional(req, w.contractRaw, "public, max-age=60", rate.headers)
+            return RtHandled{resp: doc, w: w}
+        if req.path == c.path + "/version":
+            let body = do rtObjectJSONRaw(["version", "schema_version", "generated_at"], [jsonQuote(w.contractVersion), "" + w.schemaVersion, jsonQuote(cRFC3339(w.contractGenerated))])
+            let vr = do cWriteConditional(req, body, "private, no-cache", rate.headers)
+            return RtHandled{resp: vr, w: w}
+        if req.path == c.path + "/history":
+            let hb = do cHistoryJSON(w)
+            let hr = do cWriteConditional(req, hb, "private, no-cache", rate.headers)
+            return RtHandled{resp: hr, w: w}
+        let from = trim(rtQueryValue(req.query, "from"))
+        let mut to = trim(rtQueryValue(req.query, "to"))
+        if from == "":
+            let bad = do rtAPIError(400, "name the version to diff from (?from=), or `current`")
+            let badr = do rtWithHeaders(bad, rate.headers)
+            return RtHandled{resp: badr, w: w}
+        if to == "":
+            to = "current"
+        let fromDoc = do cDocumentByVersion(w, from)
+        if !fromDoc.ok:
+            let nf = do rtAPIError(404, "this deployment never served contract version " + from)
+            let nfr = do rtWithHeaders(nf, rate.headers)
+            return RtHandled{resp: nfr, w: w}
+        let toDoc = do cDocumentByVersion(w, to)
+        if !toDoc.ok:
+            let nf2 = do rtAPIError(404, "this deployment never served contract version " + to)
+            let nf2r = do rtWithHeaders(nf2, rate.headers)
+            return RtHandled{resp: nf2r, w: w}
+        let diff = do cContractDiff(fromDoc.body, toDoc.body)
+        let dr = do cWriteConditional(req, diff, "private, no-cache", rate.headers)
+        return RtHandled{resp: dr, w: w}
+
+    struct RtDocLookup:
+        ok: bool
+        body: text
+
+    proc cDocumentByVersion(w: RtWorld, version: text) -> RtDocLookup:
+        if version == "current" || version == w.contractVersion:
+            return RtDocLookup{ok: true, body: w.contractRaw}
+        let rows = do rtEntRows(w, "FacetContractVersion")
+        let mut i = 0
+        loop i < len(rows):
+            let vv = do valGet(rows[i], "version")
+            let vs = do valToStr(vv)
+            if vs == version:
+                let dv = do valGet(rows[i], "document")
+                return RtDocLookup{ok: true, body: valToStr(dv)}
+            i = i + 1
+        return RtDocLookup{ok: false, body: ""}
+
+    # cHistoryJSON: every recorded version (the current one listed even if
+    # unrecorded), newest first, ties by version.
+    proc cHistoryJSON(w: RtWorld) -> text:
+        let current = w.contractVersion
+        let rows = do rtEntRows(w, "FacetContractVersion")
+        let mut versions = []
+        let mut schemaVs = []
+        let mut ats = []
+        let mut haveCurrent = false
+        let mut i = 0
+        loop i < len(rows):
+            let vv = do valGet(rows[i], "version")
+            let v = do valToStr(vv)
+            let av = do valGet(rows[i], "first_seen")
+            let sv = do valGet(rows[i], "schema_version")
+            versions = append(versions, v)
+            schemaVs = append(schemaVs, valToInt(sv))
+            ats = append(ats, valToInt(av))
+            if v == current:
+                haveCurrent = true
+            i = i + 1
+        if !haveCurrent:
+            versions = append(versions, current)
+            schemaVs = append(schemaVs, w.schemaVersion)
+            ats = append(ats, w.contractGenerated)
+        # stable sort: at desc, then version asc
+        let mut order = []
+        let mut k = 0
+        loop k < len(versions):
+            let mut j = len(order)
+            let mut placed = false
+            loop j > 0 && !placed:
+                let o = order[j - 1]
+                let after = ats[k] > ats[o] || (ats[k] == ats[o] && versions[k] < versions[o])
+                if after:
+                    j = j - 1
+                else:
+                    placed = true
+            order = slice(order, 0, j) + [k] + slice(order, j, len(order))
+            k = k + 1
+        let mut entries = []
+        let mut e = 0
+        loop e < len(order):
+            let at = order[e]
+            entries = append(entries, recordVal(["version", "schema_version", "first_seen", "current"], [textVal(versions[at]), intVal(schemaVs[at]), textVal(cRFC3339(ats[at])), boolVal(versions[at] == current)]))
+            e = e + 1
+        let body = do rtObjectJSONRaw(["current", "schema_version", "server_time", "versions"], [jsonQuote(current), "" + w.schemaVersion, jsonQuote(cRFC3339(nowMs() / 1000)), rtValJSONOrdered(listVal(entries))])
+        return body
+
+    # ── shapes and diffs ────────────────────────────────────────────────
+    # A shape's field sets are records: name -> {type, required}.
+    proc cField(t: text, required: bool) -> Val:
+        let r = do recordVal(["type", "required"], [textVal(t), boolVal(required)])
+        return r
+
+    proc cSchemaRefName(schema: JVal) -> text:
+        let r = do jGet(schema, "$ref")
+        if r.kind == "str":
+            let has = do rtHasPrefix(r.s, "#/components/schemas/")
+            if has:
+                return slice(r.s, 21, len(r.s))
+            return r.s
+        let arms = do jGet(schema, "oneOf")
+        if arms.kind == "arr":
+            let mut i = 0
+            loop i < len(arms.vals):
+                if arms.vals[i].kind == "obj":
+                    let name = do cSchemaRefName(arms.vals[i])
+                    if name != "":
+                        return name
+                i = i + 1
+        return ""
+
+    proc cSchemaTypeName(schema: JVal) -> text:
+        if schema.kind != "obj":
+            return "any"
+        let arms = do jGet(schema, "oneOf")
+        if arms.kind == "arr":
+            let mut name = do cSchemaRefName(schema)
+            if name == "":
+                name = "any"
+            let mut i = 0
+            loop i < len(arms.vals):
+                if arms.vals[i].kind == "obj":
+                    let t = do jGet(arms.vals[i], "type")
+                    if t.kind == "str" && t.s == "null":
+                        return name + "|null"
+                i = i + 1
+            return name
+        let refName = do cSchemaRefName(schema)
+        if refName != "":
+            return refName
+        let mut base = "any"
+        let mut nullable = false
+        let t2 = do jGet(schema, "type")
+        if t2.kind == "str":
+            base = t2.s
+        if t2.kind == "arr":
+            let mut k = 0
+            loop k < len(t2.vals):
+                if t2.vals[k].kind == "str":
+                    if t2.vals[k].s == "null":
+                        nullable = true
+                    else:
+                        base = t2.vals[k].s
+                k = k + 1
+        if base == "array":
+            let items = do jGet(schema, "items")
+            base = "array<" + cSchemaTypeName(items) + ">"
+        if base == "object":
+            let ap = do jGet(schema, "additionalProperties")
+            if ap.kind == "obj":
+                base = "map<" + cSchemaTypeName(ap) + ">"
+        if base == "string":
+            let f = do jGet(schema, "format")
+            if f.kind == "str" && f.s != "":
+                base = "string(" + f.s + ")"
+        if nullable:
+            base = base + "|null"
+        return base
+
+    # cSchemaFields: schemaFields — a schema's (or its referenced
+    # component's) properties as a field record.
+    proc cSchemaFields(schema0: JVal, components: JVal) -> Val:
+        let mut out = do recordVal([], [])
+        if schema0.kind != "obj":
+            return out
+        let mut schema = schema0
+        let name = do cSchemaRefName(schema0)
+        if name != "":
+            let has = do jHas(components, name)
+            if !has:
+                return out
+            schema = do jGet(components, name)
+        let props = do jGet(schema, "properties")
+        let req = do jGet(schema, "required")
+        let mut i = 0
+        loop i < len(props.keys):
+            let mut required = false
+            if req.kind == "arr":
+                let mut r = 0
+                loop r < len(req.vals):
+                    if req.vals[r].kind == "str" && req.vals[r].s == props.keys[i]:
+                        required = true
+                    r = r + 1
+            out = do valSet(out, props.keys[i], cField(cSchemaTypeName(props.vals[i]), required))
+            i = i + 1
+        return out
+
+    # RtShape: contractShape — parallel key/value lists per kind; a route's
+    # value is a record {params, request, responses (record status ->
+    # fields), deprecated}; a mutation's {fields, body, result}.
+    struct RtShape:
+        ok: bool
+        version: text
+        schema: int
+        routeKeys: [text]
+        routeVals: [Val]
+        streamKeys: [text]
+        streamVals: [Val]
+        mutKeys: [text]
+        mutVals: [Val]
+        schemaKeys: [text]
+        schemaVals: [Val]
+
+    proc cMergeFields(into: Val, more: Val) -> Val:
+        let mut out = into
+        let mut i = 0
+        loop i < len(more.keys):
+            out = do valSet(out, more.keys[i], more.items[i])
+            i = i + 1
+        return out
+
+    proc cShapeOf(body: text) -> RtShape:
+        let doc = do jsonParse(body)
+        let empty = RtShape{ok: false, version: "", schema: 0, routeKeys: [], routeVals: [], streamKeys: [], streamVals: [], mutKeys: [], mutVals: [], schemaKeys: [], schemaVals: []}
+        if doc.kind != "obj":
+            return empty
+        let info = do jGet(doc, "info")
+        let version = do jStr(info, "version")
+        let sv = do jGet(doc, "x-schema-version")
+        let mut schema = 0
+        if sv.kind == "num":
+            schema = toInt(sv.s)
+        let comps = do jGet(doc, "components")
+        let components = do jGet(comps, "schemas")
+        let mut schemaKeys = []
+        let mut schemaVals = []
+        let mut ci = 0
+        loop ci < len(components.keys):
+            schemaKeys = append(schemaKeys, components.keys[ci])
+            schemaVals = append(schemaVals, cSchemaFields(components.vals[ci], components))
+            ci = ci + 1
+        let paths = do jGet(doc, "paths")
+        let mut routeKeys = []
+        let mut routeVals = []
+        let mut pi = 0
+        loop pi < len(paths.keys):
+            let methods = paths.vals[pi]
+            let mut mi = 0
+            loop mi < len(methods.keys):
+                let op = methods.vals[mi]
+                let deprecated = do jBool(op, "deprecated")
+                let mut params = do recordVal([], [])
+                let ps = do jGet(op, "parameters")
+                let mut k = 0
+                loop k < len(ps.vals):
+                    let p = ps.vals[k]
+                    let pname = do jStr(p, "name")
+                    let pin = do jStr(p, "in")
+                    let preq = do jBool(p, "required")
+                    let psch = do jGet(p, "schema")
+                    params = do valSet(params, pname + "@" + pin, cField(cSchemaTypeName(psch), preq))
+                    k = k + 1
+                let mut request = do recordVal([], [])
+                let rb = do jGet(op, "requestBody")
+                let rc = do jGet(rb, "content")
+                let mut ri = 0
+                loop ri < len(rc.keys):
+                    let rs = do jGet(rc.vals[ri], "schema")
+                    request = do cMergeFields(request, cSchemaFields(rs, components))
+                    ri = ri + 1
+                let mut responses = do recordVal([], [])
+                let rsp = do jGet(op, "responses")
+                let mut si = 0
+                loop si < len(rsp.keys):
+                    let mut fields = do recordVal([], [])
+                    let cc = do jGet(rsp.vals[si], "content")
+                    let mut cj = 0
+                    loop cj < len(cc.keys):
+                        let cs = do jGet(cc.vals[cj], "schema")
+                        fields = do cMergeFields(fields, cSchemaFields(cs, components))
+                        cj = cj + 1
+                    responses = do valSet(responses, rsp.keys[si], fields)
+                    si = si + 1
+                routeKeys = append(routeKeys, upper(methods.keys[mi]) + " " + paths.keys[pi])
+                routeVals = append(routeVals, recordVal(["params", "request", "responses", "deprecated"], [params, request, responses, boolVal(deprecated)]))
+                mi = mi + 1
+            pi = pi + 1
+        let streams = do jGet(doc, "x-stream-events")
+        let mut streamKeys = []
+        let mut streamVals = []
+        let mut ei = 0
+        loop ei < len(streams.vals):
+            let e = streams.vals[ei]
+            let payload = do jGet(e, "payload")
+            streamKeys = append(streamKeys, jStr(e, "stream") + " " + jStr(e, "name"))
+            streamVals = append(streamVals, cSchemaFields(payload, components))
+            ei = ei + 1
+        let muts = do jGet(doc, "x-mutation-events")
+        let mut mutKeys = []
+        let mut mutVals = []
+        let mut mj = 0
+        loop mj < len(muts.vals):
+            let m = muts.vals[mj]
+            let mut fields2 = do recordVal([], [])
+            let fl = do jGet(m, "fields")
+            let mut fi = 0
+            loop fi < len(fl.vals):
+                let f = fl.vals[fi]
+                fields2 = do valSet(fields2, jStr(f, "name"), cField(jStr(f, "type"), jBool(f, "required")))
+                fi = fi + 1
+            let mb = do jGet(m, "body")
+            let mr = do jGet(m, "result")
+            mutKeys = append(mutKeys, jStr(m, "event_type"))
+            mutVals = append(mutVals, recordVal(["fields", "body", "result"], [fields2, cSchemaFields(mb, components), cSchemaFields(mr, components)]))
+            mj = mj + 1
+        return RtShape{ok: true, version: version, schema: schema, routeKeys: routeKeys, routeVals: routeVals, streamKeys: streamKeys, streamVals: streamVals, mutKeys: mutKeys, mutVals: mutVals, schemaKeys: schemaKeys, schemaVals: schemaVals}
+
+    proc cUnionKeys(a: [text], b: [text]) -> [text]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(a):
+            out = do cAddUsed(out, a[i])
+            i = i + 1
+        let mut j = 0
+        loop j < len(b):
+            out = do cAddUsed(out, b[j])
+            j = j + 1
+        let sorted = do rtSortedTexts(out)
+        return sorted
+
+    proc cIndexIn(keys: [text], k: text) -> int:
+        let mut i = 0
+        loop i < len(keys):
+            if keys[i] == k:
+                return i
+            i = i + 1
+        return -1
+
+    proc cWord(req: bool) -> text:
+        if req:
+            return "required"
+        return "optional"
+
+    # cFieldsDiff: fieldsDiff — added, removed, type_changed, required_changed.
+    proc cFieldsDiff(a: Val, b: Val) -> Val:
+        let mut added = []
+        let mut removed = []
+        let mut typeChanged = []
+        let mut requiredChanged = []
+        let names = do cUnionKeys(a.keys, b.keys)
+        let mut i = 0
+        loop i < len(names):
+            let n = names[i]
+            let inA = do valHas(a, n)
+            let inB = do valHas(b, n)
+            let fa = do valGet(a, n)
+            let fb = do valGet(b, n)
+            let ta = do valGet(fa, "type")
+            let tb = do valGet(fb, "type")
+            let ra = do valGet(fa, "required")
+            let rb = do valGet(fb, "required")
+            if !inA:
+                added = append(added, recordVal(["name", "type", "required"], [textVal(n), tb, rb]))
+            else:
+                if !inB:
+                    removed = append(removed, recordVal(["name", "type", "required"], [textVal(n), ta, ra]))
+                else:
+                    if ta.t != tb.t:
+                        typeChanged = append(typeChanged, recordVal(["name", "from", "to"], [textVal(n), ta, tb]))
+                    if ra.b != rb.b:
+                        requiredChanged = append(requiredChanged, recordVal(["name", "from", "to"], [textVal(n), textVal(cWord(ra.b)), textVal(cWord(rb.b))]))
+            i = i + 1
+        let r = do recordVal(["added", "removed", "type_changed", "required_changed"], [listVal(added), listVal(removed), listVal(typeChanged), listVal(requiredChanged)])
+        return r
+
+    proc cChanged(d: Val) -> bool:
+        let a = do valGet(d, "added")
+        let r = do valGet(d, "removed")
+        let t = do valGet(d, "type_changed")
+        let q = do valGet(d, "required_changed")
+        return len(a.items) + len(r.items) + len(t.items) + len(q.items) > 0
+
+    proc cContractDiff(fromBody: text, toBody: text) -> text:
+        let from = do cShapeOf(fromBody)
+        let to = do cShapeOf(toBody)
+        let mut routesAdded = []
+        let mut routesRemoved = []
+        let mut routesChanged = []
+        let rk = do cUnionKeys(from.routeKeys, to.routeKeys)
+        let mut i = 0
+        loop i < len(rk):
+            let ia = do cIndexIn(from.routeKeys, rk[i])
+            let ib = do cIndexIn(to.routeKeys, rk[i])
+            if ia < 0:
+                routesAdded = append(routesAdded, textVal(rk[i]))
+            else:
+                if ib < 0:
+                    routesRemoved = append(routesRemoved, textVal(rk[i]))
+                else:
+                    let a = from.routeVals[ia]
+                    let b = to.routeVals[ib]
+                    let params = do cFieldsDiff(valGet(a, "params"), valGet(b, "params"))
+                    let request = do cFieldsDiff(valGet(a, "request"), valGet(b, "request"))
+                    let ra = do valGet(a, "responses")
+                    let rb = do valGet(b, "responses")
+                    let mut responses = []
+                    let sk = do cUnionKeys(ra.keys, rb.keys)
+                    let mut s = 0
+                    loop s < len(sk):
+                        let okA = do valHas(ra, sk[s])
+                        let okB = do valHas(rb, sk[s])
+                        let fields = do cFieldsDiff(valGet(ra, sk[s]), valGet(rb, sk[s]))
+                        let fch = do cChanged(fields)
+                        if !okA || !okB || fch:
+                            responses = append(responses, recordVal(["status", "added", "removed", "fields"], [textVal(sk[s]), boolVal(!okA), boolVal(!okB), fields]))
+                        s = s + 1
+                    let da = do valGet(a, "deprecated")
+                    let db = do valGet(b, "deprecated")
+                    let depChanged = da.b != db.b
+                    let pch = do cChanged(params)
+                    let qch = do cChanged(request)
+                    if pch || qch || len(responses) > 0 || depChanged:
+                        routesChanged = append(routesChanged, recordVal(["route", "params", "request", "responses", "deprecated", "deprecated_changed"], [textVal(rk[i]), params, request, listVal(responses), db, boolVal(depChanged)]))
+            i = i + 1
+        let mut evAdded = []
+        let mut evRemoved = []
+        let mut evChanged = []
+        let ek = do cUnionKeys(from.streamKeys, to.streamKeys)
+        let mut j = 0
+        loop j < len(ek):
+            let ja = do cIndexIn(from.streamKeys, ek[j])
+            let jb = do cIndexIn(to.streamKeys, ek[j])
+            if ja < 0:
+                evAdded = append(evAdded, textVal(ek[j]))
+            else:
+                if jb < 0:
+                    evRemoved = append(evRemoved, textVal(ek[j]))
+                else:
+                    let d = do cFieldsDiff(from.streamVals[ja], to.streamVals[jb])
+                    let dch = do cChanged(d)
+                    if dch:
+                        let sp = do rtIndexOfText(ek[j], " ")
+                        evChanged = append(evChanged, recordVal(["stream", "name", "payload"], [textVal(slice(ek[j], 0, sp)), textVal(slice(ek[j], sp + 1, len(ek[j]))), d]))
+            j = j + 1
+        let mut muAdded = []
+        let mut muRemoved = []
+        let mut muChanged = []
+        let mk = do cUnionKeys(from.mutKeys, to.mutKeys)
+        let mut m = 0
+        loop m < len(mk):
+            let ma = do cIndexIn(from.mutKeys, mk[m])
+            let mb = do cIndexIn(to.mutKeys, mk[m])
+            if ma < 0:
+                muAdded = append(muAdded, textVal(mk[m]))
+            else:
+                if mb < 0:
+                    muRemoved = append(muRemoved, textVal(mk[m]))
+                else:
+                    let a2 = from.mutVals[ma]
+                    let b2 = to.mutVals[mb]
+                    let f2 = do cFieldsDiff(valGet(a2, "fields"), valGet(b2, "fields"))
+                    let bo = do cFieldsDiff(valGet(a2, "body"), valGet(b2, "body"))
+                    let re = do cFieldsDiff(valGet(a2, "result"), valGet(b2, "result"))
+                    let c1 = do cChanged(f2)
+                    let c2 = do cChanged(bo)
+                    let c3 = do cChanged(re)
+                    if c1 || c2 || c3:
+                        muChanged = append(muChanged, recordVal(["event_type", "fields", "body", "result"], [textVal(mk[m]), f2, bo, re]))
+            m = m + 1
+        let mut scAdded = []
+        let mut scRemoved = []
+        let mut scChanged = []
+        let ck = do cUnionKeys(from.schemaKeys, to.schemaKeys)
+        let mut c = 0
+        loop c < len(ck):
+            let ca = do cIndexIn(from.schemaKeys, ck[c])
+            let cb = do cIndexIn(to.schemaKeys, ck[c])
+            if ca < 0:
+                scAdded = append(scAdded, textVal(ck[c]))
+            else:
+                if cb < 0:
+                    scRemoved = append(scRemoved, textVal(ck[c]))
+                else:
+                    let d2 = do cFieldsDiff(from.schemaVals[ca], to.schemaVals[cb])
+                    let d2ch = do cChanged(d2)
+                    if d2ch:
+                        scChanged = append(scChanged, recordVal(["name", "fields"], [textVal(ck[c]), d2]))
+            c = c + 1
+        let identical = len(routesAdded) + len(routesRemoved) + len(routesChanged) + len(evAdded) + len(evRemoved) + len(evChanged) + len(muAdded) + len(muRemoved) + len(muChanged) + len(scAdded) + len(scRemoved) + len(scChanged) == 0
+        let out = do recordVal(["from", "to", "identical", "routes_added", "routes_removed", "routes_changed", "stream_events_added", "stream_events_removed", "stream_events_changed", "mutations_added", "mutations_removed", "mutations_changed", "schemas_added", "schemas_removed", "schemas_changed"], [recordVal(["version", "schema_version"], [textVal(from.version), intVal(from.schema)]), recordVal(["version", "schema_version"], [textVal(to.version), intVal(to.schema)]), boolVal(identical), listVal(routesAdded), listVal(routesRemoved), listVal(routesChanged), listVal(evAdded), listVal(evRemoved), listVal(evChanged), listVal(muAdded), listVal(muRemoved), listVal(muChanged), listVal(scAdded), listVal(scRemoved), listVal(scChanged)])
+        let j2 = do rtValJSONOrdered(out)
+        return j2

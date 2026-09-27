@@ -221,7 +221,7 @@ func TestPositionalFileIOIsAtomic(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		arr := v.([]any)
+		arr, _ := listElems(v)
 		first := toInt(arr[0])
 		for i, x := range arr {
 			if toInt(x) != first {

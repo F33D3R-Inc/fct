@@ -106,9 +106,7 @@ app FqTxSelfHost:
     proc txLower(e0: FqEngine, txops: [TxOp]) -> TxLowered uses io.file:
         let mut e = e0
         let mut ops = []
-        let mut stAddr = []
-        let mut stLive = []
-        let mut stNodes = []
+        let mut st = do stagedNew()
         let mut seKeys = []
         let mut seLive = []
         let mut seEdges = []
@@ -117,7 +115,7 @@ app FqTxSelfHost:
         loop i < n:
             let t = txops[i]
             if t.tag == "insert":
-                let sn = do enStagedNode(e, stAddr, stLive, stNodes, t.node.address)
+                let sn = do enStagedNode(e, st, t.node.address)
                 e = sn.eng
                 if !sn.ok:
                     let f0 = do txFail(e, "storage", sn.err)
@@ -129,20 +127,15 @@ app FqTxSelfHost:
                     let a = do enArchiveNow(e, sn.node)
                     e = a.eng
                     ops = append(ops, opArchive(a.entry))
-                stAddr = append(stAddr, t.node.address)
-                stLive = append(stLive, true)
-                stNodes = append(stNodes, t.node)
+                st = do stagedPut(st, t.node.address, true, t.node)
                 ops = append(ops, opInsert(t.node))
             if t.tag == "delete":
                 let mut stagedDeleted = false
-                let mut s = len(stAddr) - 1
-                loop s >= 0:
-                    if stAddr[s] == t.address:
-                        stagedDeleted = !stLive[s]
-                        break
-                    s = s - 1
+                let sd = do stagedFind(st, t.address)
+                if sd >= 0:
+                    stagedDeleted = !st.live[sd]
                 if !stagedDeleted:
-                    let sn2 = do enStagedNode(e, stAddr, stLive, stNodes, t.address)
+                    let sn2 = do enStagedNode(e, st, t.address)
                     e = sn2.eng
                     if !sn2.ok:
                         let f2 = do txFail(e, "storage", sn2.err)
@@ -150,15 +143,13 @@ app FqTxSelfHost:
                     if !sn2.found:
                         let f3 = do txFail(e, "invalid", "transaction failed, nothing applied: delete target not found: " + t.address)
                         return f3
-                    let ld = do enLowerDeleteInto(e, [sn2.node], ops, stAddr, stLive, stNodes)
+                    let ld = do enLowerDeleteInto(e, [sn2.node], ops, st)
                     e = ld.eng
                     if !ld.ok:
                         let f4 = do txFail(e, ld.kind, ld.err)
                         return f4
                     ops = ld.ops
-                    stAddr = ld.stAddr
-                    stLive = ld.stLive
-                    stNodes = ld.stNodes
+                    st = ld.st
             if t.tag == "clear" || t.tag == "deleteWhere":
                 # lower_selection over staged_selection: the kind index's
                 # addresses and every staged one, in address order.
@@ -176,16 +167,16 @@ app FqTxSelfHost:
                     let kb = do fqwHexBytes(sc.keys[k])
                     cands = do qSortedInsert(cands, bytesToText(btRange(kb, pl, len(kb))))
                     k = k + 1
-                let nsa = len(stAddr)
+                let nsa = len(st.sorted)
                 let mut k2 = 0
                 loop k2 < nsa:
-                    cands = do qSortedInsert(cands, stAddr[k2])
+                    cands = do qSortedInsert(cands, st.sorted[k2])
                     k2 = k2 + 1
                 let mut targets = []
                 let nc = len(cands)
                 let mut c = 0
                 loop c < nc:
-                    let sn3 = do enStagedNode(e, stAddr, stLive, stNodes, cands[c])
+                    let sn3 = do enStagedNode(e, st, cands[c])
                     e = sn3.eng
                     if !sn3.ok:
                         let f6 = do txFail(e, "storage", sn3.err)
@@ -202,7 +193,7 @@ app FqTxSelfHost:
                 let nt = len(targets)
                 let mut ti = 0
                 loop ti < nt:
-                    let sn4 = do enStagedNode(e, stAddr, stLive, stNodes, targets[ti])
+                    let sn4 = do enStagedNode(e, st, targets[ti])
                     e = sn4.eng
                     if !sn4.ok:
                         let f8 = do txFail(e, "storage", sn4.err)
@@ -210,22 +201,18 @@ app FqTxSelfHost:
                     if sn4.found:
                         seeds = append(seeds, sn4.node)
                     else:
-                        stAddr = append(stAddr, targets[ti])
-                        stLive = append(stLive, false)
-                        stNodes = append(stNodes, operationBlank("insert").node)
+                        st = do stagedPut(st, targets[ti], false, operationBlank("insert").node)
                         ops = append(ops, opDelete(targets[ti]))
                     ti = ti + 1
-                let ld2 = do enLowerDeleteInto(e, seeds, ops, stAddr, stLive, stNodes)
+                let ld2 = do enLowerDeleteInto(e, seeds, ops, st)
                 e = ld2.eng
                 if !ld2.ok:
                     let f9 = do txFail(e, ld2.kind, ld2.err)
                     return f9
                 ops = ld2.ops
-                stAddr = ld2.stAddr
-                stLive = ld2.stLive
-                stNodes = ld2.stNodes
+                st = ld2.st
             if t.tag == "setIf":
-                let sn5 = do enStagedNode(e, stAddr, stLive, stNodes, t.address)
+                let sn5 = do enStagedNode(e, st, t.address)
                 e = sn5.eng
                 if !sn5.ok:
                     let f10 = do txFail(e, "storage", sn5.err)
@@ -244,16 +231,14 @@ app FqTxSelfHost:
                 let a2 = do enArchiveNow(e, sn5.node)
                 e = a2.eng
                 ops = append(ops, opArchive(a2.entry))
-                stAddr = append(stAddr, t.address)
-                stLive = append(stLive, true)
-                stNodes = append(stNodes, nx.node)
+                st = do stagedPut(st, t.address, true, nx.node)
                 ops = append(ops, opInsert(nx.node))
             if t.tag == "insertEdge":
                 let ends = [t.edge.from, t.edge.to]
                 let labels = ["from", "to"]
                 let mut j = 0
                 loop j < 2:
-                    let sn6 = do enStagedNode(e, stAddr, stLive, stNodes, ends[j])
+                    let sn6 = do enStagedNode(e, st, ends[j])
                     e = sn6.eng
                     if !sn6.ok:
                         let f14 = do txFail(e, "storage", sn6.err)
@@ -314,7 +299,7 @@ app FqTxSelfHost:
         if !lw.ok:
             return FqKindR{ok: false, kind: lw.kind, err: lw.err, eng: lw.eng}
         let e = lw.eng
-        let bound = do enMaxTransactionOps()
+        let bound = do enMaxTransactionOps(e)
         if len(lw.ops) > bound:
             return FqKindR{ok: false, kind: "invalid", err: "transaction failed, nothing applied: it resolves to " + len(lw.ops) + " mutations, over the " + bound + " this engine will stage in one frame. Split the batch, or raise FACETQL_MAX_TRANSACTION_OPS.", eng: e}
         let u = do enCheckUnique(e, lw.ops)
@@ -323,7 +308,8 @@ app FqTxSelfHost:
         let rf = do enCheckReferences(u.eng, lw.ops)
         if !rf.ok:
             return FqKindR{ok: false, kind: "invalid", err: rf.err, eng: rf.eng}
-        let c = do enCommitFrame(rf.eng, lw.ops)
+        let c0 = do enCommitFrame(rf.eng, lw.ops)
+        let c = do enSyncWal(c0)
         return FqKindR{ok: c.ok, kind: "storage", err: c.err, eng: c.eng}
 
     proc txExecute(e0: FqEngine, txops: [TxOp]) -> FqEngR uses io.file:
@@ -346,7 +332,7 @@ app FqTxSelfHost:
         let mut e = sc.eng
         if !sc.ok:
             return TxTargets{ok: false, err: sc.err, eng: e, addrs: []}
-        let cap = do enMaxScanRows()
+        let cap = do enMaxScanRows(e0)
         let mut out = []
         let pl = len(kp)
         let n = len(sc.keys)
@@ -364,7 +350,7 @@ app FqTxSelfHost:
                     return TxTargets{ok: false, err: m.err, eng: e, addrs: []}
                 if m.v:
                     if len(out) >= cap:
-                        let lim = do enScanLimitExceeded("this bulk delete")
+                        let lim = do enScanLimitExceeded(e0, "this bulk delete")
                         return TxTargets{ok: false, err: lim, eng: e, addrs: []}
                     out = append(out, addr)
             i = i + 1
@@ -594,7 +580,8 @@ app FqTxSelfHost:
 
     proc txScriptText(dir: text, keyHex: text, nonceBase: int, interval: int, rotateBytes: int, script: text) -> text uses io.file:
         let key = do fqwHexBytes(keyHex)
-        let ld = do enLoad(dir, key, nonceBase, interval, rotateBytes)
+        let lim = do enDefaultLimits()
+        let ld = do enLoad(dir, key, nonceBase, interval, rotateBytes, lim)
         if !ld.ok:
             return "error: " + ld.err
         let run = do txRunOps(ld.eng, script)
@@ -609,7 +596,8 @@ app FqTxSelfHost:
     # `after:limit:owner:admin`.
     proc txReportText(dir: text, keyHex: text, nonceBase: int, interval: int, rotateBytes: int, script: text, scans: text) -> text uses io.file:
         let key = do fqwHexBytes(keyHex)
-        let ld = do enLoad(dir, key, nonceBase, interval, rotateBytes)
+        let lim = do enDefaultLimits()
+        let ld = do enLoad(dir, key, nonceBase, interval, rotateBytes, lim)
         if !ld.ok:
             return "error: " + ld.err
         let cu = do enCompactUserLog(ld.eng)

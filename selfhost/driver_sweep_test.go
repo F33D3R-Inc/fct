@@ -15,6 +15,15 @@ package selfhost
 // is missing) — drift between the Go compiler and selfhost cannot pass
 // unnoticed.
 //
+// Gaps this sweep has caught, each closed by porting: the byte-buffer
+// crypto builtins (sha256Bytes, hmacSha256, base64UrlRaw, bcryptHash,
+// bcryptMatches — runtime/cryptobuiltins_test.go's inline app), which
+// landed in internal/parser/builtins.go, build.go's pureBuiltinArity /
+// inferProcType / procCapabilities and had to reach the same five tables
+// in the port (expr_tree.fct's names, check.fct's arities and impure
+// calls, proc_lower.fct's result types, action_lower.fct's server-only
+// list).
+//
 // driverSweepUnported may list apps (by driverSweepKey) the driver
 // knowingly does not match yet, each with the missing port named. It can
 // only shrink: an entry whose app now matches, or that names no app any

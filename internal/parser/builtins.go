@@ -67,13 +67,20 @@ var builtinSites = map[string]BuiltinSite{
 	// proc bodies only
 	"append": SiteProc, "bytes": SiteProc, "textToBytes": SiteProc, "bytesToText": SiteProc,
 	"aesGcmSeal": SiteProc, "aesGcmOpen": SiteProc, "aesGcmAuthentic": SiteProc, "randomBytes": SiteProc,
+	// indexOf(s, sub, from) -> int: the rune index of sub in s at or after from, -1 when absent —
+	// what a parser written in fct (selfhost/ir_json.fct) scans a document with instead of a
+	// charAt per byte (strings.Index, rune-indexed like slice/charAt)
+	"indexOf": SiteProc,
+	// keyed digests and password hashing over byte buffers (runtime/cryptobuiltins.go): what a
+	// self-hosted runtime signs its cookies and stores its credentials with
+	"sha256Bytes": SiteProc, "hmacSha256": SiteProc, "base64UrlRaw": SiteProc, "bcryptHash": SiteProc, "bcryptMatches": SiteProc,
 	"readFile": SiteProc, "writeFile": SiteProc, "appendFile": SiteProc, "fileExists": SiteProc, "truncateFile": SiteProc,
-	"fileSize": SiteProc, "readFileAt": SiteProc, "writeFileAt": SiteProc, "syncFile": SiteProc, "renameFile": SiteProc, "removeFile": SiteProc,
+	"fileSize": SiteProc, "fileModTime": SiteProc, "readFileAt": SiteProc, "writeFileAt": SiteProc, "syncFile": SiteProc, "renameFile": SiteProc, "removeFile": SiteProc, "lockFile": SiteProc, "crc32": SiteProc,
 	"httpGet": SiteProc, "httpPost": SiteProc,
 	"listen": SiteProc, "listenOn": SiteProc, "accept": SiteProc, "connect": SiteProc,
 	"readBytes": SiteProc, "writeBytes": SiteProc, "closeConn": SiteProc, "setTimeoutMs": SiteProc, "connError": SiteProc,
 	"pollBytes": SiteProc, "connOpen": SiteProc, "shutdownConn": SiteProc,
-	"closeListener": SiteProc, "listenError": SiteProc, "grantRead": SiteProc,
+	"closeListener": SiteProc, "listenError": SiteProc, "listenerPort": SiteProc, "grantRead": SiteProc,
 	"writeStdout": SiteProc, "writeStderr": SiteProc, "readStdin": SiteProc, "envVar": SiteProc, "envSet": SiteProc,
 	"channel": SiteProc, "send": SiteProc, "recv": SiteProc, "sleepMs": SiteProc, "monoMs": SiteProc, "nowMs": SiteProc, "signals": SiteProc,
 	"awaitAny": SiteProc, "closeChannel": SiteProc, "exitProcess": SiteProc, "processStats": SiteProc, "listenTls": SiteProc, "connPeer": SiteProc, "connectTls": SiteProc,

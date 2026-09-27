@@ -131,6 +131,13 @@ func memoryLimit() (uint64, string, bool) {
 	return memoryLimitBytes, memoryLimitSource, memoryLimitKnown
 }
 
+// SetProfiling makes every proc call carry the proc's name as a pprof
+// label (`proc`), for a CPU profile that attributes samples to the fct
+// program's procs — `facet exec` under FACET_CPUPROFILE turns it on.
+func (s *Server) SetProfiling(on bool) {
+	s.profiling = on
+}
+
 // SetExit replaces how exitProcess ends the process — a test observes the
 // status instead of losing its own process to it.
 func (s *Server) SetExit(fn func(code int)) {

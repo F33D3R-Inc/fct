@@ -35,6 +35,27 @@ app FqEngineSelfHost:
     # cache, metrics and read pins have no effect on what is stored and are
     # not part of this port (with no concurrent reader, a drained segment
     # is retired at the checkpoint that drained it).
+    # FqEngLimits: engine.rs's process-wide bounds read from the
+    # environment once (max_transaction_ops, max_scan_rows,
+    # max_query_offset) — here carried by the engine, set by whoever opens
+    # it (fqserver.fct from FACETQL_MAX_TRANSACTION_OPS,
+    # FACETQL_MAX_SCAN_ROWS, FACETQL_MAX_QUERY_OFFSET).
+    struct FqEngLimits:
+        maxOps: int
+        maxScanRows: int
+        maxQueryOffset: int
+        # deferDrops: a checkpoint retires the segments it drained but
+        # leaves their deletion (enDropUnreferenced) to the owner, who
+        # runs it once every reader admitted against the pre-checkpoint
+        # snapshot is known (fqserver.fct's writer task). Off, the
+        # checkpoint deletes what no registered pin holds.
+        deferDrops: bool
+
+    # enDefaultLimits: the defaults (DEFAULT_MAX_TRANSACTION_OPS,
+    # DEFAULT_MAX_SCAN_ROWS, DEFAULT_MAX_QUERY_OFFSET).
+    proc enDefaultLimits() -> FqEngLimits:
+        return FqEngLimits{maxOps: 50000, maxScanRows: 100000, maxQueryOffset: 10000, deferDrops: false}
+
     struct FqEngine:
         st: FqStore
         wal: FqwHandle
@@ -48,6 +69,7 @@ app FqEngineSelfHost:
         walSeq: int
         users: [UserRecord]
         rd: FqEngReaders
+        limits: FqEngLimits
 
     # FqEngReaders: engine.rs's epoch and reader registry. Every checkpoint
     # bumps the epoch; a snapshot reader pins the epoch it read at; a heap
@@ -67,7 +89,7 @@ app FqEngineSelfHost:
         eng: FqEngine
 
     proc enWith(e: FqEngine, st: FqStore) -> FqEngine:
-        return FqEngine{st: st, wal: e.wal, ctr: e.ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd}
+        return FqEngine{st: st, wal: e.wal, ctr: e.ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd, limits: e.limits}
 
     proc enErr(e: FqEngine, msg: text) -> FqEngR:
         return FqEngR{ok: false, err: msg, eng: e}
@@ -97,7 +119,7 @@ app FqEngineSelfHost:
         let rec = do fqwRecord(seq, txId, opId, op)
         let nonce = do fqwNonce(e.walNonce, e.walSeq)
         let a = do fqwAppend(e.wal, rec, e.st.ix.key, nonce)
-        let e2 = FqEngine{st: e.st, wal: a.handle, ctr: ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq + 1, users: e.users, rd: e.rd}
+        let e2 = FqEngine{st: e.st, wal: a.handle, ctr: ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq + 1, users: e.users, rd: e.rd, limits: e.limits}
         if !a.ok:
             return FqEngSeq{ok: false, err: a.err, eng: e2, seq: seq}
         return FqEngSeq{ok: true, err: "", eng: e2, seq: seq}
@@ -110,7 +132,7 @@ app FqEngineSelfHost:
     proc enNextOperationId(e: FqEngine) -> FqEngInt:
         let v = e.ctr.nextOperationId
         let ctr = FqwCounters{nextSequence: e.ctr.nextSequence, nextTransactionId: e.ctr.nextTransactionId, nextOperationId: v + 1}
-        return FqEngInt{eng: FqEngine{st: e.st, wal: e.wal, ctr: ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd}, v: v}
+        return FqEngInt{eng: FqEngine{st: e.st, wal: e.wal, ctr: ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd, limits: e.limits}, v: v}
 
     # enArchiveNow: HistoryEntry::now — stamped with the clock and the next
     # operation id as its version.
@@ -432,14 +454,84 @@ app FqEngineSelfHost:
         let ok = do enOk(e)
         return ok
 
+    # Staged: a batch's pending view (transaction.rs's staged map) — every
+    # staging in order (addrs/live/nodes; an address staged twice has two
+    # entries, the later one current), plus a sorted index over the
+    # distinct addresses (sorted, and at: each one's latest entry) so a
+    # lookup is a binary search, not a scan of the batch.
+    struct Staged:
+        addrs: [text]
+        live: [bool]
+        nodes: [Node]
+        sorted: [text]
+        at: [int]
+
+    proc stagedNew() -> Staged:
+        return Staged{addrs: [], live: [], nodes: [], sorted: [], at: []}
+
+    # stagedSlot: the position address would have in the sorted index
+    # (its own, or where it would be inserted), and whether it is there.
+    struct StagedSlot:
+        found: bool
+        pos: int
+
+    proc stagedSlot(st: Staged, address: text) -> StagedSlot:
+        let mut lo = 0
+        let mut hi = len(st.sorted)
+        loop lo < hi:
+            let mid = (lo + hi) / 2
+            if st.sorted[mid] < address:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo < len(st.sorted) && st.sorted[lo] == address:
+            return StagedSlot{found: true, pos: lo}
+        return StagedSlot{found: false, pos: lo}
+
+    # stagedFind: the current entry for address, or -1.
+    proc stagedFind(st: Staged, address: text) -> int:
+        let s = do stagedSlot(st, address)
+        if s.found:
+            return st.at[s.pos]
+        return -1
+
+    # stagedPut: one more staging of address.
+    proc stagedPut(st0: Staged, address: text, isLive: bool, node: Node) -> Staged:
+        let mut st = st0
+        let idx = len(st.addrs)
+        st.addrs = append(st.addrs, address)
+        st.live = append(st.live, isLive)
+        st.nodes = append(st.nodes, node)
+        let s = do stagedSlot(st, address)
+        if s.found:
+            let mut at = st.at
+            at[s.pos] = idx
+            st.at = at
+        else:
+            let mut sorted = []
+            let mut ats = []
+            let n = len(st.sorted)
+            let mut i = 0
+            loop i < n:
+                if i == s.pos:
+                    sorted = append(sorted, address)
+                    ats = append(ats, idx)
+                sorted = append(sorted, st.sorted[i])
+                ats = append(ats, st.at[i])
+                i = i + 1
+            if s.pos == n:
+                sorted = append(sorted, address)
+                ats = append(ats, idx)
+            st.sorted = sorted
+            st.at = ats
+        return st
+
     # enStagedNode: staged_node — this batch's pending view of an address
     # (a staged delete is none), otherwise the store's.
-    proc enStagedNode(e: FqEngine, stAddr: [text], stLive: [bool], stNodes: [Node], address: text) -> FqEngNode uses io.file:
-        let mut i = len(stAddr) - 1
-        loop i >= 0:
-            if stAddr[i] == address:
-                return FqEngNode{ok: true, err: "", eng: e, found: stLive[i], node: stNodes[i]}
-            i = i - 1
+    proc enStagedNode(e: FqEngine, st: Staged, address: text) -> FqEngNode uses io.file:
+        let i = do stagedFind(st, address)
+        if i >= 0:
+            return FqEngNode{ok: true, err: "", eng: e, found: st.live[i], node: st.nodes[i]}
         let r = do enReadNode(e, address)
         return r
 
@@ -451,7 +543,7 @@ app FqEngineSelfHost:
 
     # enReferencingNodes: referencing_nodes — the nodes (committed, or
     # staged by this batch) whose reference field holds key.
-    proc enReferencingNodes(e0: FqEngine, def: ReferenceDef, key: FqJ, stAddr: [text], stLive: [bool], stNodes: [Node], kAddr: [text], kLive: [bool], kNodes: [Node]) -> FqEngNodes uses io.file:
+    proc enReferencingNodes(e0: FqEngine, def: ReferenceDef, key: FqJ, st: Staged, kst: Staged) -> FqEngNodes uses io.file:
         let mut e = e0
         let at = do enDataFind(e, def.kind, def.field)
         if at < 0:
@@ -472,25 +564,21 @@ app FqEngineSelfHost:
                 cands = append(cands, a)
             i = i + 1
         # staged_kinds: every address the batch had staged live (its last
-        # staging) under the kind, when the closure began.
-        let ns = len(kAddr)
+        # staging) under the kind, when the closure began — the sorted
+        # index names each distinct address's latest entry.
+        let ns = len(kst.sorted)
         let mut j = 0
         loop j < ns:
-            let mut last = true
-            let mut k2 = j + 1
-            loop k2 < ns:
-                if kAddr[k2] == kAddr[j]:
-                    last = false
-                k2 = k2 + 1
-            if last && kLive[j] && kNodes[j].kind == def.kind && !(kAddr[j] in cands):
-                cands = append(cands, kAddr[j])
+            let k = kst.at[j]
+            if kst.live[k] && kst.nodes[k].kind == def.kind && !(kst.sorted[j] in cands):
+                cands = append(cands, kst.sorted[j])
             j = j + 1
         let sorted = do fqwSortText(cands)
         let mut nodes = []
         let nc = len(sorted)
         let mut c = 0
         loop c < nc:
-            let r = do enStagedNode(e, stAddr, stLive, stNodes, sorted[c])
+            let r = do enStagedNode(e, st, sorted[c])
             e = r.eng
             if !r.ok:
                 return FqEngNodes{ok: false, err: r.err, eng: e, nodes: []}
@@ -534,8 +622,8 @@ app FqEngineSelfHost:
         eng: FqEngine
         ops: [Operation]
 
-    proc enMaxTransactionOps() -> int:
-        return 50000
+    proc enMaxTransactionOps(e: FqEngine) -> int:
+        return e.limits.maxOps
 
     # enLowerDelete: lower_delete_closure — each node archived and
     # deleted; with references declared, the referencing nodes cascade,
@@ -548,19 +636,15 @@ app FqEngineSelfHost:
         err: text
         eng: FqEngine
         ops: [Operation]
-        stAddr: [text]
-        stLive: [bool]
-        stNodes: [Node]
+        st: Staged
 
     proc enLowerFail(e: FqEngine, kind: text, msg: text) -> FqEngLower:
-        return FqEngLower{ok: false, kind: kind, err: msg, eng: e, ops: [], stAddr: [], stLive: [], stNodes: []}
+        return FqEngLower{ok: false, kind: kind, err: msg, eng: e, ops: [], st: stagedNew()}
 
-    proc enLowerDeleteInto(e0: FqEngine, seeds: [Node], ops0: [Operation], stAddr0: [text], stLive0: [bool], stNodes0: [Node]) -> FqEngLower uses io.file:
+    proc enLowerDeleteInto(e0: FqEngine, seeds: [Node], ops0: [Operation], st0: Staged) -> FqEngLower uses io.file:
         let mut e = e0
         let mut ops = ops0
-        let mut stAddr = stAddr0
-        let mut stLive = stLive0
-        let mut stNodes = stNodes0
+        let mut st = st0
         if len(e.st.references) == 0:
             let n = len(seeds)
             let mut i = 0
@@ -568,17 +652,13 @@ app FqEngineSelfHost:
                 let a = do enArchiveNow(e, seeds[i])
                 e = a.eng
                 ops = append(ops, opArchive(a.entry))
-                stAddr = append(stAddr, seeds[i].address)
-                stLive = append(stLive, false)
-                stNodes = append(stNodes, seeds[i])
+                st = do stagedPut(st, seeds[i].address, false, seeds[i])
                 ops = append(ops, opDelete(seeds[i].address))
                 i = i + 1
-            return FqEngLower{ok: true, kind: "", err: "", eng: e, ops: ops, stAddr: stAddr, stLive: stLive, stNodes: stNodes}
-        let bound = do enMaxTransactionOps()
+            return FqEngLower{ok: true, kind: "", err: "", eng: e, ops: ops, st: st}
+        let bound = do enMaxTransactionOps(e0)
         # staged_kinds: the batch's live staged nodes, as of the start.
-        let kAddr = stAddr0
-        let kLive = stLive0
-        let kNodes = stNodes0
+        let kst = st0
         let mut queue = seeds
         let mut removed = []
         let mut qi = 0
@@ -591,9 +671,7 @@ app FqEngineSelfHost:
             let a2 = do enArchiveNow(e, node)
             e = a2.eng
             ops = append(ops, opArchive(a2.entry))
-            stAddr = append(stAddr, node.address)
-            stLive = append(stLive, false)
-            stNodes = append(stNodes, node)
+            st = do stagedPut(st, node.address, false, node)
             ops = append(ops, opDelete(node.address))
             let defs = do referencesForParent(e.st.references, node.kind)
             let nd = len(defs)
@@ -602,7 +680,7 @@ app FqEngineSelfHost:
                 let def = defs[d]
                 let key = do enReferencedKey(node, def)
                 if key.ok:
-                    let rn = do enReferencingNodes(e, def, key.v, stAddr, stLive, stNodes, kAddr, kLive, kNodes)
+                    let rn = do enReferencingNodes(e, def, key.v, st, kst)
                     e = rn.eng
                     if !rn.ok:
                         let f0 = do enLowerFail(e, "storage", rn.err)
@@ -635,19 +713,17 @@ app FqEngineSelfHost:
                                 let a3 = do enArchiveNow(e, child)
                                 e = a3.eng
                                 ops = append(ops, opArchive(a3.entry))
-                                stAddr = append(stAddr, cl.node.address)
-                                stLive = append(stLive, true)
-                                stNodes = append(stNodes, cl.node)
+                                st = do stagedPut(st, cl.node.address, true, cl.node)
                                 ops = append(ops, opInsert(cl.node))
                                 sn = sn + 1
                 d = d + 1
             if len(ops) > bound:
                 let f3 = do enLowerFail(e, "invalid", "delete refused, nothing applied: deleting " + node.address + " cascades to more than the " + bound + " mutations this engine will stage in one frame. A cascade is atomic or it is not a cascade, so it is refused rather than split. Delete the referencing nodes in batches first, or raise FACETQL_MAX_TRANSACTION_OPS.")
                 return f3
-        return FqEngLower{ok: true, kind: "", err: "", eng: e, ops: ops, stAddr: stAddr, stLive: stLive, stNodes: stNodes}
+        return FqEngLower{ok: true, kind: "", err: "", eng: e, ops: ops, st: st}
 
     proc enLowerDelete(e0: FqEngine, seeds: [Node]) -> FqEngOps uses io.file:
-        let r = do enLowerDeleteInto(e0, seeds, [], [], [], [])
+        let r = do enLowerDeleteInto(e0, seeds, [], stagedNew())
         return FqEngOps{ok: r.ok, err: r.err, eng: r.eng, ops: r.ops}
 
     # ── apply_atomic ───────────────────────────────────────────────────
@@ -688,9 +764,19 @@ app FqEngineSelfHost:
             if !a1.ok:
                 return a1
             let na = do enNoteApplied(a1.eng, ap.seq)
-            return na
+            let sy = do enSyncWal(na)
+            return sy
         let c = do enCommitFrame(e, ops)
-        return c
+        let sy2 = do enSyncWal(c)
+        return sy2
+
+    # enSyncWal: wal::sync_pending at the end of a mutation — the one
+    # fsync that makes its records durable before the caller is answered.
+    proc enSyncWal(r: FqEngR) -> FqEngR uses io.file:
+        if !r.ok:
+            return r
+        let ok = do fqwSync(r.eng.wal)
+        return r
 
     # enCommitFrame: Transaction::commit and the note_applied after it —
     # every operation validated, then BEGIN (fenced), each operation,
@@ -710,7 +796,7 @@ app FqEngineSelfHost:
                 return f2
             i = i + 1
         let txId = e.ctr.nextTransactionId
-        e = FqEngine{st: e.st, wal: e.wal, ctr: FqwCounters{nextSequence: e.ctr.nextSequence, nextTransactionId: txId + 1, nextOperationId: e.ctr.nextOperationId}, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd}
+        e = FqEngine{st: e.st, wal: e.wal, ctr: FqwCounters{nextSequence: e.ctr.nextSequence, nextTransactionId: txId + 1, nextOperationId: e.ctr.nextOperationId}, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd, limits: e.limits}
         let b = do enAppend(e, txId, fqwControl("begin"))
         if !b.ok:
             let f3 = do enErr(b.eng, b.err)
@@ -718,7 +804,7 @@ app FqEngineSelfHost:
         e = b.eng
         let beginSeq = b.seq
         let ck1 = do ckBeginFence(e.ck, beginSeq)
-        e = FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: ck1, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd}
+        e = FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: ck1, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd, limits: e.limits}
         let mut j = 0
         loop j < n:
             let sg = do enAppend(e, txId, ops[j])
@@ -754,7 +840,7 @@ app FqEngineSelfHost:
 
     proc enReleaseFence(e: FqEngine, beginSeq: int) -> FqEngine:
         let ck = do ckReleaseFence(e.ck, beginSeq)
-        return FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd}
+        return FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd, limits: e.limits}
 
     # enNoteApplied: note_applied — every `interval` mutations a
     # checkpoint (whose failure leaves the mutation durable in the WAL).
@@ -763,11 +849,13 @@ app FqEngineSelfHost:
         if seq > applied:
             applied = seq
         let pending = e.pending + 1
-        let e2 = FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: e.ck, applied: applied, pending: pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd}
+        let e2 = FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: e.ck, applied: applied, pending: pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd, limits: e.limits}
         if pending < e.interval:
             let ok = do enOk(e2)
             return ok
-        let c = do enCheckpoint(e2)
+        let mut c = do enCheckpointRetain(e2)
+        if c.ok && !e.limits.deferDrops:
+            c = do enDropUnreferenced(c.eng)
         if !c.ok:
             let ok2 = do enOk(c.eng)
             return ok2
@@ -835,7 +923,7 @@ app FqEngineSelfHost:
         return ok
 
     # enCheckpoint: checkpoint_locked.
-    proc enCheckpoint(e0: FqEngine) -> FqEngR uses io.file:
+    proc enCheckpointRetain(e0: FqEngine) -> FqEngR uses io.file:
         let mut e = e0
         let cands = do hpCompactionCandidates(e.st.heap, 0.5)
         let mut drained = []
@@ -854,7 +942,7 @@ app FqEngineSelfHost:
         if !adv.ok:
             let f1 = do enErr(e, adv.err)
             return f1
-        e = FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: adv.ckpt, applied: e.applied, pending: 0, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd}
+        e = FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: adv.ckpt, applied: e.applied, pending: 0, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd, limits: e.limits}
         let rot = do enRotateWal(e)
         if !rot.ok:
             return rot
@@ -871,7 +959,15 @@ app FqEngineSelfHost:
             epochs = append(epochs, epoch)
             i = i + 1
         e = do enWithReaders(e, FqEngReaders{epoch: epoch, pinEpochs: e.rd.pinEpochs, pinCounts: e.rd.pinCounts, retiredSegs: segs, retiredEpochs: epochs})
-        let dr = do enDropUnreferenced(e)
+        let ok = do enOk(e)
+        return ok
+
+    # enCheckpoint: checkpoint, then drop_unreferenced_segments.
+    proc enCheckpoint(e0: FqEngine) -> FqEngR uses io.file:
+        let r = do enCheckpointRetain(e0)
+        if !r.ok:
+            return r
+        let dr = do enDropUnreferenced(r.eng)
         return dr
 
     # enDropUnreferenced: drop_unreferenced_segments — every retired
@@ -904,7 +1000,7 @@ app FqEngineSelfHost:
     # enWithReaders: the registry replaced, and every B+tree told the
     # epoch and oldest pin it now holds page reuse to.
     proc enWithReaders(e: FqEngine, rd: FqEngReaders) -> FqEngine:
-        let e1 = FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: rd}
+        let e1 = FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: rd, limits: e.limits}
         let oldest = do enOldestPin(e1)
         let st = do stSetReaders(e1.st, FqBtReaders{epoch: rd.epoch, oldestPin: oldest})
         let e2 = do enWith(e1, st)
@@ -922,7 +1018,13 @@ app FqEngineSelfHost:
 
     # enPin: pin_read — a snapshot reader's claim on the current epoch.
     proc enPin(e: FqEngine) -> FqEngInt:
-        let ep = e.rd.epoch
+        let r = do enPinAt(e, e.rd.epoch)
+        return r
+
+    # enPinAt: a reader's claim on the epoch it read at — the snapshot's,
+    # which the owner that admitted it knows (fqserver.fct's loop pins
+    # against the published snapshot; its writer registers the pin here).
+    proc enPinAt(e: FqEngine, ep: int) -> FqEngInt:
         let mut epochs = e.rd.pinEpochs
         let mut counts = e.rd.pinCounts
         let at = do fqwIndexOfInt(epochs, ep)
@@ -1009,8 +1111,8 @@ app FqEngineSelfHost:
         let w = writeFile(tmp, body)
         let s = syncFile(tmp)
         let r = renameFile(tmp, path)
-        let h = FqwHandle{path: path, needsSeparator: false}
-        let e2 = FqEngine{st: e.st, wal: h, ctr: e.ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: seq, users: e.users, rd: e.rd}
+        let h = FqwHandle{path: path, needsSeparator: false, size: -1}
+        let e2 = FqEngine{st: e.st, wal: h, ctr: e.ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: seq, users: e.users, rd: e.rd, limits: e.limits}
         let ok2 = do enOk(e2)
         return ok2
 
@@ -1048,7 +1150,7 @@ app FqEngineSelfHost:
         if !r.found:
             let o = do enApplyAtomic(r.eng, [opDelete(address)])
             return FqKindR{ok: o.ok, kind: "storage", err: o.err, eng: o.eng}
-        let lo = do enLowerDeleteInto(r.eng, [r.node], [], [], [], [])
+        let lo = do enLowerDeleteInto(r.eng, [r.node], [], stagedNew())
         if !lo.ok:
             return FqKindR{ok: false, kind: lo.kind, err: lo.err, eng: lo.eng}
         let out = do enApplyAtomic(lo.eng, lo.ops)
@@ -1347,7 +1449,7 @@ app FqEngineSelfHost:
         return out
 
     proc enWithUsers(e: FqEngine, users: [UserRecord]) -> FqEngine:
-        return FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: users, rd: e.rd}
+        return FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: users, rd: e.rd, limits: e.limits}
 
     proc enInsertUser(e: FqEngine, u: UserRecord) -> FqEngR uses io.file:
         let r = do enApplyAtomic(e, [opInsertUser(u)])
@@ -1369,8 +1471,8 @@ app FqEngineSelfHost:
 
     # ── load + recovery ────────────────────────────────────────────────
     # enLoad: StorageEngine::load, then recovery::recover (Database::new).
-    proc enLoad(dir: text, key: [int], nonceBase: int, interval: int, rotateBytes: int) -> FqEngR uses io.file:
-        let o = do enOpen(dir, key, nonceBase, interval, rotateBytes)
+    proc enLoad(dir: text, key: [int], nonceBase: int, interval: int, rotateBytes: int, limits: FqEngLimits) -> FqEngR uses io.file:
+        let o = do enOpen(dir, key, nonceBase, interval, rotateBytes, limits)
         return FqEngR{ok: o.ok, err: o.err, eng: o.eng}
 
     # enOpen: enLoad, naming the phase a failure happened in — "load"
@@ -1382,18 +1484,30 @@ app FqEngineSelfHost:
         phase: text
         eng: FqEngine
 
-    proc enOpen(dir: text, key: [int], nonceBase: int, interval: int, rotateBytes: int) -> FqEngOpen uses io.file:
-        let r = do enLoadPhase(dir, key, nonceBase, interval, rotateBytes)
+    proc enOpen(dir: text, key: [int], nonceBase: int, interval: int, rotateBytes: int, limits: FqEngLimits) -> FqEngOpen uses io.file:
+        let r = do enLoadPhase(dir, key, nonceBase, interval, rotateBytes, limits)
         if !r.ok:
             return FqEngOpen{ok: false, err: r.err, phase: "load", eng: r.eng}
         let rc = do enRecover(r.eng)
         return FqEngOpen{ok: rc.ok, err: rc.err, phase: "recover", eng: rc.eng}
 
-    proc enLoadPhase(dir: text, key: [int], nonceBase: int, interval: int, rotateBytes: int) -> FqEngR uses io.file:
+    proc enLoadPhase(dir: text, key: [int], nonceBase: int, interval: int, rotateBytes: int, limits: FqEngLimits) -> FqEngR uses io.file:
+        # lock::acquire — StorageEngine::open's first act: the advisory
+        # flock on facetql.lock, held for the life of the process, so a
+        # data directory has exactly one writer. Refused, nothing is
+        # opened (the load below only reads, and its outcome is not
+        # reported: the refusal is).
+        let held = lockFile(dir + "facetql.lock")
         let ld = do stLoad(dir, key, nonceBase)
-        let h = FqwHandle{path: dir + "facetql.wal", needsSeparator: false}
+        let h = FqwHandle{path: dir + "facetql.wal", needsSeparator: false, size: -1}
         let fresh = do fqwCountersFresh()
-        let e0 = FqEngine{st: ld.store, wal: h, ctr: fresh, ck: ckNew(), applied: 0, pending: 0, interval: interval, rotateBytes: rotateBytes, walNonce: nonceBase + 3, walSeq: 0, users: [], rd: FqEngReaders{epoch: 0, pinEpochs: [], pinCounts: [], retiredSegs: [], retiredEpochs: []}}
+        let e0 = FqEngine{st: ld.store, wal: h, ctr: fresh, ck: ckNew(), applied: 0, pending: 0, interval: interval, rotateBytes: rotateBytes, walNonce: nonceBase + 3, walSeq: 0, users: [], rd: FqEngReaders{epoch: 0, pinEpochs: [], pinCounts: [], retiredSegs: [], retiredEpochs: []}, limits: limits}
+        if !held:
+            let mut shown = dir
+            if len(shown) > 1:
+                shown = slice(shown, 0, len(shown) - 1)
+            let fl = do enErr(e0, "another FacetQL process already has " + shown + " open. A data directory supports exactly one writer process: the page allocator, the index metadata and the WAL sequence counters are process-local, so a second writer would corrupt the files structurally rather than fail loudly. Stop the other process, or point this one at a different --data-dir.")
+            return fl
         if !ld.ok:
             let f0 = do enErr(e0, ld.err)
             return f0
@@ -1429,13 +1543,13 @@ app FqEngineSelfHost:
         return r
 
     proc enSetCounters(e: FqEngine, ctr: FqwCounters) -> FqEngine:
-        return FqEngine{st: e.st, wal: e.wal, ctr: ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd}
+        return FqEngine{st: e.st, wal: e.wal, ctr: ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd, limits: e.limits}
 
     proc enNoteRecovered(e: FqEngine, seq: int) -> FqEngine:
         let mut a = e.applied
         if seq > a:
             a = seq
-        return FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: e.ck, applied: a, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd}
+        return FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: e.ck, applied: a, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd, limits: e.limits}
 
     # enReplayOp: apply_recovery_operation — the committed operation
     # through the same apply step (and the users set it maintains).
@@ -1578,14 +1692,14 @@ app FqEngineSelfHost:
         let r = do enReadNode(e1, address)
         return r
 
-    proc enMaxScanRows() -> int:
-        return 100000
+    proc enMaxScanRows(e: FqEngine) -> int:
+        return e.limits.maxScanRows
 
-    proc enMaxQueryOffset() -> int:
-        return 10000
+    proc enMaxQueryOffset(e: FqEngine) -> int:
+        return e.limits.maxQueryOffset
 
-    proc enScanLimitExceeded(what: text) -> text:
-        let m = do enMaxScanRows()
+    proc enScanLimitExceeded(e: FqEngine, what: text) -> text:
+        let m = do enMaxScanRows(e)
         return what + " would materialize more than " + m + " rows, the maximum one request may hold in memory. Narrow the query (a smaller `kind`/`owner` range, or a predicate), page through it, or raise FACETQL_MAX_SCAN_ROWS."
 
     # enScanTree: for_each_range over a built-in tree — every (key, value)
@@ -1675,13 +1789,13 @@ app FqEngineSelfHost:
         let mut e = sc.eng
         if !sc.ok:
             return FqEngHistory{ok: false, err: sc.err, eng: e, entries: []}
-        let cap = do enMaxScanRows()
+        let cap = do enMaxScanRows(e0)
         let mut out = []
         let n = len(sc.values)
         let mut i = 0
         loop i < n:
             if len(out) >= cap:
-                let m = do enScanLimitExceeded("this node's history")
+                let m = do enScanLimitExceeded(e0, "this node's history")
                 return FqEngHistory{ok: false, err: m, eng: e, entries: []}
             let r = do enRecordAt(e, sc.values[i], "history")
             e = r.eng
@@ -1708,13 +1822,13 @@ app FqEngineSelfHost:
         let mut e = sc.eng
         if !sc.ok:
             return FqEngEdges{ok: false, err: sc.err, eng: e, edges: []}
-        let cap = do enMaxScanRows()
+        let cap = do enMaxScanRows(e0)
         let mut out = []
         let n = len(sc.values)
         let mut i = 0
         loop i < n:
             if len(out) >= cap:
-                let m = do enScanLimitExceeded("this node's edge list")
+                let m = do enScanLimitExceeded(e0, "this node's edge list")
                 return FqEngEdges{ok: false, err: m, eng: e, edges: []}
             let r = do enRecordAt(e, sc.values[i], "edge")
             e = r.eng
@@ -1784,13 +1898,13 @@ app FqEngineSelfHost:
         let sc = do enScanCandidates(e0, false, "", true, owner)
         if !sc.ok:
             return sc
-        let cap = do enMaxScanRows()
+        let cap = do enMaxScanRows(e0)
         let mut out = []
         let n = len(sc.nodes)
         let mut i = 0
         loop i < n:
             if len(out) >= cap:
-                let m = do enScanLimitExceeded("this owner's node list")
+                let m = do enScanLimitExceeded(e0, "this owner's node list")
                 return FqEngNodes{ok: false, err: m, eng: sc.eng, nodes: []}
             let mut visible = true
             if hasRequester:
@@ -1806,7 +1920,7 @@ app FqEngineSelfHost:
         let e0 = do enCountRead(e00)
         if limit == 0:
             return FqEngNodes{ok: true, err: "", eng: e0, nodes: []}
-        let mo = do enMaxQueryOffset()
+        let mo = do enMaxQueryOffset(e00)
         if offset > mo:
             return FqEngNodes{ok: false, err: "offset " + offset + " is above the maximum of " + mo + ". Deep offset paging re-reads and discards every row before the page, so its cost grows with the page number; use the keyset cursor (`after`, from a previous page's `next`) on POST /nodes/query, which costs the same at any depth. Raise FACETQL_MAX_QUERY_OFFSET to override.", eng: e0, nodes: []}
         let cands = do enCandidates(e0, hasKind, kind, hasOwner, owner)
@@ -1951,7 +2065,8 @@ app FqEngineSelfHost:
 
     proc enReadText(dir: text, keyHex: text, nonceBase: int, script: text) -> text uses io.file:
         let key = do fqwHexBytes(keyHex)
-        let ld = do enLoad(dir, key, nonceBase, 256, 67108864)
+        let lim = do enDefaultLimits()
+        let ld = do enLoad(dir, key, nonceBase, 256, 67108864, lim)
         if !ld.ok:
             return "error: " + ld.err
         let r = do enReadOps(ld.eng, script)
@@ -2439,7 +2554,8 @@ app FqEngineSelfHost:
 
     proc enScriptText(dir: text, keyHex: text, nonceBase: int, interval: int, rotateBytes: int, script: text) -> text uses io.file:
         let key = do fqwHexBytes(keyHex)
-        let ld = do enLoad(dir, key, nonceBase, interval, rotateBytes)
+        let lim = do enDefaultLimits()
+        let ld = do enLoad(dir, key, nonceBase, interval, rotateBytes, lim)
         if !ld.ok:
             return "error: " + ld.err
         let mut e = ld.eng

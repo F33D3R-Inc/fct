@@ -179,3 +179,42 @@ func TestRecordStaysFlatDespiteType(t *testing.T) {
 		t.Fatalf("expected a record-must-be-flat error, got %v", err)
 	}
 }
+
+// `auth <scheme> basic <id> <secret>` and `body form` are validated like
+// the bearer clause: the credential binds text parameters that are not path
+// parameters, a GET carries no form, and a form never doubles a wire body.
+func TestAPIBasicAndFormValidation(t *testing.T) {
+	base := `app A:
+    type T:
+        x: text
+    action ex(client_id: text, client_secret: text, code: text) -> T:
+        return T{x: code}
+    action get1(id: int) -> T:
+        return T{x: "" + id}
+    %s
+    view Home at "/":
+        text "hi"
+`
+	ok := `api POST "/api/token" -> ex auth dev_client basic client_id client_secret:
+        body form`
+	if _, err := String(strings.Replace(base, "%s", ok, 1)); err != nil {
+		t.Fatalf("a basic + form route must compile: %v", err)
+	}
+	cases := []struct{ decl, want string }{
+		{`api POST "/api/token" -> ex auth dev_client basic client_id nope`, `basic credential parameter "nope" must be a text parameter`},
+		{`api POST "/api/token" -> ex auth dev_client basic client_id client_id`, `bind to two different parameters`},
+		{`api POST "/api/token" -> ex auth bearer basic client_id client_secret`, `reserved`},
+		{`api GET "/api/one/{id}" -> get1:
+        body form`, "a GET carries no request body"},
+		{`api POST "/api/token" -> ex auth dev_client basic client_id client_secret:
+        body form
+        body T`, "two different request bodies"},
+		{`api POST "/api/token" -> ex auth dev_client bearer`, "api auth clause is"},
+	}
+	for _, c := range cases {
+		_, err := String(strings.Replace(base, "%s", c.decl, 1))
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s\n  err = %v, want %q", c.decl, err, c.want)
+		}
+	}
+}

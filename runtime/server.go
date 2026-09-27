@@ -7,6 +7,7 @@
 package runtime
 
 import (
+	"context"
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
@@ -20,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,22 +43,25 @@ type Server struct {
 	byPolicy    map[string]*ir.Policy
 	byComponent map[string]*ir.Component
 	byService   map[string]*ir.Service
-	byProc      map[string]*ir.Proc      // proc name -> its IR, for `do ProcName(args)`
-	procCode    sync.Map                 // *ir.Proc / *ir.Daemon -> its compiled *procCode (proccompile.go)
-	layoutOnce  sync.Once                // builds layouts, the first time a proc builds a struct
-	layouts     map[string]*structLayout // struct type -> its field layout (proccompile.go)
-	byRecord    map[string]*ir.Record    // record name -> its field schema, for decoding a structured service reply
-	triggers    map[string][]ir.Trigger  // source action name -> reactions to run on its success
-	gated       map[string][]gatedField  // entity -> @requires-gated fields (API per-actor, never SSE)
-	apiRead     map[string]entityRead    // entity -> its JSON-API read rule; ABSENT MEANS REFUSED (see apiread.go)
-	privateNm   map[string]bool          // @private state names — never shipped to a client
-	uploadDir   string                   // directory uploaded files are written to and served from
-	dataDir     string                   // sandbox root for a proc's readFile/writeFile (io.file) — see runtime/io.go
-	channels    *channelRegistry         // backs the `channel()`/`send`/`recv` builtins — see runtime/channel.go
-	netConns    *netRegistry             // backs listen/accept/readBytes/writeBytes/closeConn (io.net.listen) — see runtime/netconn.go
-	shared      *sharedCells             // backs `shared` cells ($shared.get/$shared.set) — see runtime/shared.go
-	console     *stdio                   // backs writeStdout/writeStderr/readStdin (io.console) — see runtime/stdio.go
-	exit        func(code int)           // ends the process for exitProcess (os.Exit; a test substitutes its own) — see runtime/process.go
+	byProc      map[string]*ir.Proc         // proc name -> its IR, for `do ProcName(args)`
+	procCode    sync.Map                    // *ir.Proc / *ir.Daemon -> its compiled *procCode (proccompile.go)
+	layoutOnce  sync.Once                   // builds layouts, the first time a proc builds a struct
+	layouts     map[string]*structLayout    // struct type -> its field layout (proccompile.go)
+	profiling   bool                        // label every proc call with its name for a CPU profile (SetProfiling)
+	compOnce    sync.Once                   // builds composites, the first time a proc is called
+	composites  map[string][]ir.RecordField // struct or wire type -> its fields; absent means scalar (proccompile.go)
+	byRecord    map[string]*ir.Record       // record name -> its field schema, for decoding a structured service reply
+	triggers    map[string][]ir.Trigger     // source action name -> reactions to run on its success
+	gated       map[string][]gatedField     // entity -> @requires-gated fields (API per-actor, never SSE)
+	apiRead     map[string]entityRead       // entity -> its JSON-API read rule; ABSENT MEANS REFUSED (see apiread.go)
+	privateNm   map[string]bool             // @private state names — never shipped to a client
+	uploadDir   string                      // directory uploaded files are written to and served from
+	dataDir     string                      // sandbox root for a proc's readFile/writeFile (io.file) — see runtime/io.go
+	channels    *channelRegistry            // backs the `channel()`/`send`/`recv` builtins — see runtime/channel.go
+	netConns    *netRegistry                // backs listen/accept/readBytes/writeBytes/closeConn (io.net.listen) — see runtime/netconn.go
+	shared      *sharedCells                // backs `shared` cells ($shared.get/$shared.set) — see runtime/shared.go
+	console     *stdio                      // backs writeStdout/writeStderr/readStdin (io.console) — see runtime/stdio.go
+	exit        func(code int)              // ends the process for exitProcess (os.Exit; a test substitutes its own) — see runtime/process.go
 
 	uploadMu       sync.Mutex                // guards uploadSessions
 	uploadSessions map[string]*uploadSession // in-flight resumable uploads, keyed by session id
@@ -1153,6 +1158,14 @@ func (s *Server) coerceRet(v any, ret string, list bool) any {
 	if !list {
 		return s.coerceOne(v, ret)
 	}
+	if b, isBytes := v.(bytesVal); isBytes {
+		// A byte buffer is an [int] already; any other element type reads
+		// its ints through coerceOne.
+		if ret == "int" {
+			return v
+		}
+		v = promoteBytes(b)
+	}
 	items, ok := v.([]any)
 	if !ok {
 		if v == nil {
@@ -1162,8 +1175,12 @@ func (s *Server) coerceRet(v any, ret string, list bool) any {
 	}
 	if s.byRecord[ret] == nil && canonicalList(items, ret) {
 		// Already the declared element type throughout (every well-typed
-		// proc-to-proc return is): hand the list on as it is. The binding
-		// is not owned, so a caller that mutates it copies first.
+		// proc-to-proc return is): hand the list on as it is — the value
+		// as it arrived, not re-boxed. The binding is not owned, so a
+		// caller that mutates it copies first.
+		if ok {
+			return v
+		}
 		return items
 	}
 	out := make([]any, len(items))
@@ -1773,7 +1790,9 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 		if err != nil {
 			panic(procCallError{err})
 		}
-		return v, true
+		// The proc engine's struct-typed values are structVal; this action's
+		// world (its reply, its later expressions) is records — see plainValue.
+		return plainValue(v), true
 	})
 	defer delete(scope, procRunnerKey)
 	if status, msg := s.execActionBlockCatching(act.Body, ar); status != http.StatusOK {
@@ -2251,7 +2270,11 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 					// a later statement explicitly assigns it into a state cell. The
 					// proc's OWN internal `let` locals never reach here at all: they
 					// lived only in the frame runProcLocked built and discarded.
-					ar.scope[st.Bind] = s.coerceRet(res, st.Ret, st.RetList)
+					//
+					// The proc engine builds its struct-typed values as structVal; the
+					// action's world (its reply, its later expressions, rows) is
+					// records. Crossing back is the mirror of procArgValue.
+					ar.scope[st.Bind] = plainValue(s.coerceRet(res, st.Ret, st.RetList))
 				}
 			}
 		case "exprstmt":
@@ -2431,6 +2454,16 @@ func (s *Server) execActionBlockCatching(body []ir.Stmt, ar *actionRun) (status 
 // type, since internal/ir/build.go's stmtsReturnComplete refuses that for a
 // return-typed proc — simply yields nil.
 func (s *Server) runProcLocked(p *ir.Proc, args []any) (any, error) {
+	if s.profiling {
+		// A detached or daemon body's own statements, labelled like a
+		// called proc's (proccompile.go's procSite.call) under a profile.
+		var out any
+		var err error
+		pprof.Do(context.Background(), pprof.Labels("proc", p.Name), func(context.Context) {
+			out, err = s.runCode(s.codeFor(p, p.Params, p.Body), p, args)
+		})
+		return out, err
+	}
 	return s.runCode(s.codeFor(p, p.Params, p.Body), p, args)
 }
 
@@ -2464,6 +2497,13 @@ func (s *Server) runCodeOwned(pc *procCode, p *ir.Proc, args []any, owned uint64
 		} else {
 			v = zero(prm.Type)
 		}
+		// A row an action projected (`list(workDTO(w, me) in Work …)`) arrives as
+		// the map the projection built, while the compiled body reads a struct-
+		// typed parameter through its layout (proccompile.go's "get"). The
+		// declared parameter type is the contract both sides agreed to, so the
+		// boundary converts to it here — once, recursively — rather than every
+		// field read guessing at the representation it was handed.
+		v = s.procArgValue(prm.Type, prm.List, v)
 		// Shared, not copied: unless the caller handed the value over, the
 		// parameter's slot does not own it, so the proc's first in-place
 		// write to it copies (proccompile.go).
@@ -2915,7 +2955,18 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		// One answer to "what may this actor receive of these rows", shared with the
 		// page bootstrap, the region endpoint and the live stream.
-		out := map[string]any{"rows": s.visibleRows(name, rows, scope)}
+		//
+		// A list is always a JSON array: a filter that matched nothing (`?author=
+		// nobody`, `?id=999`) answers `[]`, never `null` — a client iterating the
+		// rows must not have to special-case the empty answer (the region endpoint
+		// makes the same promise, see handleRegion).
+		visible := s.visibleRows(name, rows, scope)
+		if visible == nil {
+			visible = []any{}
+		} else if vs, ok := visible.([]any); ok && vs == nil {
+			visible = []any{}
+		}
+		out := map[string]any{"rows": visible}
 		if next != "" {
 			out["next"] = next
 		}

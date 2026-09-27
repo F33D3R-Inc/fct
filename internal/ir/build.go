@@ -1372,11 +1372,55 @@ func Build(app *ast.App) (*IR, error) {
 			}
 			auth = ap.AuthScheme
 		}
+		if ap.BasicID != "" {
+			// The Basic credential is the app's own client id and secret,
+			// verified by the action — never a session.
+			if len(act.Requires) > 0 {
+				return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q authenticates with %s basic credentials, so action %q cannot also require a session policy", ap.Method, ap.Path, ap.AuthScheme, ap.Action)}
+			}
+			for _, name := range []string{ap.BasicID, ap.BasicSecret} {
+				var bp *Param
+				for i := range act.Params {
+					if act.Params[i].Name == name {
+						bp = &act.Params[i]
+					}
+				}
+				if bp == nil || bp.Type != "text" || bp.List {
+					return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: basic credential parameter %q must be a text parameter of action %q", ap.Method, ap.Path, name, ap.Action)}
+				}
+				for _, pp := range pathParams {
+					if pp == name {
+						return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: {%s} is a path parameter, not a basic credential", ap.Method, ap.Path, name)}
+					}
+				}
+			}
+			if ap.BasicID == ap.BasicSecret {
+				return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: the basic id and secret bind to two different parameters", ap.Method, ap.Path)}
+			}
+			if ap.AuthScheme == "none" || ap.AuthScheme == "session" || ap.AuthScheme == "bearer" {
+				return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: auth scheme %q is reserved; name the credential (e.g. dev_client)", ap.Method, ap.Path, ap.AuthScheme)}
+			}
+			auth = ap.AuthScheme
+		}
+		if ap.Form {
+			if ap.Method == "GET" {
+				return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: a GET carries no request body — drop `body form`", ap.Method, ap.Path)}
+			}
+			if ap.Body != "" {
+				return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: `body form` and `body %s` name two different request bodies", ap.Method, ap.Path, ap.Body)}
+			}
+			for _, p := range act.Params {
+				if p.Type == "bytes" {
+					return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: a `bytes` parameter (%q) already makes the request a multipart form — drop `body form`", ap.Method, ap.Path, p.Name)}
+				}
+			}
+		}
 		docs, err := e.apiDocs(ap, act, pathParams, out.Types)
 		if err != nil {
 			return nil, err
 		}
 		out.APIs = append(out.APIs, API{Method: ap.Method, Path: ap.Path, Params: pathParams, Action: ap.Action, Status: status, Rate: ap.Rate, Since: ap.Since, Auth: auth, Ret: act.Ret, RetList: act.RetList, Bearer: ap.Bearer,
+			BasicID: ap.BasicID, BasicSecret: ap.BasicSecret, Form: ap.Form,
 			Summary: ap.Summary, Description: ap.Description, Body: ap.Body, Errors: ap.Errors, Operation: ap.Operation, ParamDocs: docs})
 	}
 
@@ -1538,6 +1582,13 @@ func Build(app *ast.App) (*IR, error) {
 		if err := checkOn(em); err != nil {
 			return nil, err
 		}
+	}
+	// Events a module expected some host stream to carry and none here does
+	// (`expect event notification: NotificationDTO`, compile/expect.go): the
+	// module is compiled on its own, and the stream is its host's to declare.
+	for _, ev := range app.ExpectedEvents {
+		carriesNamed[ev.Name+" "+ev.Type] = true
+		carried[ev.Type] = true
 	}
 	for _, em := range e.emittedEvents {
 		if !carriesNamed[em.name+" "+em.typ] {
@@ -1743,6 +1794,14 @@ func Build(app *ast.App) (*IR, error) {
 			if routeMatches(out.Pages[i].Path, ref.path) {
 				matched = true
 				break
+			}
+		}
+		// A route a module expected its host to serve and no view here does
+		// (`expect view at "/profile/:handle"`, compile/expect.go): the fragment
+		// is being compiled on its own, and the link is its host's to serve.
+		for _, pattern := range app.ExpectedRoutes {
+			if !matched && routeMatches(pattern, ref.path) {
+				matched = true
 			}
 		}
 		if !matched {
@@ -4025,9 +4084,26 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			return bytesType
 		case "aesGcmAuthentic":
 			return "bool"
+		case "sha256Bytes", "hmacSha256":
+			// A digest (runtime/cryptobuiltins.go): a byte buffer in, one out.
+			return bytesType
+		case "base64UrlRaw", "bcryptHash":
+			return "text"
+		case "bcryptMatches":
+			return "bool"
+		case "indexOf":
+			// indexOf(s, sub, from) -> int, a rune index or -1.
+			return "int"
 		case "byteLen":
 			// byteLen(s) -> int, s's real UTF-8 byte length (as opposed to
 			// len(s)'s rune count) — always an int, the same as len().
+			return "int"
+		case "crc32":
+			// crc32(bs, from, to) -> int: the CRC-32 (IEEE 802.3, the
+			// polynomial 0xEDB88320, as zlib, PNG and facetql's crc32fast
+			// compute it) of bs[from..to), a byte buffer. A storage engine's
+			// checksum primitive, as sha256Hex is its digest one: a table
+			// lookup per byte the evaluator cannot make cheap.
 			return "int"
 		case "readFile", "httpGet", "httpPost":
 			return "text"
@@ -4078,6 +4154,11 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			return "int"
 		case "connError", "connPeer", "listenError":
 			return "text"
+		case "listenerPort":
+			// listenerPort(l) -> int: the port a listener is bound to — the
+			// one the operating system chose for listen(0) — or 0 for a
+			// listener whose bind failed.
+			return "int"
 		case "closeListener", "grantRead":
 			return "bool"
 		case "writeStdout", "writeStderr":
@@ -4110,7 +4191,7 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			// error exactly as writeFile's below. fileExists answers the one
 			// question readFile cannot ask without failing: is it there.
 			return "bool"
-		case "fileSize":
+		case "fileSize", "fileModTime":
 			// fileSize(path) -> int: the file's length in bytes, -1 when absent.
 			return "int"
 		case "readFileAt":
@@ -4119,6 +4200,12 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			return bytesType
 		case "writeFileAt", "syncFile", "renameFile", "removeFile":
 			// true on success; a failure is a runtime error, as writeFile's.
+			return "bool"
+		case "lockFile":
+			// lockFile(path) -> bool: the exclusive advisory lock on that file
+			// (flock), held by this process for its lifetime — true when held
+			// (or already held by this process), false when another process
+			// holds it. Any other failure is a runtime error, as writeFile's.
 			return "bool"
 		case "writeFile":
 			// true on success — a failure (missing dir, permission, disk full)
@@ -6711,9 +6798,9 @@ func checkNoIndexIf(ex ast.Expr, wire map[string]bool, line int, allow func(ast.
 // must never be able to write one into source at all. checkNoIO is the
 // syntactic barrier that guarantees that, exactly mirroring checkNoBitwise's
 // shape and its single call site inside check().
-var ioBuiltins = map[string]bool{"readFile": true, "writeFile": true, "appendFile": true, "fileExists": true, "truncateFile": true, "fileSize": true, "readFileAt": true, "writeFileAt": true, "syncFile": true, "renameFile": true, "removeFile": true, "httpGet": true, "httpPost": true,
+var ioBuiltins = map[string]bool{"readFile": true, "writeFile": true, "appendFile": true, "fileExists": true, "truncateFile": true, "fileSize": true, "fileModTime": true, "readFileAt": true, "writeFileAt": true, "syncFile": true, "renameFile": true, "removeFile": true, "lockFile": true, "httpGet": true, "httpPost": true,
 	"connect": true, "connectTls": true, "readBytes": true, "writeBytes": true, "closeConn": true, "setTimeoutMs": true, "connError": true, "pollBytes": true, "connOpen": true,
-	"closeListener": true, "listenError": true, "grantRead": true,
+	"closeListener": true, "listenError": true, "listenerPort": true, "grantRead": true,
 	"writeStdout": true, "writeStderr": true, "readStdin": true}
 
 // checkNoIO rejects a call to readFile/writeFile/httpGet/httpPost anywhere
@@ -7186,7 +7273,7 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 			if len(t.Args) != 2 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly two arguments", t.Name)}
 			}
-		case "fileExists", "fileSize", "syncFile", "removeFile":
+		case "fileExists", "fileSize", "fileModTime", "syncFile", "removeFile", "lockFile":
 			if len(t.Args) != 1 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly one argument", t.Name)}
 			}
@@ -7194,7 +7281,7 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 			if len(t.Args) != 2 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly two arguments", t.Name)}
 			}
-		case "readFileAt", "writeFileAt", "pollBytes":
+		case "readFileAt", "writeFileAt", "pollBytes", "crc32":
 			if len(t.Args) != 3 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly three arguments", t.Name)}
 			}
@@ -7230,7 +7317,7 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 			if len(t.Args) != 3 {
 				return &BuildError{line, "listenTls(port, identity, password) takes exactly three arguments: a port, a PKCS#12 identity file and its password"}
 			}
-		case "listen", "accept", "closeConn", "connError", "connPeer", "shutdownConn", "connOpen", "closeListener", "listenError", "grantRead":
+		case "listen", "accept", "closeConn", "connError", "connPeer", "shutdownConn", "connOpen", "closeListener", "listenError", "listenerPort", "grantRead":
 			if len(t.Args) != 1 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly one argument", t.Name)}
 			}
@@ -7460,7 +7547,7 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 func builtinCapability(name string) (string, bool) {
 	switch name {
 	case "readFile", "writeFile", "appendFile", "fileExists", "truncateFile",
-		"fileSize", "readFileAt", "writeFileAt", "syncFile", "renameFile", "removeFile":
+		"fileSize", "fileModTime", "readFileAt", "writeFileAt", "syncFile", "renameFile", "removeFile", "lockFile":
 		return "io.file", true
 	case "httpGet", "httpPost", "connect", "connectTls":
 		return "io.net", true
@@ -7481,7 +7568,7 @@ func builtinCapability(name string) (string, bool) {
 	case "grantRead":
 		// io.file: it makes a file readable (runtime/grants.go).
 		return "io.file", true
-	case "closeListener", "listenError":
+	case "closeListener", "listenError", "listenerPort":
 		// Operations on a listener handle: the listener's own capability.
 		return "io.net.listen", true
 	case "listen", "listenOn", "listenTls", "accept":
@@ -7582,7 +7669,7 @@ func procCapabilities(ex ast.Expr) map[string]string {
 	walk = func(ex ast.Expr) {
 		switch t := ex.(type) {
 		case ast.Call:
-			if t.Name == "now" || t.Name == "rand" || t.Name == "randomBytes" {
+			if t.Name == "now" || t.Name == "rand" || t.Name == "randomBytes" || t.Name == "bcryptHash" {
 				caps[impureCap] = t.Name
 			} else if t.Name == "print" {
 				caps[printCap] = t.Name
@@ -7712,7 +7799,7 @@ func pureBuiltinArity(name string) (int, bool) {
 	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day",
 		"ago", "compact", "commas", "iso", "fromIso", "first", "fromJson", "bytes", "toFloat", "toInt", "toMoney", "slug",
 		"textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits",
-		"u64Text", "u64Parse", "u64ParseError", "u64ToFloat":
+		"u64Text", "u64Parse", "u64ParseError", "u64ToFloat", "sha256Bytes", "base64UrlRaw", "bcryptHash":
 		return 1, true
 	case "print":
 		// print(value): a debugging aid, not real arithmetic/string/date
@@ -7725,9 +7812,9 @@ func pureBuiltinArity(name string) (int, bool) {
 	case "append":
 		return 2, true
 	case "min", "max", "contains", "take", "split", "join", "charAt",
-		"u64Cmp", "u64Min", "u64Max", "u64SatSub", "u64Div", "u64Rem":
+		"u64Cmp", "u64Min", "u64Max", "u64SatSub", "u64Div", "u64Rem", "hmacSha256", "bcryptMatches":
 		return 2, true
-	case "slice", "replace", "aesGcmSeal", "aesGcmOpen", "aesGcmAuthentic":
+	case "slice", "replace", "aesGcmSeal", "aesGcmOpen", "aesGcmAuthentic", "indexOf":
 		return 3, true
 	}
 	return 0, false
@@ -9054,7 +9141,7 @@ func (e *env) apiDocs(ap *ast.API, act *Action, pathParams []string, types []Wir
 			fields[f.Name] = f
 		}
 		for _, p := range act.Params {
-			if inPath[p.Name] || p.Name == ap.Bearer {
+			if inPath[p.Name] || p.Name == ap.Bearer || p.Name == ap.BasicID || p.Name == ap.BasicSecret {
 				continue
 			}
 			f, ok := fields[p.Name]

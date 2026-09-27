@@ -1,0 +1,388 @@
+import "runtime_page.fct"
+import "contract_history.fct"
+
+app RuntimeServer:
+    # runtime_server.fct — the facet web runtime as a service written in
+    # fct: runtime/server.go's Handler over http_server.fct. It loads a
+    # compiled app (the JSON `facet ir` emits, through ir_graph.fct), and
+    # serves it exactly as the Go runtime does: the built-in endpoints ahead
+    # of the app's view router (Handler's `builtins` table, in ServeMux's
+    # longest-pattern order), then the pages.
+    #
+    #   The test driver (runtime_parity_test.go) posts /api/rtConfigure
+    #   with the port and the IR file (inside the data directory), then
+    #   starts the daemons; `facet exec` would read RT_PORT / RT_IR from the
+    #   environment instead (rtConfigFromEnv).
+    #
+    # The shape is fqserver.fct's: one loop task (rtLoop) owns the world —
+    # entities, sessions, subscribers — and answers one request at a time,
+    # which is Server.mu; every connection is its own task (rtServeConn)
+    # that parses the request, hands it to the loop as a packed message
+    # with its reply channel, and writes what comes back. A live stream
+    # stays on its connection task and receives frames from the loop.
+    shared rtPort: int
+    shared rtIRPath: text
+
+    proc rtSetConfig(port: int, irPath: text):
+        rtPort = port
+        rtIRPath = irPath
+
+    action rtConfigure(port: int, irPath: text):
+        do rtSetConfig(port, irPath)
+
+    # ── messages between a connection and the loop ──────────────────────
+    proc rtPack(fields: [text]) -> text:
+        let mut out = ""
+        let mut i = 0
+        loop i < len(fields):
+            out = out + len(fields[i]) + ":" + fields[i]
+            i = i + 1
+        return out
+
+    proc rtUnpack(s: text) -> [text]:
+        let mut out = []
+        let n = len(s)
+        let mut p = 0
+        loop p < n:
+            let mut q = p
+            loop charAt(s, q) != ":":
+                q = q + 1
+            let k = toInt(slice(s, p, q))
+            out = append(out, slice(s, q + 1, q + 1 + k))
+            p = q + 1 + k
+        return out
+
+    proc rtBoolText(b: bool) -> text:
+        if b:
+            return "1"
+        return "0"
+
+    # A request: ["Q", reply, method, path, query, hasQuery, body, h1name, h1value, …].
+    proc rtReqFields(reply: int, req: HttpServerRequest) -> [text]:
+        let mut f = ["Q", "" + reply, req.method, req.path, req.query, rtBoolText(req.hasQuery), req.body]
+        let mut i = 0
+        loop i < len(req.headers):
+            f = append(f, req.headers[i].name)
+            f = append(f, req.headers[i].value)
+            i = i + 1
+        return f
+
+    proc rtReqAt(f: [text]) -> HttpServerRequest:
+        let mut headers = []
+        let mut i = 7
+        loop i + 1 < len(f):
+            headers = append(headers, HttpHeader{name: f[i], value: f[i + 1]})
+            i = i + 2
+        return HttpServerRequest{state: 1, err: "", method: f[2], target: f[3], path: f[3], query: f[4], hasQuery: f[5] == "1", version: "HTTP/1.1", headers: headers, body: f[6], rest: []}
+
+    # A response: ["R", status, body, h1name, h1value, …]; a stream:
+    # ["S", chan, status, h1name, h1value, …] followed by frames on chan.
+    proc rtRespFields(r: HttpServerResponse) -> [text]:
+        let mut f = ["R", "" + r.status, r.body]
+        let mut i = 0
+        loop i < len(r.headers):
+            f = append(f, r.headers[i].name)
+            f = append(f, r.headers[i].value)
+            i = i + 1
+        return f
+
+    proc rtHeadersAt(f: [text], from: int) -> [HttpHeader]:
+        let mut headers = []
+        let mut i = from
+        loop i + 1 < len(f):
+            headers = append(headers, HttpHeader{name: f[i], value: f[i + 1]})
+            i = i + 2
+        return headers
+
+    # ── the loop ────────────────────────────────────────────────────────
+    proc rtLoop(ch: int, w0: RtWorld, js: text) uses io.net.listen, io.console, io.file:
+        let mut w = w0
+        loop true:
+            let msg = recv(ch)
+            let f = do rtUnpack(msg)
+            if f[0] == "Q":
+                let reply = toInt(f[1])
+                let req = do rtReqAt(f)
+                let out = do rtRoute(w, req, js, reply)
+                w = out.w
+                if out.stream:
+                    let sent = send(reply, rtPack(["S", "" + out.chan, "" + out.resp.status] + rtHeaderPairs(out.resp.headers)))
+                    let sent2 = send(out.chan, out.resp.body)
+                else:
+                    let sent3 = send(reply, rtPack(rtRespFields(out.resp)))
+            if f[0] == "U":
+                w = do rtUnsubscribe(w, toInt(f[1]))
+
+    proc rtHeaderPairs(hs: [HttpHeader]) -> [text]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(hs):
+            out = append(out, hs[i].name)
+            out = append(out, hs[i].value)
+            i = i + 1
+        return out
+
+    # RtRouted: one request's answer — a whole response, or the head of a
+    # stream whose frames arrive on `chan`.
+    struct RtRouted:
+        resp: HttpServerResponse
+        w: RtWorld
+        stream: bool
+        chan: int
+
+    proc rtWhole(w: RtWorld, r: HttpServerResponse) -> RtRouted:
+        return RtRouted{resp: r, w: w, stream: false, chan: 0}
+
+    # rtRoute: Handler — the built-ins first, then the view router.
+    proc rtRoute(w0: RtWorld, req: HttpServerRequest, js: text, reply: int) -> RtRouted uses io.file:
+        let mut w = w0
+        let path = req.path
+        # Declared `api` endpoints first (serveDeclaredAPI): the app's own
+        # contract takes precedence over the generic projection and the views.
+        let peer = do rtHeaderValue(req.headers, "x-facet-peer")
+        let decl = do rtServeDeclaredAPI(w, req, peer)
+        w = decl.w
+        if decl.handled:
+            let dr = do rtWhole(w, decl.resp)
+            return dr
+        if path == "/facet.css":
+            let mut headers = [HttpHeader{name: "content-type", value: "text/css; charset=utf-8"}, HttpHeader{name: "cache-control", value: "public, max-age=31536000, immutable"}, HttpHeader{name: "etag", value: "\"" + w.cssVer + "\""}]
+            let inm = do rtHeaderValue(req.headers, "if-none-match")
+            if inm == "\"" + w.cssVer + "\"":
+                let nm = do rtWhole(w, HttpServerResponse{status: 304, reason: "", headers: headers, body: ""})
+                return nm
+            let css = do rtWhole(w, HttpServerResponse{status: 200, reason: "", headers: headers, body: w.cssBody})
+            return css
+        if path == "/facet.js":
+            let jr = do rtWhole(w, HttpServerResponse{status: 200, reason: "", headers: [HttpHeader{name: "content-type", value: "application/javascript"}], body: js})
+            return jr
+        if path == "/event":
+            let ev = do rtHandleEvent(w, req)
+            let evr = do rtWhole(ev.w, ev.resp)
+            return evr
+        if path == "/live":
+            let lv = do rtHandleLive(w, req)
+            return RtRouted{resp: lv.resp, w: lv.w, stream: lv.ok, chan: lv.chan}
+        let isContract = do cIsContractPath(w, path)
+        if isContract:
+            let cr = do cHandleContract(w, req, peer)
+            let crr = do rtWhole(cr.w, cr.resp)
+            return crr
+        if path == "/upload":
+            let up = do rtHandleUpload(w, req)
+            let upr = do rtWhole(up.w, up.resp)
+            return upr
+        let upSub = do rtHasPrefix(path, "/upload/")
+        if upSub:
+            let uc = do rtHandleUploadChunked(w, req)
+            let ucr = do rtWhole(uc.w, uc.resp)
+            return ucr
+        let upsSub = do rtHasPrefix(path, "/uploads/")
+        if upsSub:
+            let us = do rtHandleUploads(w, req)
+            let usr = do rtWhole(us.w, us.resp)
+            return usr
+        if path == "/region":
+            let rg = do rtHandleRegion(w, req)
+            let rgr = do rtWhole(rg.w, rg.resp)
+            return rgr
+        if path == "/api":
+            let sch = do rtHandleAPISchema(w, req)
+            let schr = do rtWhole(w, sch)
+            return schr
+        let apiSub = do rtHasPrefix(path, "/api/")
+        if apiSub:
+            let ap = do rtHandleAPI(w, req)
+            let apr = do rtWhole(ap.w, ap.resp)
+            return apr
+        if path == "/healthz":
+            let hz = do rtWhole(w, rtJSONResponse(200, "{\"app\":" + jsonQuote(w.g.app) + ",\"status\":\"ok\"}\n"))
+            return hz
+        if path == "/readyz":
+            let rz = do rtWhole(w, rtJSONResponse(200, "{\"status\":\"ready\"}\n"))
+            return rz
+        let pg = do rtHandlePage(w, req)
+        let pr = do rtWhole(pg.w, pg.resp)
+        return pr
+
+    proc rtWithoutHeader(hs: [HttpHeader], name: text) -> [HttpHeader]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(hs):
+            if hs[i].name != name:
+                out = append(out, hs[i])
+            i = i + 1
+        return out
+
+    # rtInjectContractEntity: injectContractEntities — a declared `contract`
+    # records the document this process serves in a reserved table, which
+    # the graph therefore carries (and every page's IR ships).
+    proc rtInjectContractEntity(g0: IRGraph) -> IRGraph:
+        let mut g = g0
+        if len(g.contract) == 0:
+            return g
+        let have = do rtEntityIndex(g, "FacetContractVersion")
+        if have >= 0:
+            return g
+        let fields = [rtPlainField("id", "int", false), rtPlainField("version", "text", true), rtPlainField("schema_version", "int", false), rtPlainField("schema_hash", "text", false), rtPlainField("first_seen", "int", false), rtPlainField("document", "text", false)]
+        g.entities = append(g.entities, IREntity{name: "FacetContractVersion", softDelete: false, ephemeral: false, fields: fields, read: [], derives: []})
+        return g
+
+    proc rtPlainField(name: text, typ: text, index: bool) -> IRField:
+        return IRField{name: name, type: typ, ref: "", enumName: "", index: index, secret: false, e2e: false, password: false, readPolicy: "", optional: false, unique: false, required: false, hasMin: false, min: 0, hasMax: false, max: 0, matches: "", onDelete: ""}
+
+    # rtPeerHost: the host of "host:port" (net.SplitHostPort).
+    proc rtPeerHost(addr: text) -> text:
+        let mut i = len(addr) - 1
+        loop i >= 0:
+            if charAt(addr, i) == ":":
+                return slice(addr, 0, i)
+            i = i - 1
+        return addr
+
+    # ── connections ─────────────────────────────────────────────────────
+    proc rtServeConn(c: int, ch: int) uses io.net.listen:
+        let reply = channel()
+        let mut pending = []
+        let mut open = true
+        loop open:
+            let raw = do httpServerReadRequestRaw(c, pending, 16 * 1024 * 1024)
+            let req = raw.req
+            if req.state == 0:
+                open = false
+            if req.state == -1:
+                let r = do httpServerRefuse(c, 400, "bad request: " + req.err)
+                open = false
+            if req.state == -2:
+                let r2 = do httpServerRefuse(c, 413, "too large")
+                open = false
+            if req.state == 1:
+                pending = req.rest
+                let keep = do httpServerKeepAlive(req)
+                let mut withPeer = req
+                withPeer.headers = append(req.headers, HttpHeader{name: "x-facet-peer", value: rtPeerHost(connPeer(c))})
+                # a body that is not UTF-8 text (an upload) travels as bytes too
+                if len(raw.bodyBytes) > 0 && bytesToText(raw.bodyBytes) != req.body:
+                    withPeer.headers = append(withPeer.headers, HttpHeader{name: "x-facet-body-b64", value: base64UrlRaw(raw.bodyBytes)})
+                else:
+                    if len(raw.bodyBytes) > 0:
+                        withPeer.headers = append(withPeer.headers, HttpHeader{name: "x-facet-body-b64", value: base64UrlRaw(raw.bodyBytes)})
+                let sent = send(ch, rtPack(rtReqFields(reply, withPeer)))
+                let f = do rtUnpack(recv(reply))
+                if f[0] == "S":
+                    let frames = toInt(f[1])
+                    let headers = do rtHeadersAt(f, 3)
+                    let started = do httpServerStartStream(c, toInt(f[2]), headers)
+                    let mut ok = started
+                    loop ok:
+                        let which = awaitAny([frames], 15000)
+                        if which < 0:
+                            ok = do httpServerWriteChunk(c, textToBytes(":\n\n"))
+                        else:
+                            let frame = recv(frames)
+                            ok = do httpServerWriteChunk(c, textToBytes(frame))
+                    let un = send(ch, rtPack(["U", "" + frames]))
+                    open = false
+                else:
+                    let mut resp = HttpServerResponse{status: toInt(f[1]), reason: "", headers: rtHeadersAt(f, 3), body: f[2]}
+                    if resp.status == 304:
+                        # net/http's own rule for 304: no body, and the
+                        # Content-Type/Content-Length a handler set are dropped.
+                        resp.headers = do rtWithoutHeader(resp.headers, "content-type")
+                        resp.body = ""
+                    let b64 = do rtHeaderValue(resp.headers, "x-facet-body-b64")
+                    if b64 != "":
+                        # a stored file: bytes, not text
+                        let bytes = do rtBase64UrlDecode(b64)
+                        let plain = do rtWithoutHeader(resp.headers, "x-facet-body-b64")
+                        let wroteB = do httpServerWriteResponseBytes(c, req.method, resp.status, resp.reason, plain, bytes, keep)
+                        open = wroteB && keep
+                    else:
+                        let wrote = do httpServerWriteResponse(c, req.method, resp, keep)
+                        open = wrote && keep
+        let closed = closeConn(c)
+        let freed = closeChannel(reply)
+
+    # rtConfigFromEnv: `facet exec selfhost/runtime_server.fct` is configured
+    # by RT_PORT and RT_IR (the compiled app's JSON, inside the data
+    # directory); the parity harness configures the cells through
+    # /api/rtConfigure instead. The environment is read first: a shared
+    # cell nothing assigned may not be read.
+    struct RtConfig:
+        port: int
+        irPath: text
+
+    proc rtConfigFromEnv() -> RtConfig uses io.env:
+        let envPort = envSet("RT_PORT")
+        if envPort:
+            return RtConfig{port: toInt(envVar("RT_PORT")), irPath: envVar("RT_IR")}
+        return RtConfig{port: 0, irPath: ""}
+
+    daemon RuntimeServe uses io.file, io.net.listen, io.env, io.console:
+        let cfg = do rtConfigFromEnv()
+        let mut port = cfg.port
+        let mut irPath = cfg.irPath
+        if port == 0:
+            port = rtPort
+            irPath = rtIRPath
+        let src = readFile(irPath)
+        let jv = do jsonParse(src)
+        let g0 = do irGraphFromJVal(jv)
+        let g = do rtInjectContractEntity(g0)
+        let mut master = envVar("FACET_SECRET")
+        if master == "":
+            master = base64UrlRaw(randomBytes(32))
+            let warn = writeStderr("facet: FACET_SECRET is not set — using a random ephemeral key; sessions, CSRF tokens, and @secret columns will not survive a restart. Set FACET_SECRET in production.\n")
+        do rtSetProcTable(g.procs)
+        do rtSetStoreEntities(g)
+        do rtSetReadRules(g)
+        let mut w = do rtWorldNew(g, master, envVar("FACET_API_READ"))
+        w.secure = envVar("FACET_SECURE_COOKIES") == "1"
+        let rc = do rtRateConfig()
+        let hasUp = envSet("FACET_UPLOAD_DIR")
+        if hasUp:
+            w.uploadDir = envVar("FACET_UPLOAD_DIR")
+        let hasCap = envSet("FACET_MAX_UPLOAD_MB")
+        if hasCap && toInt(envVar("FACET_MAX_UPLOAD_MB")) > 0:
+            w.uploadCap = toInt(envVar("FACET_MAX_UPLOAD_MB")) * 1024 * 1024
+        let hasTotal = envSet("FACET_MAX_MEDIA_MB")
+        if hasTotal && toInt(envVar("FACET_MAX_MEDIA_MB")) > 0:
+            w.uploadTotalCap = toInt(envVar("FACET_MAX_MEDIA_MB")) * 1024 * 1024
+        let hasTTL = envSet("FACET_MEDIA_TTL")
+        if hasTTL:
+            w.mediaTTL = toInt(envVar("FACET_MEDIA_TTL"))
+        w.rateClassNames = rc.names
+        w.rateClassLimits = rc.limits
+        w.rateDefault = rc.fallback
+        w = do cRecordContractVersion(w)
+        w = do rtRunOnStartJobs(w)
+        let js = readFile("facet.js")
+        let ch = channel()
+        detach rtLoop(ch, w, js)
+        let l = listen(port)
+        loop true:
+            let c = accept(l)
+            detach rtServeConn(c, ch)
+
+    # rtRunOnStartJobs: runOnStartJobs — the system session exists, then
+    # every `on start` job's action runs under it, in order, before the
+    # daemons start.
+    proc rtRunOnStartJobs(w0: RtWorld) -> RtWorld uses io.console:
+        let mut w = w0
+        let si = do rtSessionIndex(w, "__system")
+        if si < 0:
+            let mut sys = do rtNewSession(w, "__system", "system", "admin")
+            sys.verified = true
+            w = do rtPutSession(w, sys)
+        let mut i = 0
+        loop i < len(w.g.jobs):
+            let j = w.g.jobs[i]
+            if j.onStart:
+                let ai = do rtActionIndex(w.g, j.action)
+                if ai >= 0:
+                    let run = do rtRunActionValue(w, "__system", w.g.actions[ai], [])
+                    w = run.w
+                    if run.status != 200:
+                        let e = writeStderr("on start job failed: " + j.name + " (" + run.status + ") " + run.msg + "\n")
+            i = i + 1
+        return w

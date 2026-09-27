@@ -82,24 +82,69 @@ app EvalSelfHost:
         b: bool
         f: float
         items: [Val]
+        # keys: a "record" (Go's `record`, one entity row / one struct
+        # literal): field names, parallel to `items`. Empty for every other
+        # kind. A record stringifies to "" and is truthy — toStr/truthy's
+        # map cases — and never takes part in arithmetic.
+        keys: [text]
 
     proc noneVal() -> Val:
-        return Val{kind: "none", i: 0, t: "", b: false, f: 0.0, items: []}
+        return Val{kind: "none", i: 0, t: "", b: false, f: 0.0, items: [], keys: []}
 
     proc intVal(n: int) -> Val:
-        return Val{kind: "int", i: n, t: "", b: false, f: 0.0, items: []}
+        return Val{kind: "int", i: n, t: "", b: false, f: 0.0, items: [], keys: []}
 
     proc textVal(s: text) -> Val:
-        return Val{kind: "text", i: 0, t: s, b: false, f: 0.0, items: []}
+        return Val{kind: "text", i: 0, t: s, b: false, f: 0.0, items: [], keys: []}
 
     proc boolVal(v: bool) -> Val:
-        return Val{kind: "bool", i: 0, t: "", b: v, f: 0.0, items: []}
+        return Val{kind: "bool", i: 0, t: "", b: v, f: 0.0, items: [], keys: []}
 
     proc floatVal(x: float) -> Val:
-        return Val{kind: "float", i: 0, t: "", b: false, f: x, items: []}
+        return Val{kind: "float", i: 0, t: "", b: false, f: x, items: [], keys: []}
 
     proc listVal(elems: [Val]) -> Val:
-        return Val{kind: "list", i: 0, t: "", b: false, f: 0.0, items: elems}
+        return Val{kind: "list", i: 0, t: "", b: false, f: 0.0, items: elems, keys: []}
+
+    proc recordVal(keys: [text], items: [Val]) -> Val:
+        return Val{kind: "record", i: 0, t: "", b: false, f: 0.0, items: items, keys: keys}
+
+    # valGet: `row.field` — the field's value, or none when the record has no
+    # such key (Go's nil map read) or v is not a record.
+    proc valGet(v: Val, field: text) -> Val:
+        if v.kind == "record":
+            let mut k = 0
+            loop k < len(v.keys):
+                if v.keys[k] == field:
+                    return v.items[k]
+                k = k + 1
+        let none = do noneVal()
+        return none
+
+    proc valHas(v: Val, field: text) -> bool:
+        if v.kind == "record":
+            let mut k = 0
+            loop k < len(v.keys):
+                if v.keys[k] == field:
+                    return true
+                k = k + 1
+        return false
+
+    # valSet: the record with `field` set (replaced in place, or appended).
+    proc valSet(v: Val, field: text, x: Val) -> Val:
+        let mut keys = v.keys
+        let mut items = v.items
+        let mut k = 0
+        loop k < len(keys):
+            if keys[k] == field:
+                items[k] = x
+                let r0 = do recordVal(keys, items)
+                return r0
+            k = k + 1
+        keys = append(keys, field)
+        items = append(items, x)
+        let r1 = do recordVal(keys, items)
+        return r1
 
     # ============================================================
     # COERCIONS — toStr / toInt / toFloat / truthy / equal / negate.
@@ -171,6 +216,8 @@ app EvalSelfHost:
             return v.t != ""
         if v.kind == "list":
             return len(v.items) > 0
+        if v.kind == "record":
+            return true
         return false
 
     proc isFloatVal(v: Val) -> bool:

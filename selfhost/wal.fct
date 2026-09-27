@@ -454,20 +454,7 @@ app WalSelfHost:
 
     # ── frame envelope ─────────────────────────────────────────────────
     proc fqwCrc32(data: [int]) -> int:
-        let mut crc = 4294967295
-        let n = len(data)
-        let mut i = 0
-        loop i < n:
-            crc = crc ^ data[i]
-            let mut k = 0
-            loop k < 8:
-                if (crc & 1) == 1:
-                    crc = (crc >> 1) ^ 3988292384
-                else:
-                    crc = crc >> 1
-                k = k + 1
-            i = i + 1
-        return crc ^ 4294967295
+        return crc32(data, 0, len(data))
 
     proc fqwMaxPayload() -> int:
         return 67108864
@@ -627,30 +614,48 @@ app WalSelfHost:
         return ok
 
     # ── appending: WalHandle + append ───────────────────────────────────
-    # FqwHandle: WalHandle's one piece of state — whether the file ends
-    # without a newline (a tear at exactly its last byte), so the next
-    # line must be preceded by one (the splice guard).
+    # FqwHandle: WalHandle's state — whether the file ends without a
+    # newline (a tear at exactly its last byte), so the next line must be
+    # preceded by one (the splice guard); and where the next append goes
+    # (the file's length, -1 until it is first needed — an open, a
+    # rotation and recovery's truncation all leave it to be measured).
     struct FqwHandle:
         path: text
         needsSeparator: bool
+        size: int
 
     proc fqwOpen(path: text) -> FqwHandle uses io.file:
         let exists = fileExists(path)
         if !exists:
-            return FqwHandle{path: path, needsSeparator: false}
+            return FqwHandle{path: path, needsSeparator: false, size: -1}
         let src = readFile(path)
         let n = len(src)
         if n == 0:
-            return FqwHandle{path: path, needsSeparator: false}
-        return FqwHandle{path: path, needsSeparator: charAt(src, n - 1) != "\n"}
+            return FqwHandle{path: path, needsSeparator: false, size: -1}
+        return FqwHandle{path: path, needsSeparator: charAt(src, n - 1) != "\n", size: -1}
 
-    # fqwWriteLine: write_line — one durable (fsynced) append.
+    # fqwWriteLine: write_line — one append (wal::append: a write, not a
+    # durability boundary; fqwSync is, once per mutation, as wal::
+    # sync_pending is: an fsync costs the same for one record or a
+    # hundred, so a frame pays it once, after its COMMIT).
     proc fqwWriteLine(h: FqwHandle, encoded: text) -> FqwHandle uses io.file:
         let mut line = encoded + "\n"
         if h.needsSeparator:
             line = "\n" + line
-        let ok = appendFile(h.path, line)
-        return FqwHandle{path: h.path, needsSeparator: false}
+        let mut at = h.size
+        if at < 0:
+            at = fileSize(h.path)
+        if at < 0:
+            at = 0
+        let bs = textToBytes(line)
+        let ok = writeFileAt(h.path, at, bs)
+        return FqwHandle{path: h.path, needsSeparator: false, size: at + len(bs)}
+
+    # fqwSync: wal::sync_pending — everything appended so far made
+    # durable.
+    proc fqwSync(h: FqwHandle) -> bool uses io.file:
+        let ok = syncFile(h.path)
+        return ok
 
     struct FqwAppended:
         ok: bool

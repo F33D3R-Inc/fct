@@ -1,0 +1,1279 @@
+import "runtime_eval_ir.fct"
+import "render_markdown.fct"
+
+app RenderHTML:
+    # render_html.fct — runtime/server.go's renderer: the server-side first
+    # paint of one page (renderer.node and every helper it reaches —
+    # nodeAttrs/regionAttrs, renderSegs/attrText/segsToString, rows/
+    # listRowPath, eachOption, match/overlay/popover, link.go's linkHref/
+    # isAppRoute/safeExternalHref, classtext.go's classText), with the
+    # render's own bookkeeping: the rows every list region resolved to
+    # (`@regions`), which lists were cut off (`@more`), and — through
+    # runtime_eval_ir.fct's materializer — every aggregate it evaluated
+    # (`@aggs`).
+    #
+    # The render state (RtRender) is threaded through and returned, the same
+    # way RtScope is: HTML accumulates in `html`, the scope carries the
+    # materializer. A node is rendered at a render path (childPath / rowPath,
+    # the address the client recomputes) and at an ORDINAL base — the index
+    # its first agg/eget expression holds in Go's aggIndex walk, which is
+    # the page's static tree in preorder: for every node its seg lists
+    # (segs, label, placeholder, pathSegs, classSegs, alt, poster, each
+    # option's label), then cond, where, limit, val, a `use`'s args, then
+    # its children; after the page's view its bindings; then each component
+    # the page reaches, in declaration order (rtCompBases).
+    struct RtRender:
+        sc: RtScope
+        html: text
+        regKeys: [text]
+        regVals: [Val]
+        moreKeys: [text]
+        moreVals: [bool]
+
+    # RtPage: what one render reads and never changes.
+    struct RtPage:
+        g: IRGraph
+        page: IRPage
+        compBases: [int]
+        compUsed: [bool]
+        bindBase: int
+
+    proc rtChildPath(path: text, i: int) -> text:
+        return path + "/" + i
+
+    proc rtRowPath(base: text, row: Val) -> text:
+        let idv = do valGet(row, "id")
+        let id = do valToStr(idv)
+        return base + "#" + id
+
+    # ── the static walk's counts ────────────────────────────────────────
+    proc rtSegsAggCount(segs: [IRSeg]) -> int:
+        let mut n = 0
+        let mut i = 0
+        loop i < len(segs):
+            let c = do rtAggCountList(segs[i].expr)
+            n = n + c
+            i = i + 1
+        return n
+
+    # rtNodeSelfCount: the agg/eget expressions a node's own fields hold, in
+    # aggIndex's order.
+    proc rtNodeSelfCount(n: IRNode) -> int:
+        let a = do rtSegsAggCount(n.segs)
+        let b = do rtSegsAggCount(n.label)
+        let c = do rtSegsAggCount(n.placeholder)
+        let d = do rtSegsAggCount(n.pathSegs)
+        let e = do rtSegsAggCount(n.classSegs)
+        let f = do rtSegsAggCount(n.alt)
+        let g = do rtSegsAggCount(n.poster)
+        let mut o = 0
+        let mut i = 0
+        loop i < len(n.options):
+            let oc = do rtSegsAggCount(n.options[i].label)
+            o = o + oc
+            i = i + 1
+        let h = do rtAggCountList(n.cond)
+        let w = do rtAggCountList(n.where)
+        let l = do rtAggCountList(n.limit)
+        let v = do rtAggCountList(n.val)
+        let mut u = 0
+        if n.kind == "use":
+            let uc = do rtAggCountList(n.args)
+            u = uc
+        return a + b + c + d + e + f + g + o + h + w + l + v + u
+
+    proc rtNodesCount(ns: [IRNode]) -> int:
+        let mut n = 0
+        let mut i = 0
+        loop i < len(ns):
+            let c = do rtNodeCount(ns[i])
+            n = n + c
+            i = i + 1
+        return n
+
+    proc rtNodeCount(n: IRNode) -> int:
+        let s = do rtNodeSelfCount(n)
+        let c = do rtNodesCount(n.children)
+        return s + c
+
+    # rtBases: a node's expression bases, in the walk's order:
+    # [segs, label, placeholder, pathSegs, classSegs, alt, poster, options,
+    #  cond, where, limit, val, args, children].
+    proc rtBases(n: IRNode, base: int) -> [int]:
+        if base < 0:
+            return [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
+        let mut out = []
+        let mut b = base
+        out = append(out, b)
+        let a = do rtSegsAggCount(n.segs)
+        b = b + a
+        out = append(out, b)
+        let c1 = do rtSegsAggCount(n.label)
+        b = b + c1
+        out = append(out, b)
+        let c2 = do rtSegsAggCount(n.placeholder)
+        b = b + c2
+        out = append(out, b)
+        let c3 = do rtSegsAggCount(n.pathSegs)
+        b = b + c3
+        out = append(out, b)
+        let c4 = do rtSegsAggCount(n.classSegs)
+        b = b + c4
+        out = append(out, b)
+        let c5 = do rtSegsAggCount(n.alt)
+        b = b + c5
+        out = append(out, b)
+        let c6 = do rtSegsAggCount(n.poster)
+        b = b + c6
+        out = append(out, b)
+        let mut i = 0
+        loop i < len(n.options):
+            let oc = do rtSegsAggCount(n.options[i].label)
+            b = b + oc
+            i = i + 1
+        out = append(out, b)
+        let c7 = do rtAggCountList(n.cond)
+        b = b + c7
+        out = append(out, b)
+        let c8 = do rtAggCountList(n.where)
+        b = b + c8
+        out = append(out, b)
+        let c9 = do rtAggCountList(n.limit)
+        b = b + c9
+        out = append(out, b)
+        let c10 = do rtAggCountList(n.val)
+        b = b + c10
+        out = append(out, b)
+        if n.kind == "use":
+            let c11 = do rtAggCountList(n.args)
+            b = b + c11
+        out = append(out, b)
+        return out
+
+    # ── page setup ──────────────────────────────────────────────────────
+    # rtCompUsed: pageComponents — the components a page can reach, marked
+    # before the walk (a component is walked once, on first use).
+    proc rtCompUsed(g: IRGraph, page: IRPage) -> [bool]:
+        let mut used = []
+        let mut i = 0
+        loop i < len(g.components):
+            used = append(used, false)
+            i = i + 1
+        let u2 = do rtMarkUsed(g, page.view, used)
+        return u2
+
+    proc rtCompIndex(g: IRGraph, name: text) -> int:
+        let mut i = 0
+        loop i < len(g.components):
+            if g.components[i].name == name:
+                return i
+            i = i + 1
+        return -1
+
+    proc rtMarkUsed(g: IRGraph, ns: [IRNode], used0: [bool]) -> [bool]:
+        let mut used = used0
+        let mut i = 0
+        loop i < len(ns):
+            let nd = ns[i]
+            if nd.kind == "use":
+                let ci = do rtCompIndex(g, nd.name)
+                if ci >= 0 && !used[ci]:
+                    used[ci] = true
+                    used = do rtMarkUsed(g, g.components[ci].view, used)
+            used = do rtMarkUsed(g, nd.children, used)
+            i = i + 1
+        return used
+
+    # rtPageSetup: the ordinal bases of a page: its view from 0, its
+    # bindings after that, then each reached component in declaration
+    # order — aggIndex's walk.
+    proc rtPageSetup(g: IRGraph, page: IRPage) -> RtPage:
+        let used = do rtCompUsed(g, page)
+        let vc = do rtNodesCount(page.view)
+        let mut b = vc
+        let bindBase = b
+        let mut i = 0
+        loop i < len(page.bindings):
+            let bc = do rtAggCountList(page.bindings[i].expr)
+            b = b + bc
+            i = i + 1
+        let mut bases = []
+        let mut j = 0
+        loop j < len(g.components):
+            bases = append(bases, b)
+            if used[j]:
+                let cc = do rtNodesCount(g.components[j].view)
+                b = b + cc
+            j = j + 1
+        return RtPage{g: g, page: page, compBases: bases, compUsed: used, bindBase: bindBase}
+
+    proc rtRenderNew(sc: RtScope) -> RtRender:
+        return RtRender{sc: sc, html: "", regKeys: [], regVals: [], moreKeys: [], moreVals: []}
+
+    # ── lookups ─────────────────────────────────────────────────────────
+    proc rtIsStateCell(g: IRGraph, name: text) -> bool:
+        let mut i = 0
+        loop i < len(g.states):
+            if g.states[i].name == name:
+                return true
+            i = i + 1
+        return false
+
+    proc rtEntityIndex(g: IRGraph, name: text) -> int:
+        let mut i = 0
+        loop i < len(g.entities):
+            if g.entities[i].name == name:
+                return i
+            i = i + 1
+        return -1
+
+    proc rtBindingExpr(page: IRPage, id: text) -> [IRExpr]:
+        let mut i = 0
+        loop i < len(page.bindings):
+            if page.bindings[i].id == id:
+                return page.bindings[i].expr
+            i = i + 1
+        return []
+
+    proc rtBindingBase(pg: RtPage, id: text) -> int:
+        let mut b = pg.bindBase
+        let mut i = 0
+        loop i < len(pg.page.bindings):
+            if pg.page.bindings[i].id == id:
+                return b
+            let c = do rtAggCountList(pg.page.bindings[i].expr)
+            b = b + c
+            i = i + 1
+        return -1
+
+    # ── segments ────────────────────────────────────────────────────────
+    # rtSegsToString: segsToString — the plain flattening of interpolated
+    # segments (an attribute, a label, a route, richtext's source).
+    proc rtSegsToString(pg: RtPage, sc0: RtScope, segs: [IRSeg], base: int) -> RtOut:
+        let mut sc = sc0
+        let mut out = ""
+        let mut b = base
+        let mut i = 0
+        loop i < len(segs):
+            let sg = segs[i]
+            if sg.lit != "":
+                out = out + sg.lit
+            else:
+                if sg.bind != "":
+                    let be = do rtBindingExpr(pg.page, sg.bind)
+                    let bb = do rtBindingBase(pg, sg.bind)
+                    let br = do rtEvalOpt(be, sc, bb)
+                    sc = br.sc
+                    let bs = do valToStr(br.v)
+                    out = out + bs
+                else:
+                    if len(sg.expr) > 0:
+                        let er = do rtEval(sg.expr[0], sc, b)
+                        sc = er.sc
+                        let es = do valToStr(er.v)
+                        out = out + es
+            if b >= 0:
+                let c = do rtAggCountList(sg.expr)
+                b = b + c
+            i = i + 1
+        let tv = do textVal(out)
+        return RtOut{v: tv, sc: sc}
+
+    proc rtAttrText(pg: RtPage, sc0: RtScope, segs: [IRSeg], base: int) -> RtOut:
+        let r = do rtSegsToString(pg, sc0, segs, base)
+        let e = do rtEsc(r.v.t)
+        let tv = do textVal(e)
+        return RtOut{v: tv, sc: r.sc}
+
+    # rtRenderSegs: renderSegs — body text: a literal escaped, a bound
+    # segment in its data-fa-bind span, an expression escaped.
+    proc rtRenderSegs(pg: RtPage, rd0: RtRender, segs: [IRSeg], base: int) -> RtRender:
+        let mut rd = rd0
+        let mut b = base
+        let mut i = 0
+        loop i < len(segs):
+            let sg = segs[i]
+            if sg.lit != "":
+                rd.html = rd.html + rtEsc(sg.lit)
+            else:
+                if sg.e2e:
+                    let mut ciph = ""
+                    if sg.bind != "":
+                        let be0 = do rtBindingExpr(pg.page, sg.bind)
+                        let bb0 = do rtBindingBase(pg, sg.bind)
+                        let br0 = do rtEvalOpt(be0, rd.sc, bb0)
+                        rd.sc = br0.sc
+                        ciph = do valToStr(br0.v)
+                    else:
+                        let er0 = do rtEvalOpt(sg.expr, rd.sc, b)
+                        rd.sc = er0.sc
+                        ciph = do valToStr(er0.v)
+                    let mut bindAttr = ""
+                    if sg.bind != "":
+                        bindAttr = " data-fa-bind=\"" + sg.bind + "\""
+                    rd.html = rd.html + "<span class=\"fa-e2e\" data-fa-e2e=\"" + rtEsc(ciph) + "\"" + bindAttr + ">🔒</span>"
+                else:
+                    if sg.bind != "":
+                        let be = do rtBindingExpr(pg.page, sg.bind)
+                        let bb = do rtBindingBase(pg, sg.bind)
+                        let br = do rtEvalOpt(be, rd.sc, bb)
+                        rd.sc = br.sc
+                        let bs = do valToStr(br.v)
+                        rd.html = rd.html + "<span data-fa-bind=\"" + sg.bind + "\">" + rtEsc(bs) + "</span>"
+                    else:
+                        if len(sg.expr) > 0:
+                            let er = do rtEval(sg.expr[0], rd.sc, b)
+                            rd.sc = er.sc
+                            let es = do valToStr(er.v)
+                            rd.html = rd.html + rtEsc(es)
+            if b >= 0:
+                let c = do rtAggCountList(sg.expr)
+                b = b + c
+            i = i + 1
+        return rd
+
+    # ── attributes ──────────────────────────────────────────────────────
+    proc rtNodeAttrs(base: text, cls0: text, n: IRNode) -> text:
+        let mut cls = base
+        if cls0 != "":
+            if cls != "":
+                cls = cls + " "
+            cls = cls + cls0
+        let mut out = ""
+        if cls != "":
+            out = out + " class=\"" + rtEsc(cls) + "\""
+        if n.style != "":
+            out = out + " style=\"" + rtEsc(n.style) + "\""
+        if n.anchor != "":
+            out = out + " id=\"" + rtEsc(n.anchor) + "\""
+        return out
+
+    proc rtRegionAttrs(base: text, id: text, cls: text, n: IRNode) -> text:
+        let attrs = do rtNodeAttrs(base, cls, n)
+        if id == "":
+            return attrs
+        return " data-fa-region=\"" + id + "\"" + attrs
+
+    # rtClassToken: escapeClassToken — only [A-Za-z0-9_-] survive.
+    proc rtClassToken(s: text) -> text:
+        let bs = textToBytes(s)
+        let mut out = []
+        let mut i = 0
+        loop i < len(bs):
+            let c = bs[i]
+            if (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 45 || c == 95:
+                out = append(out, c)
+            i = i + 1
+        return bytesToText(out)
+
+    # rtClassText: classText — an interpolated class: literals verbatim,
+    # dynamic segments reduced to class tokens.
+    proc rtClassText(pg: RtPage, sc0: RtScope, segs: [IRSeg], base: int) -> RtOut:
+        let mut sc = sc0
+        let mut out = ""
+        let mut b = base
+        let mut i = 0
+        loop i < len(segs):
+            let sg = segs[i]
+            if len(sg.expr) == 0 && sg.bind == "":
+                out = out + sg.lit
+            else:
+                let r = do rtSegsToString(pg, sc, [sg], b)
+                sc = r.sc
+                out = out + rtClassToken(r.v.t)
+            if b >= 0:
+                let c = do rtAggCountList(sg.expr)
+                b = b + c
+            i = i + 1
+        let tv = do textVal(out)
+        return RtOut{v: tv, sc: sc}
+
+    # rtPathSegment: escapePathSegment — everything outside RFC 3986's
+    # unreserved set percent-encoded, uppercase hex.
+    proc rtPathSegment(s: text) -> text:
+        let hex = "0123456789ABCDEF"
+        let bs = textToBytes(s)
+        let mut out = ""
+        let mut i = 0
+        loop i < len(bs):
+            let c = bs[i]
+            if (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 45 || c == 46 || c == 95 || c == 126:
+                out = out + bytesToText([c])
+            else:
+                out = out + "%" + charAt(hex, c / 16) + charAt(hex, c % 16)
+            i = i + 1
+        return out
+
+    proc rtLinkHref(pg: RtPage, sc0: RtScope, segs: [IRSeg], base: int) -> RtOut:
+        let mut sc = sc0
+        let mut out = ""
+        let mut b = base
+        let mut i = 0
+        loop i < len(segs):
+            let sg = segs[i]
+            if len(sg.expr) == 0 && sg.bind == "":
+                out = out + sg.lit
+            else:
+                let r = do rtSegsToString(pg, sc, [sg], b)
+                sc = r.sc
+                out = out + rtPathSegment(r.v.t)
+            if b >= 0:
+                let c = do rtAggCountList(sg.expr)
+                b = b + c
+            i = i + 1
+        let tv = do textVal(out)
+        return RtOut{v: tv, sc: sc}
+
+    # ── routes ──────────────────────────────────────────────────────────
+    proc rtTrimSlashes(s: text) -> text:
+        let mut a = 0
+        let mut z = len(s)
+        loop a < z && charAt(s, a) == "/":
+            a = a + 1
+        loop z > a && charAt(s, z - 1) == "/":
+            z = z - 1
+        return slice(s, a, z)
+
+    # rtPathUnescape: url.PathUnescape — %XX decoded; a malformed escape
+    # leaves the segment as it was.
+    proc rtPathUnescape(s: text) -> text:
+        let bs = textToBytes(s)
+        let mut out = []
+        let mut i = 0
+        loop i < len(bs):
+            let c = bs[i]
+            if c == 37:
+                if i + 2 >= len(bs):
+                    return s
+                let h = do rtHexVal(bs[i + 1])
+                let l = do rtHexVal(bs[i + 2])
+                if h < 0 || l < 0:
+                    return s
+                out = append(out, h * 16 + l)
+                i = i + 3
+            else:
+                out = append(out, c)
+                i = i + 1
+        return bytesToText(out)
+
+    proc rtHexVal(c: int) -> int:
+        if c >= 48 && c <= 57:
+            return c - 48
+        if c >= 97 && c <= 102:
+            return c - 87
+        if c >= 65 && c <= 70:
+            return c - 55
+        return -1
+
+    # RtMatch: matchRoute's answer — ok, and the bound `:param`s.
+    struct RtMatch:
+        ok: bool
+        names: [text]
+        vals: [text]
+
+    proc rtMatchRoute(pattern: text, path: text) -> RtMatch:
+        let ps = split(rtTrimSlashes(pattern), "/")
+        let cs = split(rtTrimSlashes(path), "/")
+        if len(ps) != len(cs):
+            return RtMatch{ok: false, names: [], vals: []}
+        let mut names = []
+        let mut vals = []
+        let mut i = 0
+        loop i < len(ps):
+            let p = ps[i]
+            if len(p) > 0 && charAt(p, 0) == ":":
+                if cs[i] == "":
+                    return RtMatch{ok: false, names: [], vals: []}
+                names = append(names, slice(p, 1, len(p)))
+                vals = append(vals, rtPathUnescape(cs[i]))
+            else:
+                if p != cs[i]:
+                    return RtMatch{ok: false, names: [], vals: []}
+            i = i + 1
+        return RtMatch{ok: true, names: names, vals: vals}
+
+    proc rtHrefPath(href: text) -> text:
+        let i = do rtIndexOfText(href, "#")
+        if i >= 0:
+            return slice(href, 0, i)
+        return href
+
+    proc rtIndexOfText(s: text, sub: text) -> int:
+        let n = len(s)
+        let m = len(sub)
+        let mut i = 0
+        loop i + m <= n:
+            if slice(s, i, i + m) == sub:
+                return i
+            i = i + 1
+        return -1
+
+    proc rtIsAppRoute(g: IRGraph, href: text) -> bool:
+        let path = do rtHrefPath(href)
+        if path == "":
+            return false
+        let mut i = 0
+        loop i < len(g.routes):
+            let m = do rtMatchRoute(g.routes[i].path, path)
+            if m.ok:
+                return true
+            i = i + 1
+        return false
+
+    proc rtHasPrefixFold(s: text, prefix: text) -> bool:
+        if len(s) < len(prefix):
+            return false
+        return lower(slice(s, 0, len(prefix))) == lower(prefix)
+
+    proc rtSafeExternalHref(href: text) -> bool:
+        let schemes = ["https://", "http://"]
+        let mut k = 0
+        loop k < 2:
+            let sch = schemes[k]
+            let has = do rtHasPrefixFold(href, sch)
+            if has:
+                let rest = slice(href, len(sch), len(href))
+                let mut i = 0
+                loop i < len(rest):
+                    let c = charAt(rest, i)
+                    if c == "/" || c == "?" || c == "#":
+                        return i > 0
+                    i = i + 1
+                return rest != ""
+            k = k + 1
+        let mail = do rtHasPrefixFold(href, "mailto:")
+        if mail:
+            return len(href) > 7
+        return false
+
+    # ── media ───────────────────────────────────────────────────────────
+    # rtMediaSrc: mediaSrc with signing off — a durable /uploads/ reference
+    # normalized (query and fragment dropped), anything else untouched.
+    proc rtMediaSrc(v: text) -> text:
+        let t = trim(v)
+        let pre = do rtHasPrefixFold(t, "/uploads/")
+        if !pre || slice(t, 0, 9) != "/uploads/":
+            return v
+        let mut name = slice(t, 9, len(t))
+        let q = do rtIndexOfText(name, "?")
+        let h = do rtIndexOfText(name, "#")
+        let mut cut = len(name)
+        if q >= 0 && q < cut:
+            cut = q
+        if h >= 0 && h < cut:
+            cut = h
+        name = slice(name, 0, cut)
+        let sl = do rtIndexOfText(name, "/")
+        let bsl = do rtIndexOfText(name, "\\")
+        let dd = do rtIndexOfText(name, "..")
+        if name == "" || sl >= 0 || bsl >= 0 || dd >= 0:
+            return v
+        return "/uploads/" + name
+
+    # ── rows ────────────────────────────────────────────────────────────
+    # rtSelectRows: selectRows — filter by `where` per row (the
+    # materializer suspended), order, cap. The entity path (listRows via the
+    # store) answers the same rows in the same order.
+    proc rtSelectRows(rows: [Val], n: IRNode, sc0: RtScope, bases: [int], store: bool) -> RtOut:
+        let mut sc = sc0
+        let mut filtered = rows
+        if len(n.where) > 0:
+            let fr = do rtFilterRows(rows, n.itemVar, n.where[0], sc, bases[9])
+            sc = fr.sc
+            filtered = fr.v.items
+        let mut out = filtered
+        if store:
+            out = do rtStoreSortRows(filtered, n.order, n.desc)
+        else:
+            out = do rtSortRows(filtered, n.order, n.desc)
+        if len(n.limit) > 0:
+            let lr = do rtEval(n.limit[0], sc, bases[10])
+            sc = lr.sc
+            let lim = do valToInt(lr.v)
+            if lim > 0 && len(out) > lim:
+                out = slice(out, 0, lim)
+        let lv = do listVal(out)
+        return RtOut{v: lv, sc: sc}
+
+    # rtStoreSortRows: memStore.Query's order — by the field (lessVal), a
+    # tie broken by id; no field means by id; `desc` reverses the whole.
+    proc rtStoreLess(a: Val, b: Val, order: text) -> bool:
+        let ai = do valGet(a, "id")
+        let bi = do valGet(b, "id")
+        let x = do valToInt(ai)
+        let y = do valToInt(bi)
+        if order == "":
+            return x < y
+        let av = do valGet(a, order)
+        let bv = do valGet(b, order)
+        let sa = do valToStr(av)
+        let sb = do valToStr(bv)
+        let l1 = do rtLess(av, bv)
+        let l2 = do rtLess(bv, av)
+        if sa == sb && l1 == l2:
+            return x < y
+        return l1
+
+    proc rtStoreSortRows(rows: [Val], order: text, desc: bool) -> [Val]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(rows):
+            let r = rows[i]
+            let mut j = len(out)
+            let mut placed = false
+            loop j > 0 && !placed:
+                let after = do rtStoreLess(r, out[j - 1], order)
+                if after:
+                    j = j - 1
+                else:
+                    placed = true
+            out = slice(out, 0, j) + [r] + slice(out, j, len(out))
+            i = i + 1
+        if !desc:
+            return out
+        let mut rev = []
+        let mut k = len(out) - 1
+        loop k >= 0:
+            rev = append(rev, out[k])
+            k = k - 1
+        return rev
+
+    # RtRows: listRowsMore's answer, with the scope it left.
+    struct RtRows:
+        rows: [Val]
+        more: bool
+        sc: RtScope
+
+    proc rtListRowsMore(pg: RtPage, sc0: RtScope, n: IRNode, bases: [int]) -> RtRows:
+        let mut sc = sc0
+        let coll = do rtGet(sc, n.coll)
+        let ei = do rtEntityIndex(pg.g, n.coll)
+        # A table's rows come back from the store (memStore.Query: ordered by
+        # the field, then by id, the whole order reversed for `desc`); a
+        # `[T]` state cell's are selected in memory (selectRows' stable sort).
+        let mut store = ei >= 0
+        if ei >= 0 && pg.g.entities[ei].ephemeral:
+            store = false
+        # applyReadPolicy: a table's `read:` clause joins the predicate.
+        let mut probe0 = n
+        if ei >= 0:
+            let rp = do rtReadPolicyOf(n.coll)
+            if len(rp) > 0:
+                let bound = do rtRenameRowVar(rp[0], n.itemVar)
+                if len(n.where) > 0:
+                    probe0.where = [irBin("&&", bound, n.where[0])]
+                else:
+                    probe0.where = [bound]
+        if store && len(probe0.where) > 0:
+            # splitPredicate's foldOuter: the outer parts of the predicate are
+            # evaluated once, here, at the list's path (see rtFoldOuter). The
+            # policy's parts are not in the page's index (base -1).
+            if len(n.where) > 0:
+                let folded = do rtFoldOuter(n.where[0], n.itemVar, sc, bases[9])
+                sc = folded
+            let rp2 = do rtReadPolicyOf(n.coll)
+            if len(rp2) > 0:
+                let bound2 = do rtRenameRowVar(rp2[0], n.itemVar)
+                let folded2 = do rtFoldOuter(bound2, n.itemVar, sc, -1)
+                sc = folded2
+        if n.more == "" || len(n.limit) == 0:
+            if ei >= 0 && len(n.limit) > 0:
+                # listRows' store path: `limit 0` asks for nothing.
+                let lr0 = do rtEval(n.limit[0], sc, bases[10])
+                let lim0 = do valToInt(lr0.v)
+                if lim0 <= 0:
+                    return RtRows{rows: [], more: false, sc: lr0.sc}
+            let r = do rtSelectRows(coll.items, probe0, sc, bases, store)
+            return RtRows{rows: r.v.items, more: false, sc: r.sc}
+        let lr = do rtEval(n.limit[0], sc, bases[10])
+        sc = lr.sc
+        let limit = do valToInt(lr.v)
+        if limit <= 0:
+            return RtRows{rows: [], more: false, sc: sc}
+        let mut probe = probe0
+        probe.limit = [irLit("" + (limit + 1), "int")]
+        let r2 = do rtSelectRows(coll.items, probe, sc, bases, store)
+        if len(r2.v.items) > limit:
+            return RtRows{rows: slice(r2.v.items, 0, limit), more: true, sc: r2.sc}
+        return RtRows{rows: r2.v.items, more: false, sc: r2.sc}
+
+    # rtRows: renderer.rows — the rows a repeating node renders, recorded
+    # under its render path when they are a table's.
+    proc rtRows(pg: RtPage, rd0: RtRender, n: IRNode, path: text, bases: [int]) -> RtRender:
+        let mut rd = rd0
+        let rr = do rtListRowsMore(pg, rd.sc, n, bases)
+        rd.sc = rr.sc
+        if n.more != "":
+            rd.moreKeys = append(rd.moreKeys, path)
+            rd.moreVals = append(rd.moreVals, rr.more)
+        let ei = do rtEntityIndex(pg.g, n.coll)
+        # visibleRowList: the fields this actor may not read leave the rows
+        # before the HTML is built and before the client receives them.
+        let mut rows = rr.rows
+        if ei >= 0:
+            rows = do rtVisibleRows(n.coll, rr.rows, rd.sc, false)
+            let lv = do listVal(rows)
+            rd.regKeys = append(rd.regKeys, path)
+            rd.regVals = append(rd.regVals, lv)
+        rd.sc = do rtSet(rd.sc, "@rows", listVal(rows))
+        return rd
+
+    proc rtListRowPath(pg: RtPage, n: IRNode, path: text, i: int, row: Val) -> text:
+        let st = do rtIsStateCell(pg.g, n.coll)
+        if st:
+            let cp = do rtChildPath(path, i)
+            let rp = do rtRowPath(cp, row)
+            return rp
+        let rp2 = do rtRowPath(path, row)
+        return rp2
+
+    proc rtActiveTab(n: IRNode, sc: RtScope) -> text:
+        let cv = do rtGet(sc, n.bind)
+        let cur = do valToStr(cv)
+        let mut i = 0
+        loop i < len(n.children):
+            if n.children[i].value == cur:
+                return cur
+            i = i + 1
+        if len(n.children) > 0:
+            return n.children[0].value
+        return cur
+
+    proc rtHeadingLevel(v: Val) -> int:
+        let n = do valToInt(v)
+        if n < 1:
+            return 1
+        if n > 6:
+            return 6
+        return n
+
+    proc rtOptionRegionID(n: IRNode) -> text:
+        if len(n.children) == 0:
+            return ""
+        return n.id
+
+    proc rtCoerce(v: Val, typ: text) -> Val:
+        if typ == "int" || typ == "money" || typ == "date":
+            if v.kind == "int":
+                return v
+            let iv = do intVal(valToInt(v))
+            return iv
+        if typ == "float":
+            if v.kind == "float":
+                return v
+            let fv = do floatVal(valToFloat(v))
+            return fv
+        if typ == "bool":
+            if v.kind == "bool":
+                return v
+            let bv = do boolVal(valTruthy(v))
+            return bv
+        if typ == "text" || typ == "datetime":
+            if v.kind == "text":
+                return v
+            let tv = do textVal(valToStr(v))
+            return tv
+        return v
+
+    proc rtUseNeedsElement(n: IRNode) -> bool:
+        return n.id != "" || n.class != "" || len(n.classSegs) > 0 || n.style != "" || n.anchor != ""
+
+    # ── options ─────────────────────────────────────────────────────────
+    # RtOptions: eachOption's choices — values and labels, in source order.
+    struct RtOptions:
+        values: [text]
+        labels: [text]
+        rd: RtRender
+
+    proc rtEachOption(pg: RtPage, rd0: RtRender, n: IRNode, path: text, bases: [int]) -> RtOptions:
+        let mut rd = rd0
+        let mut values = []
+        let mut labels = []
+        let mut b = bases[7]
+        let mut i = 0
+        loop i < len(n.options):
+            let o = n.options[i]
+            let lr = do rtSegsToString(pg, rd.sc, o.label, b)
+            rd.sc = lr.sc
+            values = append(values, o.value)
+            labels = append(labels, lr.v.t)
+            if b >= 0:
+                let c = do rtSegsAggCount(o.label)
+                b = b + c
+            i = i + 1
+        let mut cb = bases[13]
+        let mut j = 0
+        loop j < len(n.children):
+            let c = n.children[j]
+            let cpath = do rtChildPath(path, j)
+            let cbases = do rtBases(c, cb)
+            if c.kind != "options":
+                let ov = do rtOptionValue(rd.sc, c, cbases)
+                rd.sc = ov.sc
+                let lr2 = do rtSegsToString(pg, rd.sc, c.label, cbases[1])
+                rd.sc = lr2.sc
+                values = append(values, ov.v.t)
+                labels = append(labels, lr2.v.t)
+            else:
+                rd = do rtRows(pg, rd, c, path, cbases)
+                let rows = do rtGet(rd.sc, "@rows")
+                let mut k = 0
+                loop k < len(rows.items):
+                    let r = rows.items[k]
+                    let mut saved = rd.sc
+                    let mut bound = do rtSet(rd.sc, c.itemVar, r)
+                    bound.matPath = do rtListRowPath(pg, c, cpath, k, r)
+                    let ov2 = do rtOptionValue(bound, c, cbases)
+                    let lr3 = do rtSegsToString(pg, ov2.sc, c.label, cbases[1])
+                    values = append(values, ov2.v.t)
+                    labels = append(labels, lr3.v.t)
+                    saved.matKeys = lr3.sc.matKeys
+                    saved.matVals = lr3.sc.matVals
+                    rd.sc = saved
+                    k = k + 1
+                let mut reset = rd.sc
+                reset.matPath = path
+                rd.sc = reset
+            if cb >= 0:
+                let cc = do rtNodeCount(c)
+                cb = cb + cc
+            j = j + 1
+        return RtOptions{values: values, labels: labels, rd: rd}
+
+    proc rtOptionValue(sc0: RtScope, n: IRNode, bases: [int]) -> RtOut:
+        if len(n.val) > 0:
+            let r = do rtEval(n.val[0], sc0, bases[11])
+            let tv = do textVal(valToStr(r.v))
+            return RtOut{v: tv, sc: r.sc}
+        let tv2 = do textVal(n.value)
+        return RtOut{v: tv2, sc: sc0}
+
+    # ── the walk ────────────────────────────────────────────────────────
+    proc rtChildren(pg: RtPage, rd0: RtRender, nodes: [IRNode], path: text, base: int) -> RtRender:
+        let mut rd = rd0
+        let mut b = base
+        let mut i = 0
+        loop i < len(nodes):
+            let cp = do rtChildPath(path, i)
+            rd = do rtNode(pg, rd, nodes[i], cp, b)
+            if b >= 0:
+                let c = do rtNodeCount(nodes[i])
+                b = b + c
+            i = i + 1
+        return rd
+
+    proc rtMatch(pg: RtPage, rd0: RtRender, n: IRNode, path: text, bases: [int]) -> RtRender:
+        let mut rd = rd0
+        let cr = do rtEvalOpt(n.cond, rd.sc, bases[8])
+        rd.sc = cr.sc
+        let val = do valToStr(cr.v)
+        let mut cb = bases[13]
+        let mut i = 0
+        loop i < len(n.children):
+            let cs = n.children[i]
+            if cs.kind == "case" && cs.value == val:
+                let cp = do rtChildPath(path, i)
+                let cbases = do rtBases(cs, cb)
+                let r = do rtChildren(pg, rd, cs.children, cp, cbases[13])
+                return r
+            if cb >= 0:
+                let cc = do rtNodeCount(cs)
+                cb = cb + cc
+            i = i + 1
+        let mut eb = bases[13]
+        let mut j = 0
+        loop j < len(n.children):
+            let cs2 = n.children[j]
+            if cs2.kind == "else":
+                let cp2 = do rtChildPath(path, j)
+                let ebases = do rtBases(cs2, eb)
+                let r2 = do rtChildren(pg, rd, cs2.children, cp2, ebases[13])
+                return r2
+            if eb >= 0:
+                let cc2 = do rtNodeCount(cs2)
+                eb = eb + cc2
+            j = j + 1
+        return rd
+
+    # rtNode: renderer.node — one IR node to HTML.
+    proc rtNode(pg: RtPage, rd0: RtRender, n0: IRNode, path: text, base: int) -> RtRender:
+        let mut rd = rd0
+        let mut n = n0
+        let mut entered = rd.sc
+        entered.matPath = path
+        rd.sc = entered
+        let bases = do rtBases(n, base)
+        if len(n.classSegs) > 0:
+            let ct = do rtClassText(pg, rd.sc, n.classSegs, bases[4])
+            rd.sc = ct.sc
+            n.class = ct.v.t
+        let kind = n.kind
+        if kind == "box" || kind == "row":
+            let mut cls = "fa-box"
+            if kind == "row":
+                cls = "fa-row"
+            rd.html = rd.html + "<div" + rtNodeAttrs(cls, n.class, n) + ">"
+            rd = do rtChildren(pg, rd, n.children, path, bases[13])
+            rd.html = rd.html + "</div>"
+            return rd
+        if kind == "text" || kind == "badge":
+            let mut cls2 = "fa-text"
+            if kind == "badge":
+                cls2 = "fa-badge"
+            rd.html = rd.html + "<span" + rtNodeAttrs(cls2, n.class, n) + ">"
+            rd = do rtRenderSegs(pg, rd, n.segs, bases[0])
+            rd.html = rd.html + "</span>"
+            return rd
+        if kind == "heading":
+            let lr = do rtEvalOpt(n.level, rd.sc, -1)
+            rd.sc = lr.sc
+            let lvl = do rtHeadingLevel(lr.v)
+            rd.html = rd.html + "<h" + lvl + rtNodeAttrs("fa-heading", n.class, n) + ">"
+            rd = do rtRenderSegs(pg, rd, n.segs, bases[0])
+            rd.html = rd.html + "</h" + lvl + ">"
+            return rd
+        if kind == "image":
+            let sr = do rtSegsToString(pg, rd.sc, n.segs, bases[0])
+            let ar = do rtAttrText(pg, sr.sc, n.alt, bases[5])
+            rd.sc = ar.sc
+            rd.html = rd.html + "<img" + rtNodeAttrs("fa-image", n.class, n) + " src=\"" + rtEsc(rtMediaSrc(sr.v.t)) + "\" alt=\"" + ar.v.t + "\">"
+            return rd
+        if kind == "icon":
+            let ir = do rtAttrText(pg, rd.sc, n.segs, bases[0])
+            rd.sc = ir.sc
+            rd.html = rd.html + "<span" + rtNodeAttrs("fa-icon", n.class, n) + " data-fa-icon=\"" + ir.v.t + "\" aria-hidden=\"true\"></span>"
+            return rd
+        if kind == "video":
+            let nr = do rtAttrText(pg, rd.sc, n.alt, bases[5])
+            rd.sc = nr.sc
+            let mut aria = ""
+            if nr.v.t != "":
+                aria = " aria-label=\"" + nr.v.t + "\""
+            let mut extra = ""
+            if len(n.poster) > 0:
+                let pr = do rtSegsToString(pg, rd.sc, n.poster, bases[6])
+                rd.sc = pr.sc
+                if pr.v.t != "":
+                    extra = extra + " poster=\"" + rtEsc(rtMediaSrc(pr.v.t)) + "\""
+            if n.autoplay:
+                extra = extra + " autoplay playsinline"
+            if n.loopFlag:
+                extra = extra + " loop"
+            if n.muted:
+                extra = extra + " muted"
+            let vsr = do rtSegsToString(pg, rd.sc, n.segs, bases[0])
+            rd.sc = vsr.sc
+            rd.html = rd.html + "<video" + rtNodeAttrs("fa-video", n.class, n) + " controls src=\"" + rtEsc(rtMediaSrc(vsr.v.t)) + "\"" + extra + aria + "></video>"
+            return rd
+        if kind == "richtext":
+            let rsr = do rtSegsToString(pg, rd.sc, n.segs, bases[0])
+            rd.sc = rsr.sc
+            let md = do rtMarkdownHTML(rsr.v.t)
+            rd.html = rd.html + "<div" + rtNodeAttrs("fa-richtext", n.class, n) + ">" + md + "</div>"
+            return rd
+        if kind == "tabs":
+            let active = do rtActiveTab(n, rd.sc)
+            rd.html = rd.html + "<div" + rtRegionAttrs("fa-tabs", n.id, n.class, n) + ">"
+            rd.html = rd.html + "<div class=\"fa-tabstrip\" role=\"tablist\">"
+            let mut tb = bases[13]
+            let mut i = 0
+            loop i < len(n.children):
+                let t = n.children[i]
+                let mut sel = ""
+                if t.value == active:
+                    sel = " aria-selected=\"true\""
+                let tbases = do rtBases(t, tb)
+                let tl = do rtAttrText(pg, rd.sc, t.label, tbases[1])
+                rd.sc = tl.sc
+                rd.html = rd.html + "<button class=\"fa-tab\" role=\"tab\"" + sel + " data-fa-tab=\"" + rtEsc(t.value) + "\" data-fa-tab-bind=\"" + rtEsc(n.bind) + "\">" + tl.v.t + "</button>"
+                if tb >= 0:
+                    let tc = do rtNodeCount(t)
+                    tb = tb + tc
+                i = i + 1
+            rd.html = rd.html + "</div>"
+            let mut tb2 = bases[13]
+            let mut j = 0
+            loop j < len(n.children):
+                let t2 = n.children[j]
+                if t2.value == active:
+                    let cp = do rtChildPath(path, j)
+                    let tbases2 = do rtBases(t2, tb2)
+                    rd = do rtChildren(pg, rd, t2.children, cp, tbases2[13])
+                if tb2 >= 0:
+                    let tc2 = do rtNodeCount(t2)
+                    tb2 = tb2 + tc2
+                j = j + 1
+            rd.html = rd.html + "</div>"
+            return rd
+        if kind == "button":
+            rd.html = rd.html + "<button" + rtNodeAttrs("", n.class, n) + " data-fa-action=\"" + rtEsc(n.action) + "\">"
+            rd = do rtRenderSegs(pg, rd, n.segs, bases[0])
+            rd.html = rd.html + "</button>"
+            return rd
+        if kind == "list":
+            rd = do rtRows(pg, rd, n, path, bases)
+            let rows = do rtGet(rd.sc, "@rows")
+            rd.html = rd.html + "<div" + rtRegionAttrs("", n.id, n.class, n) + ">"
+            let mut k = 0
+            loop k < len(rows.items):
+                let r = rows.items[k]
+                let mut saved = rd.sc
+                let bound2 = do rtSet(rd.sc, n.itemVar, r)
+                rd.sc = bound2
+                let rp = do rtListRowPath(pg, n, path, k, r)
+                rd = do rtChildren(pg, rd, n.children, rp, bases[13])
+                saved.matKeys = rd.sc.matKeys
+                saved.matVals = rd.sc.matVals
+                saved.matPath = path
+                rd.sc = saved
+                k = k + 1
+            if n.more != "":
+                let mut cut = false
+                let mut m = 0
+                loop m < len(rd.moreKeys):
+                    if rd.moreKeys[m] == path:
+                        cut = rd.moreVals[m]
+                    m = m + 1
+                if cut:
+                    rd.html = rd.html + "<button type=\"button\" class=\"fa-more\" data-fa-more=\"" + rtEsc(n.more) + "\">More</button>"
+            rd.html = rd.html + "</div>"
+            return rd
+        if kind == "stage":
+            rd.html = rd.html + "<canvas" + rtRegionAttrs("fa-stage", n.id, n.class, n) + " width=\"" + n.width + "\" height=\"" + n.height + "\"></canvas>"
+            let mut sb = bases[13]
+            let mut si = 0
+            loop si < len(n.children):
+                let sp = n.children[si]
+                let spath = do rtChildPath(path, si)
+                let sbases = do rtBases(sp, sb)
+                rd = do rtRows(pg, rd, sp, spath, sbases)
+                if sb >= 0:
+                    let sc0 = do rtNodeCount(sp)
+                    sb = sb + sc0
+                si = si + 1
+            return rd
+        if kind == "if":
+            let cr = do rtEvalOpt(n.cond, rd.sc, bases[8])
+            rd.sc = cr.sc
+            let show = do valTruthy(cr.v)
+            if n.id == "":
+                if show:
+                    rd = do rtChildren(pg, rd, n.children, path, bases[13])
+                return rd
+            rd.html = rd.html + "<div" + rtRegionAttrs("", n.id, n.class, n) + " style=\"display:contents\">"
+            if show:
+                rd = do rtChildren(pg, rd, n.children, path, bases[13])
+            rd.html = rd.html + "</div>"
+            return rd
+        if kind == "match":
+            rd.html = rd.html + "<div" + rtRegionAttrs("", n.id, n.class, n) + ">"
+            rd = do rtMatch(pg, rd, n, path, bases)
+            rd.html = rd.html + "</div>"
+            return rd
+        if kind == "input":
+            let bv = do rtGet(rd.sc, n.bind)
+            let val = do rtEsc(valToStr(bv))
+            let mut secret = ""
+            if n.value != "":
+                secret = " type=\"password\" autocomplete=\"" + rtEsc(n.value) + "\""
+            let mut onchange = ""
+            if n.action != "":
+                onchange = " data-fa-action=\"" + rtEsc(n.action) + "\" data-fa-debounce=\"" + n.debounce + "\""
+            let pr = do rtAttrText(pg, rd.sc, n.placeholder, bases[2])
+            rd.sc = pr.sc
+            rd.html = rd.html + "<input" + rtNodeAttrs("", n.class, n) + secret + " data-fa-input=\"" + n.bind + "\" value=\"" + val + "\" placeholder=\"" + pr.v.t + "\"" + onchange + ">"
+            return rd
+        if kind == "textarea":
+            let bv2 = do rtGet(rd.sc, n.bind)
+            let pr2 = do rtAttrText(pg, rd.sc, n.placeholder, bases[2])
+            rd.sc = pr2.sc
+            rd.html = rd.html + "<textarea" + rtNodeAttrs("fa-textarea", n.class, n) + " data-fa-input=\"" + rtEsc(n.bind) + "\" placeholder=\"" + pr2.v.t + "\">" + rtEsc(valToStr(bv2)) + "</textarea>"
+            return rd
+        if kind == "checkbox":
+            let mut cbase = "fa-checkbox"
+            let mut role = ""
+            if n.value == "switch":
+                cbase = "fa-toggle"
+                role = " role=\"switch\""
+            let bv3 = do rtGet(rd.sc, n.bind)
+            let on = do valTruthy(bv3)
+            let mut checked = ""
+            if on:
+                checked = " checked"
+            let lr3 = do rtAttrText(pg, rd.sc, n.label, bases[1])
+            rd.sc = lr3.sc
+            rd.html = rd.html + "<label" + rtNodeAttrs(cbase, n.class, n) + "><input type=\"checkbox\" data-fa-input=\"" + rtEsc(n.bind) + "\"" + role + checked + "><span>" + lr3.v.t + "</span></label>"
+            return rd
+        if kind == "radio":
+            rd.html = rd.html + "<div" + rtRegionAttrs("fa-radio", rtOptionRegionID(n), n.class, n) + " role=\"radiogroup\">"
+            let cv = do rtGet(rd.sc, n.bind)
+            let cur = do valToStr(cv)
+            let opts = do rtEachOption(pg, rd, n, path, bases)
+            rd = opts.rd
+            let mut oi = 0
+            loop oi < len(opts.values):
+                let mut chk = ""
+                if opts.values[oi] == cur:
+                    chk = " checked"
+                rd.html = rd.html + "<label class=\"fa-radio-option\"><input type=\"radio\" name=\"" + rtEsc(n.bind) + "\" value=\"" + rtEsc(opts.values[oi]) + "\" data-fa-input=\"" + rtEsc(n.bind) + "\"" + chk + "><span>" + rtEsc(opts.labels[oi]) + "</span></label>"
+                oi = oi + 1
+            rd.html = rd.html + "</div>"
+            return rd
+        if kind == "after":
+            return rd
+        if kind == "overlay" || kind == "popover":
+            rd.html = rd.html + "<div" + rtRegionAttrs("", n.id, n.class, n) + ">"
+            let ov = do rtGet(rd.sc, n.bind)
+            let open = do valTruthy(ov)
+            if open:
+                if kind == "overlay":
+                    rd.html = rd.html + "<div class=\"fa-overlay-backdrop\" data-fa-close=\"" + rtEsc(n.bind) + "\"><div class=\"fa-overlay-panel\">"
+                    rd = do rtChildren(pg, rd, n.children, path, bases[13])
+                    rd.html = rd.html + "</div></div>"
+                else:
+                    rd.html = rd.html + "<div class=\"fa-popover-backdrop\" data-fa-close=\"" + rtEsc(n.bind) + "\"></div><div class=\"fa-popover-panel\">"
+                    rd = do rtChildren(pg, rd, n.children, path, bases[13])
+                    rd.html = rd.html + "</div>"
+            rd.html = rd.html + "</div>"
+            return rd
+        if kind == "typeahead":
+            let listID = "ta-" + n.id
+            let tv = do rtGet(rd.sc, n.bind)
+            let tpr = do rtAttrText(pg, rd.sc, n.placeholder, bases[2])
+            rd.sc = tpr.sc
+            rd.html = rd.html + "<input class=\"fa-typeahead\" data-fa-input=\"" + n.bind + "\" list=\"" + listID + "\" value=\"" + rtEsc(valToStr(tv)) + "\" placeholder=\"" + tpr.v.t + "\">"
+            rd.html = rd.html + "<datalist id=\"" + listID + "\">"
+            let coll = do rtGet(rd.sc, n.coll)
+            let vals = do rtDistinctFieldValues(coll, n.value)
+            let mut di = 0
+            loop di < len(vals):
+                rd.html = rd.html + "<option value=\"" + rtEsc(vals[di]) + "\">"
+                di = di + 1
+            rd.html = rd.html + "</datalist>"
+            return rd
+        if kind == "link":
+            let ll = do rtAttrText(pg, rd.sc, n.label, bases[1])
+            rd.sc = ll.sc
+            let label = ll.v.t
+            let mut href = n.path
+            if n.route:
+                let hr = do rtSegsToString(pg, rd.sc, n.pathSegs, bases[3])
+                rd.sc = hr.sc
+                href = hr.v.t
+                let isRoute = do rtIsAppRoute(pg.g, href)
+                if !isRoute:
+                    rd.html = rd.html + "<span" + rtNodeAttrs("fa-link", n.class, n) + ">" + label + "</span>"
+                    return rd
+            else:
+                if len(n.pathSegs) > 0:
+                    let lh = do rtLinkHref(pg, rd.sc, n.pathSegs, bases[3])
+                    rd.sc = lh.sc
+                    href = lh.v.t
+            let mut rel = ""
+            if n.external:
+                let safe = do rtSafeExternalHref(href)
+                if !safe:
+                    rd.html = rd.html + "<span" + rtNodeAttrs("fa-link", n.class, n) + ">" + label + "</span>"
+                    return rd
+                rel = " rel=\"noopener noreferrer\""
+            rd.html = rd.html + "<a" + rtNodeAttrs("fa-link", n.class, n) + " href=\"" + rtEsc(href) + "\"" + rel + ">" + label + "</a>"
+            return rd
+        if kind == "select":
+            rd.html = rd.html + "<select" + rtRegionAttrs("fa-select", rtOptionRegionID(n), n.class, n) + " data-fa-input=\"" + n.bind + "\">"
+            let scv = do rtGet(rd.sc, n.bind)
+            let scur = do valToStr(scv)
+            let sopts = do rtEachOption(pg, rd, n, path, bases)
+            rd = sopts.rd
+            let mut so = 0
+            loop so < len(sopts.values):
+                let mut sel2 = ""
+                if sopts.values[so] == scur:
+                    sel2 = " selected"
+                rd.html = rd.html + "<option value=\"" + rtEsc(sopts.values[so]) + "\"" + sel2 + ">" + rtEsc(sopts.labels[so]) + "</option>"
+                so = so + 1
+            rd.html = rd.html + "</select>"
+            return rd
+        if kind == "form":
+            rd.html = rd.html + "<form" + rtNodeAttrs("fa-form", n.class, n) + " data-fa-form=\"" + rtEsc(n.action) + "\">"
+            rd = do rtChildren(pg, rd, n.children, path, bases[13])
+            let fl = do rtAttrText(pg, rd.sc, n.label, bases[1])
+            rd.sc = fl.sc
+            rd.html = rd.html + "<button type=\"submit\">" + fl.v.t + "</button></form>"
+            return rd
+        if kind == "upload":
+            let ul = do rtAttrText(pg, rd.sc, n.label, bases[1])
+            rd.sc = ul.sc
+            rd.html = rd.html + "<label" + rtNodeAttrs("fa-upload", n.class, n) + ">" + ul.v.t + "<input type=\"file\" data-fa-upload=\"" + n.bind + "\"></label>"
+            return rd
+        if kind == "use":
+            let ci = do rtCompIndex(pg.g, n.name)
+            if ci < 0:
+                return rd
+            let comp = pg.g.components[ci]
+            let wrap = do rtUseNeedsElement(n)
+            if wrap:
+                let mut useBase = "fa-use"
+                if n.id != "":
+                    useBase = ""
+                rd.html = rd.html + "<div" + rtRegionAttrs(useBase, n.id, n.class, n) + ">"
+            let mut saved2 = rd.sc
+            let mut child = rd.sc
+            let mut ab = bases[12]
+            let mut pi = 0
+            loop pi < len(comp.params):
+                let p = comp.params[pi]
+                let mut v = do noneVal()
+                if pi < len(n.args):
+                    let ar2 = do rtEval(n.args[pi], child, ab)
+                    child = ar2.sc
+                    v = ar2.v
+                    if ab >= 0:
+                        let ac = do rtAggCount(n.args[pi])
+                        ab = ab + ac
+                let cv2 = do rtCoerce(v, p.type)
+                child = do rtSet(child, p.name, cv2)
+                pi = pi + 1
+            rd.sc = child
+            rd = do rtChildren(pg, rd, comp.view, path, pg.compBases[ci])
+            saved2.matKeys = rd.sc.matKeys
+            saved2.matVals = rd.sc.matVals
+            saved2.matPath = rd.sc.matPath
+            rd.sc = saved2
+            if wrap:
+                rd.html = rd.html + "</div>"
+            return rd
+        return rd
+
+    # rtDistinctFieldValues: the unique, non-empty values of one field over
+    # an entity's rows, sorted.
+    proc rtDistinctFieldValues(rows: Val, field: text) -> [text]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(rows.items):
+            let r = rows.items[i]
+            if r.kind == "record":
+                let fv = do valGet(r, field)
+                let v = do valToStr(fv)
+                if v != "":
+                    let mut seen = false
+                    let mut k = 0
+                    loop k < len(out):
+                        if out[k] == v:
+                            seen = true
+                        k = k + 1
+                    if !seen:
+                        let mut j = len(out)
+                        let mut placed = false
+                        loop j > 0 && !placed:
+                            if v < out[j - 1]:
+                                j = j - 1
+                            else:
+                                placed = true
+                        out = slice(out, 0, j) + [v] + slice(out, j, len(out))
+            i = i + 1
+        return out
+
+    # rtMarkdownHTML: richtext.go's markdownHTML (render_markdown.fct).
+    proc rtMarkdownHTML(src: text) -> text:
+        let h = do mdRender(src)
+        return h

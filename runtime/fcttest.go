@@ -30,7 +30,7 @@ import (
 //
 // A step is one of: `run` an action (optionally expecting it to fail with a
 // message containing `fails`), `expect` an expression to equal a value, or `seed`
-// fixture rows.
+// fixture rows. A step-level `as` sets who runs or evaluates that one step.
 
 type testSuite struct {
 	Tests []testCase `json:"tests"`
@@ -147,7 +147,15 @@ func runCase(graph *ir.IR, tc testCase) error {
 			if err != nil {
 				return fmt.Errorf("%s: bad expression %q: %w", where, step.Expect, err)
 			}
-			got := srv.EvalExpr(e, actor, role, verified)
+			// A step's `as` names who evaluates it, for an expectation exactly
+			// as for an action: "what does bob see" is `{"as": bob, "expect":
+			// …}`, since a visibility rule is only ever a rule about someone.
+			a, r, v := actor, role, verified
+			if step.As != nil {
+				a, r = identityOf(step.As, a, r)
+				v = step.As.Verified
+			}
+			got := srv.EvalExpr(e, a, r, v)
 			if !valuesEqual(got, step.Equals) {
 				return fmt.Errorf("%s: expected %q == %s, got %s", where, step.Expect, jsonOf(step.Equals), jsonOf(got))
 			}

@@ -73,15 +73,27 @@ app FabricDaemonTelemetrySelfHost:
         poller: TelemetryPoller
         describe: text
         messages: [FabricMessage]
+        # "gated" only: the file whose existence switches the fixed
+        # messages on (fileExists, relative to the data directory).
+        gate: text
 
     proc daemonFacetqlTelemetry(settings: DaemonSettings) -> DaemonTelemetry:
         let targets = do daemonTelemetryTargets(settings)
         let poller = do telemetryPollerNew(targets)
-        return DaemonTelemetry{kind: "facetql", poller: poller, describe: daemonFacetqlDescribe(len(targets)), messages: []}
+        return DaemonTelemetry{kind: "facetql", poller: poller, describe: daemonFacetqlDescribe(len(targets)), messages: [], gate: ""}
 
     proc daemonFixedTelemetry(describe: text, messages: [FabricMessage]) -> DaemonTelemetry:
         let poller = do telemetryPollerNew([])
-        return DaemonTelemetry{kind: "fixed", poller: poller, describe: describe, messages: messages}
+        return DaemonTelemetry{kind: "fixed", poller: poller, describe: describe, messages: messages, gate: ""}
+
+    # A test source, as tests/mover.rs's HotCell is one: the fixed messages
+    # are delivered only while `gate` (a file in the data directory) exists,
+    # so a scenario decides the instant the loop first sees pressure — a
+    # migration mid-session, with the session's own requests in flight.
+    # Until then the sweep is empty: no evidence, no decision.
+    proc daemonGatedTelemetry(describe: text, messages: [FabricMessage], gate: text) -> DaemonTelemetry:
+        let poller = do telemetryPollerNew([])
+        return DaemonTelemetry{kind: "gated", poller: poller, describe: describe, messages: messages, gate: gate}
 
     proc daemonTelemetryDescribe(t: DaemonTelemetry) -> text:
         if t.kind == "facetql":
@@ -95,9 +107,15 @@ app FabricDaemonTelemetrySelfHost:
 
     # TelemetrySource::sample at `nowMs`: one sweep's evidence, plus what
     # went wrong getting it.
-    proc daemonTelemetrySample(t: DaemonTelemetry, nowMs: int) -> DaemonTelemetrySampled uses io.net:
+    proc daemonTelemetrySample(t: DaemonTelemetry, nowMs: int) -> DaemonTelemetrySampled uses io.net, io.file:
         let mut sample = do daemonSampleEmpty()
-        if t.kind == "fixed":
+        let mut fixed = t.kind == "fixed"
+        if t.kind == "gated":
+            if fileExists(t.gate):
+                fixed = true
+            else:
+                return DaemonTelemetrySampled{telemetry: t, sample: sample}
+        if fixed:
             let n0 = len(t.messages)
             let mut j = 0
             loop j < n0:

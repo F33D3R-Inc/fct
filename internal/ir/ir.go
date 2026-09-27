@@ -464,6 +464,16 @@ type API struct {
 	// binds to on a route that authenticates with an app-issued credential
 	// (`auth <scheme> bearer <param>`); Auth is then that scheme.
 	Bearer string `json:"bearer,omitempty"`
+	// BasicID and BasicSecret name the action parameters the HTTP Basic
+	// credential binds to (`auth <scheme> basic <id> <secret>`); Auth is
+	// then that scheme, and the route answers 401 with WWW-Authenticate:
+	// Basic when the header is missing.
+	BasicID     string `json:"basicId,omitempty"`
+	BasicSecret string `json:"basicSecret,omitempty"`
+	// Form marks a `body form` route: the body is a form
+	// (application/x-www-form-urlencoded or multipart/form-data) whose fields
+	// bind the action's body parameters, and the contract documents it so.
+	Form bool `json:"form,omitempty"`
 	// Dispatch names the message a dispatching route decodes its body as
 	// (`api POST "/events" -> Mutation`): the variant its tag selects runs its
 	// own action. Action is then "".

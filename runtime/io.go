@@ -17,7 +17,9 @@ package runtime
 // author-supplied, data-dependent at runtime, and may be nested).
 
 import (
+	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"net/url"
@@ -25,6 +27,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -282,11 +285,7 @@ func (s *Server) ioReadFileAt(path string, offset, n int) (any, error) {
 	if _, err := f.ReadAt(data, int64(offset)); err != nil {
 		return nil, fmt.Errorf("readFileAt: %q: failed to read %d bytes at offset %d: %v", path, n, offset, err)
 	}
-	buf := make([]any, n)
-	for i, b := range data {
-		buf[i] = int(b)
-	}
-	return buf, nil
+	return bytesVal(data), nil
 }
 
 // ioWriteFileAt implements `writeFileAt(path: text, offset: int, data: bytes)
@@ -303,17 +302,12 @@ func (s *Server) ioWriteFileAt(path string, offset int, content any) (any, error
 	if offset < 0 {
 		return nil, fmt.Errorf("writeFileAt: %q: negative offset %d", path, offset)
 	}
-	arr, ok := content.([]any)
+	data, ok := bytesOf(content)
 	if !ok {
-		return nil, fmt.Errorf("writeFileAt: %q: content is not a byte buffer", path)
-	}
-	data := make([]byte, len(arr))
-	for i, v := range arr {
-		b := toInt(v)
-		if b < 0 || b > 255 {
-			return nil, fmt.Errorf("writeFileAt: %q: byte value %d out of range (must be 0-255)", path, b)
+		if _, isList := content.([]any); isList {
+			return nil, fmt.Errorf("writeFileAt: %q: byte value out of range (must be 0-255)", path)
 		}
-		data[i] = byte(b)
+		return nil, fmt.Errorf("writeFileAt: %q: content is not a byte buffer", path)
 	}
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return nil, fmt.Errorf("writeFileAt: %q: %v", path, err)
@@ -450,17 +444,12 @@ func (s *Server) ioWriteFileBytes(path string, content any) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("write: %w", err)
 	}
-	arr, ok := content.([]any)
+	data, ok := bytesOf(content)
 	if !ok {
-		return nil, fmt.Errorf("write: %q: content is not a byte buffer", path)
-	}
-	data := make([]byte, len(arr))
-	for i, v := range arr {
-		n := toInt(v)
-		if n < 0 || n > 255 {
-			return nil, fmt.Errorf("write: %q: byte value %d out of range (must be 0-255)", path, n)
+		if _, isList := content.([]any); isList {
+			return nil, fmt.Errorf("write: %q: byte value out of range (must be 0-255)", path)
 		}
-		data[i] = byte(n)
+		return nil, fmt.Errorf("write: %q: content is not a byte buffer", path)
 	}
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return nil, fmt.Errorf("write: %q: %v", path, err)
@@ -560,6 +549,75 @@ func (s *Server) ioHTTPPost(rawURL, body string) (any, error) {
 // corruption. Keyed by the resolved path; readers share, writers exclude.
 var fileLocks sync.Map // string -> *sync.RWMutex
 
+// crc32Range implements `crc32(bs, from, to) -> int`: the IEEE CRC-32 of
+// bs[from..to), bs a byte buffer (a list of ints 0-255). A range outside
+// the buffer, or a value that is not a byte, is a runtime error.
+func crc32Range(bs any, from, to int) (any, error) {
+	if b, ok := bs.(bytesVal); ok {
+		if from < 0 || to > len(b) || from > to {
+			return nil, fmt.Errorf("crc32: range %d..%d is outside a buffer of %d bytes", from, to, len(b))
+		}
+		return int(crc32.ChecksumIEEE(b[from:to])), nil
+	}
+	arr, ok := bs.([]any)
+	if !ok {
+		return nil, fmt.Errorf("crc32: not a byte buffer")
+	}
+	if from < 0 || to > len(arr) || from > to {
+		return nil, fmt.Errorf("crc32: range %d..%d is outside a buffer of %d bytes", from, to, len(arr))
+	}
+	data := make([]byte, to-from)
+	for i := from; i < to; i++ {
+		b := toInt(arr[i])
+		if b < 0 || b > 255 {
+			return nil, fmt.Errorf("crc32: byte value %d out of range (must be 0-255)", b)
+		}
+		data[i-from] = byte(b)
+	}
+	return int(crc32.ChecksumIEEE(data)), nil
+}
+
+// heldFileLocks are the files this process holds an exclusive advisory
+// lock on (lockFile), by full path. A held lock is never released: it is
+// the process's claim on a data directory (facetql's storage/lock.rs), and
+// the kernel releases it when the process ends — however it ends.
+var (
+	heldFileLocksMu sync.Mutex
+	heldFileLocks   = map[string]*os.File{}
+)
+
+// ioLockFile implements `lockFile(path: text) -> bool`: take the exclusive
+// advisory lock (flock LOCK_EX|LOCK_NB) on the file, creating it empty if
+// absent, and hold it for the life of the process. True when the lock is
+// held — including when this process already holds it (idempotent, like a
+// second acquire in one process); false when another process holds it
+// (EWOULDBLOCK). Any other failure is a runtime error, as writeFile's.
+// Advisory: it stops another lockFile, not another writer.
+func (s *Server) ioLockFile(path string) (any, error) {
+	full, err := s.resolveDataPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("lockFile: %w", err)
+	}
+	heldFileLocksMu.Lock()
+	defer heldFileLocksMu.Unlock()
+	if _, held := heldFileLocks[full]; held {
+		return true, nil
+	}
+	f, err := os.OpenFile(full, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("lockFile: %q: %v", path, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return false, nil
+		}
+		return nil, fmt.Errorf("lockFile: %q: %v", path, err)
+	}
+	heldFileLocks[full] = f
+	return true, nil
+}
+
 func lockFile(full string, write bool) func() {
 	v, _ := fileLocks.LoadOrStore(full, &sync.RWMutex{})
 	mu := v.(*sync.RWMutex)
@@ -569,4 +627,23 @@ func lockFile(full string, write bool) func() {
 	}
 	mu.RLock()
 	return mu.RUnlock
+}
+
+// ioFileModTime implements `fileModTime(path) -> int` (io.file): the file's
+// last modification time in unix seconds, 0 when there is no such file — the
+// one fact about a stored file a runtime serving it needs (Last-Modified)
+// that fileSize/fileExists do not give.
+func (s *Server) ioFileModTime(path string) (any, error) {
+	full, err := s.resolveReadPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("fileModTime: %w", err)
+	}
+	fi, err := os.Stat(full)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return nil, fmt.Errorf("fileModTime: %q: %v", path, err)
+	}
+	return int(fi.ModTime().Unix()), nil
 }

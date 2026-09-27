@@ -70,16 +70,12 @@ app IRJSONSelfHost:
         val: JVal
         pos: int
 
-    private proc jIsWs(c: text) -> bool:
-        return c == " " || c == "\n" || c == "\t" || c == "\r"
-
     private proc jSkipWs(s: text, pos: int) -> int:
         let n = len(s)
         let mut i = pos
         let mut go = true
         loop i < n && go:
-            let ws = do jIsWs(charAt(s, i))
-            if ws:
+            if charAt(s, i) in [" ", "\n", "\t", "\r"]:
                 i = i + 1
             else:
                 go = false
@@ -131,52 +127,72 @@ app IRJSONSelfHost:
         return t
 
     # jReadString: s[pos] is the opening quote; returns the decoded text and
-    # the position after the closing quote.
+    # the position after the closing quote. The closing quote is found by
+    # search (indexOf), skipping one that a run of backslashes escapes; the
+    # segment before it is taken whole when it holds no escape, and
+    # decoded escape by escape otherwise — so a document is read in a few
+    # steps per string, not a step per character.
     private proc jReadString(s: text, pos: int) -> JRead:
         let n = len(s)
-        let mut i = pos + 1
-        let mut out = ""
-        let mut closed = false
-        loop i < n && !closed:
-            let c = charAt(s, i)
-            if c == "\"":
-                closed = true
-                i = i + 1
+        let start = pos + 1
+        let mut q = indexOf(s, "\"", start)
+        let mut escaped = true
+        loop q >= 0 && escaped:
+            let mut bs = 0
+            loop q - 1 - bs >= start && charAt(s, q - 1 - bs) == "\\":
+                bs = bs + 1
+            if bs % 2 == 0:
+                escaped = false
             else:
-                if c == "\\" && i + 1 < n:
-                    let e = charAt(s, i + 1)
-                    if e == "n":
-                        out = out + "\n"
-                        i = i + 2
-                    else:
-                        if e == "t":
-                            out = out + "\t"
-                            i = i + 2
-                        else:
-                            if e == "r":
-                                out = out + "\r"
-                                i = i + 2
-                            else:
-                                if e == "u" && i + 5 < n:
-                                    let h1 = do jHexVal(charAt(s, i + 2))
-                                    let h2 = do jHexVal(charAt(s, i + 3))
-                                    let h3 = do jHexVal(charAt(s, i + 4))
-                                    let h4 = do jHexVal(charAt(s, i + 5))
-                                    let code = h1 * 4096 + h2 * 256 + h3 * 16 + h4
-                                    let ch = do jCharOf(code)
-                                    out = out + ch
-                                    i = i + 6
-                                else:
-                                    # \" \\ \/ and anything else: the character itself
-                                    out = out + e
-                                    i = i + 2
-                else:
-                    out = out + c
-                    i = i + 1
-        if !closed:
+                q = indexOf(s, "\"", q + 1)
+        if q < 0:
             let none = do jNone()
             return JRead{val: none, pos: n}
-        return JRead{val: JVal{kind: "str", s: out, keys: [], vals: []}, pos: i}
+        let seg = slice(s, start, q)
+        let firstEsc = indexOf(seg, "\\", 0)
+        if firstEsc < 0:
+            return JRead{val: JVal{kind: "str", s: seg, keys: [], vals: []}, pos: q + 1}
+        let m = len(seg)
+        let mut out = slice(seg, 0, firstEsc)
+        let mut i = firstEsc
+        loop i < m:
+            let c = charAt(seg, i)
+            if c == "\\" && i + 1 < m:
+                let e = charAt(seg, i + 1)
+                if e == "n":
+                    out = out + "\n"
+                    i = i + 2
+                else:
+                    if e == "t":
+                        out = out + "\t"
+                        i = i + 2
+                    else:
+                        if e == "r":
+                            out = out + "\r"
+                            i = i + 2
+                        else:
+                            if e == "u" && i + 5 < m:
+                                let h1 = do jHexVal(charAt(seg, i + 2))
+                                let h2 = do jHexVal(charAt(seg, i + 3))
+                                let h3 = do jHexVal(charAt(seg, i + 4))
+                                let h4 = do jHexVal(charAt(seg, i + 5))
+                                let code = h1 * 4096 + h2 * 256 + h3 * 16 + h4
+                                let ch = do jCharOf(code)
+                                out = out + ch
+                                i = i + 6
+                            else:
+                                # \" \\ \/ and anything else: the character itself
+                                out = out + e
+                                i = i + 2
+            else:
+                let nextEsc = indexOf(seg, "\\", i)
+                if nextEsc < 0:
+                    out = out + slice(seg, i, m)
+                    i = m
+                else:
+                    out = out + slice(seg, i, nextEsc)
+                    i = nextEsc
+        return JRead{val: JVal{kind: "str", s: out, keys: [], vals: []}, pos: q + 1}
 
     private proc jIsNumChar(c: text) -> bool:
         return c == "-" || c == "+" || c == "." || c == "e" || c == "E" || c == "0" || c == "1" || c == "2" || c == "3" || c == "4" || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
@@ -286,17 +302,11 @@ app IRJSONSelfHost:
         return r.val
 
     # ── PART TWO: JVal → IR ─────────────────────────────────────────────────
-    # jExprOpt: the 0-or-1-element child list for an optional expression key.
-    private proc jExprOpt(v: JVal, k: text) -> [IRExpr]:
-        let has = do jHas(v, k)
-        if !has:
-            return []
-        let x = do jGet(v, k)
-        let e = do irExprFromJVal(x)
-        return [e]
-
-    private proc jExprList(v: JVal, k: text) -> [IRExpr]:
-        let x = do jGet(v, k)
+    # Each object is read in ONE pass over its keys (a `continue` per key
+    # matched), not a scan per field name: an expression node has 25
+    # possible keys and carries 3-6, so a lookup per key name was ~125
+    # text compares and 25 calls per node, most of them misses.
+    private proc jExprListX(x: JVal) -> [IRExpr]:
         let n = len(x.vals)
         let mut out = []
         let mut i = 0
@@ -306,8 +316,7 @@ app IRJSONSelfHost:
             i = i + 1
         return out
 
-    private proc jTextList(v: JVal, k: text) -> [text]:
-        let x = do jGet(v, k)
+    private proc jTextListX(x: JVal) -> [text]:
         let n = len(x.vals)
         let mut out = []
         let mut i = 0
@@ -316,35 +325,124 @@ app IRJSONSelfHost:
             i = i + 1
         return out
 
+    private proc jTextList(v: JVal, k: text) -> [text]:
+        let x = do jGet(v, k)
+        let r = do jTextListX(x)
+        return r
+
     # irExprFromJVal: the inverse of ir_expr.fct's irExprJSON, key for key.
     # A literal's `val` keeps its JSON spelling (a number's digits, a bool's
     # word, a string's decoded text), which is what irExprJSON re-emits.
     proc irExprFromJVal(v: JVal) -> IRExpr:
-        let hasVal = do jHas(v, "val")
-        let valV = do jGet(v, "val")
-        let mut valText = valV.s
-        let kind = do jStr(v, "kind")
-        let vtype = do jStr(v, "vtype")
-        let name = do jStr(v, "name")
-        let field = do jStr(v, "field")
-        let obj = do jExprOpt(v, "obj")
-        let key = do jExprOpt(v, "key")
-        let op = do jStr(v, "op")
-        let args = do jExprList(v, "args")
-        let keys = do jExprList(v, "keys")
-        let fields = do jTextList(v, "fields")
-        let l = do jExprOpt(v, "l")
-        let r = do jExprOpt(v, "r")
-        let x = do jExprOpt(v, "x")
-        let itemVar = do jStr(v, "var")
-        let where = do jExprOpt(v, "where")
-        let sel = do jExprOpt(v, "sel")
-        let order = do jStr(v, "order")
-        let desc = do jBool(v, "desc")
-        let limit = do jExprOpt(v, "limit")
-        let orderBy = do jExprOpt(v, "orderBy")
-        let omit = do jTextList(v, "omit")
-        let nulls = do jTextList(v, "nulls")
+        let mut hasVal = false
+        let mut valText = ""
+        let mut kind = ""
+        let mut vtype = ""
+        let mut name = ""
+        let mut field = ""
+        let mut obj = []
+        let mut key = []
+        let mut op = ""
+        let mut args = []
+        let mut keys = []
+        let mut fields = []
+        let mut l = []
+        let mut r = []
+        let mut x = []
+        let mut itemVar = ""
+        let mut where = []
+        let mut sel = []
+        let mut order = ""
+        let mut desc = false
+        let mut limit = []
+        let mut orderBy = []
+        let mut omit = []
+        let mut nulls = []
+        let n = len(v.keys)
+        let mut i = 0
+        loop i < n:
+            let k = v.keys[i]
+            let val = v.vals[i]
+            i = i + 1
+            if k == "kind":
+                kind = val.s
+                continue
+            if k == "name":
+                name = val.s
+                continue
+            if k == "val":
+                hasVal = true
+                valText = val.s
+                continue
+            if k == "vtype":
+                vtype = val.s
+                continue
+            if k == "args":
+                args = do jExprListX(val)
+                continue
+            if k == "l":
+                let le = do irExprFromJVal(val)
+                l = [le]
+                continue
+            if k == "r":
+                let re = do irExprFromJVal(val)
+                r = [re]
+                continue
+            if k == "op":
+                op = val.s
+                continue
+            if k == "field":
+                field = val.s
+                continue
+            if k == "obj":
+                let oe = do irExprFromJVal(val)
+                obj = [oe]
+                continue
+            if k == "key":
+                let ke = do irExprFromJVal(val)
+                key = [ke]
+                continue
+            if k == "x":
+                let xe = do irExprFromJVal(val)
+                x = [xe]
+                continue
+            if k == "var":
+                itemVar = val.s
+                continue
+            if k == "where":
+                let we = do irExprFromJVal(val)
+                where = [we]
+                continue
+            if k == "sel":
+                let se = do irExprFromJVal(val)
+                sel = [se]
+                continue
+            if k == "order":
+                order = val.s
+                continue
+            if k == "desc":
+                desc = val.kind == "bool" && val.s == "true"
+                continue
+            if k == "limit":
+                let lie = do irExprFromJVal(val)
+                limit = [lie]
+                continue
+            if k == "orderBy":
+                let obe = do irExprFromJVal(val)
+                orderBy = [obe]
+                continue
+            if k == "keys":
+                keys = do jExprListX(val)
+                continue
+            if k == "fields":
+                fields = do jTextListX(val)
+                continue
+            if k == "omit":
+                omit = do jTextListX(val)
+                continue
+            if k == "nulls":
+                nulls = do jTextListX(val)
+                continue
         return IRExpr{kind: kind, hasVal: hasVal, val: valText, vtype: vtype, name: name, field: field, obj: obj, key: key, op: op, args: args, keys: keys, fields: fields, l: l, r: r, x: x, itemVar: itemVar, where: where, sel: sel, order: order, desc: desc, limit: limit, orderBy: orderBy, omit: omit, nulls: nulls}
 
     proc irExprFromJSON(s: text) -> IRExpr:
@@ -352,8 +450,7 @@ app IRJSONSelfHost:
         let e = do irExprFromJVal(v)
         return e
 
-    private proc jStmtList(v: JVal, k: text) -> [IRStmt]:
-        let x = do jGet(v, k)
+    private proc jStmtListX(x: JVal) -> [IRStmt]:
         let n = len(x.vals)
         let mut out = []
         let mut i = 0
@@ -367,47 +464,136 @@ app IRJSONSelfHost:
     # []FieldInit of {name, expr}) unzips into the parallel fieldNames/
     # fieldExprs lists.
     proc irStmtFromJVal(v: JVal) -> IRStmt:
-        let op = do jStr(v, "op")
-        let target = do jStr(v, "target")
-        let entity = do jStr(v, "entity")
-        let field = do jStr(v, "field")
-        let key = do jExprOpt(v, "key")
-        let value = do jExprOpt(v, "value")
-        let fi = do jGet(v, "fields")
-        let fn = len(fi.vals)
+        let mut op = ""
+        let mut target = ""
+        let mut entity = ""
+        let mut field = ""
+        let mut key = []
+        let mut value = []
         let mut fieldNames = []
         let mut fieldExprs = []
-        let mut i = 0
-        loop i < fn:
-            let nm = do jStr(fi.vals[i], "name")
-            let ex = do jGet(fi.vals[i], "expr")
-            let e = do irExprFromJVal(ex)
-            fieldNames = append(fieldNames, nm)
-            fieldExprs = append(fieldExprs, e)
-            i = i + 1
-        let service = do jStr(v, "service")
-        let args = do jExprList(v, "args")
-        let itemVar = do jStr(v, "var")
-        let where = do jExprOpt(v, "where")
-        let order = do jStr(v, "order")
-        let desc = do jBool(v, "desc")
-        let limit = do jExprOpt(v, "limit")
-        let orderBy = do jExprOpt(v, "orderBy")
-        let omit = do jTextList(v, "omit")
-        let bind = do jStr(v, "bind")
-        let ret = do jStr(v, "ret")
-        let retList = do jBool(v, "retList")
-        let role = do jExprOpt(v, "role")
-        let msg = do jStr(v, "msg")
-        let stV = do jGet(v, "status")
+        let mut service = ""
+        let mut args = []
+        let mut itemVar = ""
+        let mut where = []
+        let mut order = ""
+        let mut desc = false
+        let mut limit = []
+        let mut orderBy = []
+        let mut omit = []
+        let mut bind = ""
+        let mut ret = ""
+        let mut retList = false
+        let mut role = []
+        let mut msg = ""
         let mut status = 0
-        if stV.kind == "num":
-            status = toInt(stV.s)
-        let body = do jStmtList(v, "body")
-        let elseBody = do jStmtList(v, "else")
-        let bytesFlag = do jBool(v, "bytes")
-        let file = do jStr(v, "file")
-        let path = do jStr(v, "path")
+        let mut body = []
+        let mut elseBody = []
+        let mut bytesFlag = false
+        let mut file = ""
+        let mut path = ""
+        let n = len(v.keys)
+        let mut i = 0
+        loop i < n:
+            let k = v.keys[i]
+            let val = v.vals[i]
+            i = i + 1
+            if k == "op":
+                op = val.s
+                continue
+            if k == "target":
+                target = val.s
+                continue
+            if k == "value":
+                let ve = do irExprFromJVal(val)
+                value = [ve]
+                continue
+            if k == "args":
+                args = do jExprListX(val)
+                continue
+            if k == "service":
+                service = val.s
+                continue
+            if k == "bind":
+                bind = val.s
+                continue
+            if k == "ret":
+                ret = val.s
+                continue
+            if k == "retList":
+                retList = val.kind == "bool" && val.s == "true"
+                continue
+            if k == "body":
+                body = do jStmtListX(val)
+                continue
+            if k == "else":
+                elseBody = do jStmtListX(val)
+                continue
+            if k == "entity":
+                entity = val.s
+                continue
+            if k == "field":
+                field = val.s
+                continue
+            if k == "key":
+                let ke = do irExprFromJVal(val)
+                key = [ke]
+                continue
+            if k == "fields":
+                let fn = len(val.vals)
+                let mut fi = 0
+                loop fi < fn:
+                    let nm = do jStr(val.vals[fi], "name")
+                    let ex = do jGet(val.vals[fi], "expr")
+                    let e = do irExprFromJVal(ex)
+                    fieldNames = append(fieldNames, nm)
+                    fieldExprs = append(fieldExprs, e)
+                    fi = fi + 1
+                continue
+            if k == "var":
+                itemVar = val.s
+                continue
+            if k == "where":
+                let we = do irExprFromJVal(val)
+                where = [we]
+                continue
+            if k == "order":
+                order = val.s
+                continue
+            if k == "desc":
+                desc = val.kind == "bool" && val.s == "true"
+                continue
+            if k == "limit":
+                let lie = do irExprFromJVal(val)
+                limit = [lie]
+                continue
+            if k == "orderBy":
+                let obe = do irExprFromJVal(val)
+                orderBy = [obe]
+                continue
+            if k == "omit":
+                omit = do jTextListX(val)
+                continue
+            if k == "role":
+                let roe = do irExprFromJVal(val)
+                role = [roe]
+                continue
+            if k == "msg":
+                msg = val.s
+                continue
+            if k == "status":
+                if val.kind == "num":
+                    status = toInt(val.s)
+                continue
+            if k == "bytes":
+                bytesFlag = val.kind == "bool" && val.s == "true"
+                continue
+            if k == "file":
+                file = val.s
+                continue
+            if k == "path":
+                path = val.s
+                continue
         return IRStmt{op: op, target: target, entity: entity, field: field, key: key, value: value, fieldNames: fieldNames, fieldExprs: fieldExprs, service: service, args: args, itemVar: itemVar, where: where, order: order, desc: desc, limit: limit, bind: bind, ret: ret, retList: retList, role: role, msg: msg, status: status, body: body, elseBody: elseBody, bytesFlag: bytesFlag, file: file, path: path}
 
     proc irStmtFromJSON(s: text) -> IRStmt:

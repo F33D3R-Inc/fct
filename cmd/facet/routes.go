@@ -21,10 +21,13 @@ import (
 // what guards it?"), and here it is not authored at all — it is derived,
 // exactly, from the IR the compiler already produced:
 //
-//	web      one route per `view`, with its :params and its `requires` guard
-//	api      GET /api/<Entity> per entity, POST /api/<Action> per SERVER action
-//	webhook  POST <path> per declared `webhook`
-//	runtime  the fixed endpoints every Facet app serves (with --all)
+//	web       one route per `view`, with its :params and its `requires` guard
+//	api       GET /api/<Entity> per entity, POST /api/<Action> per SERVER action
+//	contract  every declared `api <METHOD> "<path>" -> <action>` operation — the
+//	          app's typed HTTP contract — plus the `contract "<path>"` document
+//	          that publishes it
+//	webhook   POST <path> per declared `webhook`
+//	runtime   the fixed endpoints every Facet app serves (with --all)
 //
 // Nothing is looked up in the runtime and nothing is guessed: a client-placed
 // action is not callable over the API, so it is not listed as one, and the IR
@@ -32,7 +35,7 @@ import (
 
 // RouteEntry is one served endpoint.
 type RouteEntry struct {
-	Kind     string   `json:"kind"`               // web | api | webhook | runtime
+	Kind     string   `json:"kind"`               // web | api | contract | webhook | runtime
 	Method   string   `json:"method"`             // GET, POST, GET/POST, …
 	Path     string   `json:"path"`               // the URL pattern
 	Name     string   `json:"name,omitempty"`     // the view/entity/action it comes from
@@ -128,6 +131,65 @@ func buildRoutes(g *ir.IR, withRuntime bool) []RouteEntry {
 			Kind: "api", Method: "POST", Path: "/api/" + a.Name, Name: a.Name,
 			Requires: requireNames(a.Requires), Note: signature(a),
 		})
+	}
+
+	// Contract: the typed HTTP operations the app declares with `api <METHOD>
+	// "<path>" -> <action>` — the surface a native client is written against.
+	// These are the product's own routes, not the generic projection above, so
+	// a table that left them out would omit exactly what the app promised. An
+	// operation's guard is its action's; a `{param}` segment is listed as the
+	// runtime binds it; a dispatching route names the message it decodes.
+	byAction := map[string]ir.Action{}
+	for _, a := range g.Actions {
+		byAction[a.Name] = a
+	}
+	for _, d := range g.APIs {
+		entry := RouteEntry{Kind: "contract", Method: d.Method, Path: d.Path, Params: d.Params}
+		switch {
+		case d.Dispatch != "":
+			entry.Name = d.Dispatch
+			entry.Note = "dispatches the message's variant to its own action"
+		default:
+			entry.Name = d.Action
+			if a, ok := byAction[d.Action]; ok {
+				entry.Requires = requireNames(a.Requires)
+				entry.Note = signature(a)
+			}
+		}
+		if d.Status != 0 && d.Status != 200 {
+			entry.Note = strings.TrimSpace(entry.Note + fmt.Sprintf("  → %d", d.Status))
+		}
+		if d.Bearer != "" {
+			entry.Note = strings.TrimSpace(entry.Note + "  (bearer " + d.Auth + " → " + d.Bearer + ")")
+		}
+		if d.Summary != "" {
+			entry.Note = strings.TrimSpace(entry.Note + "  — " + d.Summary)
+		}
+		out = append(out, entry)
+	}
+	// A declared `stream` is a GET the contract documents (text/event-stream);
+	// the contract document itself and its three siblings are served under
+	// the `contract` path. Both are operations the golden contract counts, so
+	// the table lists them next to the declared `api` operations.
+	for _, st := range g.Streams {
+		names := make([]string, len(st.Events))
+		for i, ev := range st.Events {
+			names[i] = ev.Name
+		}
+		out = append(out, RouteEntry{
+			Kind: "contract", Method: "GET", Path: st.Path, Name: "stream", Params: st.Params, Requires: st.Requires,
+			Note: "server-sent events: " + strings.Join(names, ", "),
+		})
+	}
+	if c := g.Contract; c != nil {
+		for _, sib := range []struct{ suffix, note string }{
+			{"", "the published contract document"},
+			{"/version", "the document's version (its sha256)"},
+			{"/history", "every version this deployment has served"},
+			{"/diff", "what changed between two versions (?from=&to=)"},
+		} {
+			out = append(out, RouteEntry{Kind: "contract", Method: "GET", Path: c.Path + sib.suffix, Name: "contract", Note: sib.note})
+		}
 	}
 
 	// Webhooks: inbound endpoints external systems POST to, each authenticated
@@ -256,10 +318,12 @@ func kindRank(kind string) int {
 		return 0
 	case "api":
 		return 1
-	case "webhook":
+	case "contract":
 		return 2
+	case "webhook":
+		return 3
 	}
-	return 3
+	return 4
 }
 
 // authManaged reports whether an entity is the identity table `auth` injects
@@ -359,6 +423,8 @@ func kindLegend(kind string) string {
 		return "(the rendered projection — one route per view)"
 	case "api":
 		return "(the JSON projection — entities to read, server actions to invoke)"
+	case "contract":
+		return "(the declared typed HTTP operations — the app's own API contract)"
 	case "webhook":
 		return "(inbound: external systems POST here)"
 	case "runtime":

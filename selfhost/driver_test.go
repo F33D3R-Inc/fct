@@ -236,21 +236,8 @@ var driverPassingExamples = []string{
 	"../../facets/home.fct",
 	"../../facets/live.fct",
 	"../../facets/messages.fct",
-	"../../facets/smoke.fct",
-	"../../facets/smoke_new.fct",
-	"../../facets/smoke_new2.fct",
-	"../../facets/smoke_new3.fct",
-	"../../facets/smoke_new4.fct",
-	"../../facets/smoke_new5.fct",
-	"../../facets/smoke_new6.fct",
-	"../../facets/smoke_new7.fct",
-	"../../facets/smoke_new8.fct",
-	"../../facets/smoke_new9.fct",
-	"../../facets/smoke_new10.fct",
 	"../../facets/timeline.fct",
 	"../../facets/api/main.fct",
-	"../../website/site.fct",
-	"../../apps/game/game.fct",
 }
 
 // driverKnownFailing: does NOT yet match, with the concrete reason

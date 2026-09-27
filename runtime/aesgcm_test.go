@@ -28,7 +28,7 @@ func TestAesGcmBuiltins(t *testing.T) {
 	want := ints(g.Seal(nil, nonce, pt, nil))
 
 	sealed, err := aesGcmSeal(ints(key), ints(nonce), ints(pt))
-	if err != nil || !reflect.DeepEqual(sealed, want) {
+	if err != nil || !reflect.DeepEqual(plainValue(sealed), want) {
 		t.Fatalf("aesGcmSeal = %v, %v; want Go's crypto/cipher output", err, sealed)
 	}
 	ok, err := aesGcmAuthentic(ints(key), ints(nonce), sealed)
@@ -36,10 +36,10 @@ func TestAesGcmBuiltins(t *testing.T) {
 		t.Fatalf("aesGcmAuthentic(sealed) = %v, %v", ok, err)
 	}
 	back, err := aesGcmOpen(ints(key), ints(nonce), sealed)
-	if err != nil || !reflect.DeepEqual(back, ints(pt)) {
+	if err != nil || !reflect.DeepEqual(plainValue(back), ints(pt)) {
 		t.Fatalf("aesGcmOpen round trip: %v", err)
 	}
-	bad := append([]any{}, sealed.([]any)...)
+	bad := append([]any{}, plainValue(sealed).([]any)...)
 	bad[3] = (bad[3].(int) + 1) % 256
 	if ok, _ := aesGcmAuthentic(ints(key), ints(nonce), bad); ok != false {
 		t.Fatal("a modified ciphertext authenticated")

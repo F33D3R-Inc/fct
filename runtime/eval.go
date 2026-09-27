@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,7 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 	"unsafe"
@@ -37,6 +38,15 @@ type record = map[string]any
 type structVal struct {
 	lay  *structLayout
 	vals []any
+	// own: bit i set means vals[i]'s composite value is referenced from
+	// nowhere but this struct — the proc engine's slot ownership (see
+	// proccompile.go's header) carried one level down, so a field can be
+	// grown in place (`s.f = append(s.f, e)`). It is meaningful only while
+	// the struct itself sits in a slot that owns it: a bit is set when a
+	// fresh value is stored into the field, cleared when the field is read
+	// somewhere that could retain it, and zero on every copy of the struct
+	// (cloneStructValue), whose fields the original still shares.
+	own uint64
 }
 
 // structLayout is one struct type's field order: names by position, and the
@@ -84,11 +94,24 @@ type textIndexEntry struct {
 	offs  []int32 // byte offset of each rune, plus len(s) as a final sentinel; nil when ascii
 }
 
+// The cache is read lock-free: each entry is an atomic pointer to an
+// immutable textIndexEntry, so every proc indexing a long text (a lexer's
+// charAt over a whole source file, from many procs at once) reads it
+// without contending on a lock; a miss publishes its entry round-robin.
+//
+// A text past textIndexBigMin (a whole source file, a multi-megabyte IR
+// document) keeps its own small ring: recomputing its index is a scan of
+// the whole text and an allocation of a third its size, and the many
+// shorter texts a parser indexes while walking it (each line, each string
+// it slices out) must not push it out.
 var (
-	textIndexMu    sync.Mutex
-	textIndexCache [32]textIndexEntry
-	textIndexNext  int
+	textIndexCache  [32]atomic.Pointer[textIndexEntry]
+	textIndexNext   atomic.Uint32
+	textIndexBig    [4]atomic.Pointer[textIndexEntry]
+	textIndexBigNxt atomic.Uint32
 )
+
+const textIndexBigMin = 1 << 16
 
 func scanASCII(s string) bool {
 	for i := 0; i < len(s); i++ {
@@ -116,25 +139,73 @@ func textIndex(s string) (bool, []int32) {
 		return false, runeOffsets(s)
 	}
 	p := unsafe.StringData(s)
-	textIndexMu.Lock()
-	for i := range textIndexCache {
-		e := &textIndexCache[i]
-		if len(e.s) == len(s) && unsafe.StringData(e.s) == p {
-			textIndexMu.Unlock()
+	ring, next := textIndexCache[:], &textIndexNext
+	if len(s) >= textIndexBigMin {
+		ring, next = textIndexBig[:], &textIndexBigNxt
+	}
+	for i := range ring {
+		if e := ring[i].Load(); e != nil && len(e.s) == len(s) && unsafe.StringData(e.s) == p {
 			return e.ascii, e.offs
 		}
 	}
-	textIndexMu.Unlock()
 	ascii := scanASCII(s)
 	var offs []int32
 	if !ascii {
 		offs = runeOffsets(s)
 	}
-	textIndexMu.Lock()
-	textIndexCache[textIndexNext] = textIndexEntry{s: s, ascii: ascii, offs: offs}
-	textIndexNext = (textIndexNext + 1) % len(textIndexCache)
-	textIndexMu.Unlock()
+	slot := next.Add(1) % uint32(len(ring))
+	ring[slot].Store(&textIndexEntry{s: s, ascii: ascii, offs: offs})
 	return ascii, offs
+}
+
+// boxedBytes holds the boxed one-byte text of every ASCII byte, so a
+// character read (charAt, a one-character slice) — a lexer's every step —
+// hands out a boxed value without allocating one: boxInt's counterpart for
+// text.
+var boxedBytes = func() (out [128]any) {
+	for i := range out {
+		out[i] = string(rune(i))
+	}
+	return out
+}()
+
+// boxStr is s as a value, shared when it is a single ASCII byte.
+func boxStr(s string) any {
+	if len(s) == 1 && s[0] < 128 {
+		return boxedBytes[s[0]]
+	}
+	return s
+}
+
+// runeIndexOf is indexOf(s, sub, from): the rune index of the first sub in
+// s at or after rune index from (clamped into [0, runeLen]), or -1. An empty
+// sub is found at from. Rune-indexed exactly as slice and charAt are, so a
+// found index slices back to the match.
+func runeIndexOf(s, sub string, from int) int {
+	ascii, offs := textIndex(s)
+	n := len(s)
+	if !ascii {
+		n = len(offs) - 1
+	}
+	if from < 0 {
+		from = 0
+	}
+	if from > n {
+		from = n
+	}
+	bstart := from
+	if !ascii {
+		bstart = int(offs[from])
+	}
+	k := strings.Index(s[bstart:], sub)
+	if k < 0 {
+		return -1
+	}
+	if ascii {
+		return bstart + k
+	}
+	bpos := int32(bstart + k)
+	return sort.Search(len(offs), func(i int) bool { return offs[i] >= bpos })
 }
 
 // runeLen is len(s) in runes.
@@ -208,13 +279,17 @@ func runeSlice(s string, start, end int) string {
 // that its slot does not own, which is what keeps every binding's value
 // independent of every other's: copy-on-write in place of copy-on-bind.
 func cloneArrayValue(v any) any {
-	arr, ok := v.([]any)
-	if !ok {
-		return v
+	switch arr := v.(type) {
+	case []any:
+		out := make([]any, len(arr))
+		copy(out, arr)
+		return out
+	case bytesVal:
+		out := make(bytesVal, len(arr))
+		copy(out, arr)
+		return out
 	}
-	out := make([]any, len(arr))
-	copy(out, arr)
-	return out
+	return v
 }
 
 func cloneMapValue(v any) any {
@@ -769,8 +844,14 @@ func applyBin(op string, l, r any) any {
 	case "||":
 		return truthy(l) || truthy(r)
 	case "+":
-		if la, ok := l.([]any); ok {
-			if ra, ok := r.([]any); ok {
+		if lb, ok := l.(bytesVal); ok {
+			if rb, ok := r.(bytesVal); ok {
+				out := make(bytesVal, 0, len(lb)+len(rb))
+				return append(append(out, lb...), rb...)
+			}
+		}
+		if la, ok := listElems(l); ok {
+			if ra, ok := listElems(r); ok {
 				out := make([]any, 0, len(la)+len(ra))
 				return append(append(out, la...), ra...)
 			}
@@ -878,7 +959,15 @@ func applyBin(op string, l, r any) any {
 			_, ok := m[key]
 			return ok
 		}
-		items, _ := r.([]any)
+		if rb, ok := r.(bytesVal); ok {
+			if n, ok := l.(int); ok {
+				if n < 0 || n > 255 {
+					return false
+				}
+				return bytes.IndexByte(rb, byte(n)) >= 0
+			}
+		}
+		items, _ := listElems(r)
 		for _, el := range items {
 			if equal(l, el) {
 				return true
@@ -1103,6 +1192,8 @@ func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
 		return s.ioTruncateFile(toStr(arg(0)), toInt(arg(1)))
 	case "fileSize":
 		return s.ioFileSize(toStr(arg(0)))
+	case "fileModTime":
+		return s.ioFileModTime(toStr(arg(0)))
 	case "readFileAt":
 		return s.ioReadFileAt(toStr(arg(0)), toInt(arg(1)), toInt(arg(2)))
 	case "writeFileAt":
@@ -1113,6 +1204,10 @@ func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
 		return s.ioRenameFile(toStr(arg(0)), toStr(arg(1)))
 	case "removeFile":
 		return s.ioRemoveFile(toStr(arg(0)))
+	case "lockFile":
+		return s.ioLockFile(toStr(arg(0)))
+	case "crc32":
+		return crc32Range(arg(0), toInt(arg(1)), toInt(arg(2)))
 	case "httpGet":
 		return s.ioHTTPGet(toStr(arg(0)))
 	case "httpPost":
@@ -1166,6 +1261,16 @@ func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
 		return aesGcmOpen(arg(0), arg(1), arg(2))
 	case "aesGcmAuthentic":
 		return aesGcmAuthentic(arg(0), arg(1), arg(2))
+	case "sha256Bytes":
+		return sha256Bytes(arg(0))
+	case "hmacSha256":
+		return hmacSha256(arg(0), arg(1))
+	case "base64UrlRaw":
+		return base64UrlRaw(arg(0))
+	case "bcryptHash":
+		return bcryptHashBuiltin(arg(0))
+	case "bcryptMatches":
+		return passwordMatches(toStr(arg(0)), toStr(arg(1))), nil
 	case "writeBytes":
 		return s.ioWriteBytes(toInt(arg(0)), arg(1))
 	case "closeConn":
@@ -1196,6 +1301,8 @@ func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
 		return os.Getenv(toStr(arg(0))), nil
 	case "grantRead":
 		return s.ioGrantRead(toStr(arg(0)))
+	case "listenerPort":
+		return s.ioListenerPort(toInt(arg(0)))
 	case "listenError":
 		return s.ioListenError(toInt(arg(0)))
 	case "closeListener":
@@ -1381,6 +1488,8 @@ func callBuiltin(name string, argVals []any) any {
 		switch v := arg(0).(type) {
 		case []any:
 			return len(v)
+		case bytesVal:
+			return len(v)
 		case map[any]any:
 			return len(v)
 		default:
@@ -1399,12 +1508,7 @@ func callBuiltin(name string, argVals []any) any {
 		// bytes(n)/readBytes byte buffer already is (see bytesType's doc in
 		// internal/ir/build.go), so it is len()-able, index-readable, and
 		// accepted wherever a byte buffer already is (e.g. writeBytes).
-		buf := []byte(toStr(arg(0)))
-		out := make([]any, len(buf))
-		for i, b := range buf {
-			out[i] = int(b)
-		}
-		return out
+		return bytesVal([]byte(toStr(arg(0))))
 	case "bytesToText":
 		// bytesToText(b) -> text: textToBytes' inverse, decoding a [int]
 		// byte buffer as UTF-8. Invalid input (a byte value out of range, or
@@ -1421,6 +1525,9 @@ func callBuiltin(name string, argVals []any) any {
 		// other pure builtins have. A byte value outside 0-255 is clamped
 		// into range first, the same defensive clamp writeBytes already
 		// applies to its own []int argument.
+		if bv, ok := arg(0).(bytesVal); ok {
+			return string(bv)
+		}
 		arr, _ := arg(0).([]any)
 		buf := make([]byte, len(arr))
 		for i, v := range arr {
@@ -1450,11 +1557,7 @@ func callBuiltin(name string, argVals []any) any {
 		if n < 0 {
 			n = 0
 		}
-		out := make([]any, n)
-		for i := range out {
-			out[i] = 0
-		}
-		return out
+		return make(bytesVal, n)
 	case "append":
 		// Functional, Go-`append`-flavored, but deliberately never reusing the
 		// input's backing array (unlike Go's own append, which may extend it in
@@ -1464,11 +1567,7 @@ func callBuiltin(name string, argVals []any) any {
 		// cloneArrayValue (copy-on-assign), no two proc-local array variables
 		// ever share a backing array, which is what makes `xs[i] = v` a safe,
 		// genuinely-in-place mutation of exactly the one variable it names.
-		arr, _ := arg(0).([]any)
-		out := make([]any, len(arr)+1)
-		copy(out, arr)
-		out[len(arr)] = arg(1)
-		return out
+		return appendCopy(arg(0), arg(1))
 	case "upper":
 		return strings.ToUpper(toStr(arg(0)))
 	case "lower":
@@ -1505,6 +1604,9 @@ func callBuiltin(name string, argVals []any) any {
 		if l, ok := arg(0).([]any); ok && len(l) > 0 {
 			return l[0]
 		}
+		if b, ok := arg(0).(bytesVal); ok && len(b) > 0 {
+			return bytesElem(b, 0)
+		}
 		return nil
 	case "compact":
 		return compact(toInt(arg(0)))
@@ -1519,7 +1621,7 @@ func callBuiltin(name string, argVals []any) any {
 	case "join":
 		// join(list, sep): the elements as text, sep between them — split's
 		// inverse.
-		items, _ := arg(0).([]any)
+		items, _ := listElems(arg(0))
 		parts := make([]string, len(items))
 		for i, it := range items {
 			parts[i] = toStr(it)
@@ -1557,7 +1659,15 @@ func callBuiltin(name string, argVals []any) any {
 		if xs, ok := arg(0).([]any); ok {
 			return listSlice(xs, toInt(arg(1)), toInt(arg(2)))
 		}
-		return runeSlice(toStr(arg(0)), toInt(arg(1)), toInt(arg(2)))
+		if b, ok := arg(0).(bytesVal); ok {
+			start, end := listBounds(len(b), toInt(arg(1)), toInt(arg(2)))
+			out := make(bytesVal, end-start)
+			copy(out, b[start:end])
+			return out
+		}
+		return boxStr(runeSlice(toStr(arg(0)), toInt(arg(1)), toInt(arg(2))))
+	case "indexOf":
+		return runeIndexOf(toStr(arg(0)), toStr(arg(1)), toInt(arg(2)))
 	case "charAt":
 		// charAt(s, i) -> text, a length-1 string (this language has no
 		// separate character/rune type) — defined as exactly slice(s, i,
@@ -1568,7 +1678,7 @@ func callBuiltin(name string, argVals []any) any {
 		if i < 0 {
 			return ""
 		}
-		return runeSlice(toStr(arg(0)), i, i+1)
+		return boxStr(runeSlice(toStr(arg(0)), i, i+1))
 	case "year":
 		return int(time.Unix(int64(toInt(arg(0))), 0).UTC().Year())
 	case "month":
@@ -1651,6 +1761,12 @@ func formatDebugValue(v any) string {
 		parts := make([]string, len(t))
 		for i, el := range t {
 			parts[i] = formatDebugValue(el)
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
+	case bytesVal:
+		parts := make([]string, len(t))
+		for i, el := range t {
+			parts[i] = itoa(int(el))
 		}
 		return "[" + strings.Join(parts, ", ") + "]"
 	case map[string]any:
@@ -1965,6 +2081,12 @@ func toStr(v any) string {
 			parts[i] = toStr(el)
 		}
 		return strings.Join(parts, ",")
+	case bytesVal:
+		parts := make([]string, len(t))
+		for i, el := range t {
+			parts[i] = itoa(int(el))
+		}
+		return strings.Join(parts, ",")
 	case nil:
 		return ""
 	}
@@ -1972,6 +2094,14 @@ func toStr(v any) string {
 }
 
 func equal(a, b any) bool {
+	// A byte buffer equals another list (either representation) element
+	// by element — the comparison an [int] of the same values would make.
+	if ab, ok := a.(bytesVal); ok {
+		return bytesEqualList(ab, b)
+	}
+	if bb, ok := b.(bytesVal); ok {
+		return bytesEqualList(bb, a)
+	}
 	// Read a driver's []byte as the string it holds before dispatching, so it
 	// takes the text branch below rather than falling through to the numeric one
 	// — where two different non-numeric byte strings would both convert to 0 and
@@ -2039,4 +2169,65 @@ func itoa(n int) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+// appendCopy is the append builtin: a new list holding xs's elements (none
+// when xs is not a list) and then v, never xs's own backing array.
+func appendCopy(xs, v any) any {
+	if b, ok := xs.(bytesVal); ok {
+		if x, isByte := isByteInt(v); isByte {
+			out := make(bytesVal, len(b)+1)
+			copy(out, b)
+			out[len(b)] = x
+			return out
+		}
+		xs = promoteBytes(b)
+	}
+	arr, _ := xs.([]any)
+	out := make([]any, len(arr)+1)
+	copy(out, arr)
+	out[len(arr)] = v
+	return out
+}
+
+// bytesEqualList: a byte buffer against any other value, as equal() sees
+// it — element by element against a list, false against anything else.
+func bytesEqualList(a bytesVal, b any) bool {
+	switch t := b.(type) {
+	case bytesVal:
+		return bytes.Equal(a, t)
+	case []any:
+		if len(a) != len(t) {
+			return false
+		}
+		for i, x := range t {
+			n, ok := x.(int)
+			if !ok || n != int(a[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// listBounds clamps a slice's [start, end) into [0, n], exactly as
+// listSlice does.
+func listBounds(n, start, end int) (int, int) {
+	if start < 0 {
+		start = 0
+	}
+	if start > n {
+		start = n
+	}
+	if end < 0 {
+		end = 0
+	}
+	if end > n {
+		end = n
+	}
+	if end < start {
+		end = start
+	}
+	return start, end
 }

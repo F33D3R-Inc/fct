@@ -98,3 +98,104 @@ func TestCheckRouteShadowing(t *testing.T) {
 		t.Errorf("sampleApp declares no shadowed routes, got %d findings: %+v", len(got), got)
 	}
 }
+
+// contractApp declares typed HTTP operations with `api` and publishes them
+// with `contract`: the surface a native client is written against.
+const contractApp = `app Contract:
+    entity Account:
+        id: int
+        handle: text
+    type SessionDTO:
+        token: text
+    policy member:
+        actor != "guest"
+    action signup(handle: text) -> SessionDTO:
+        add Account { handle: handle }
+        return SessionDTO{token: handle}
+    action me() -> SessionDTO:
+        requires member
+        return SessionDTO{token: actor}
+    action revokeSession(id: int):
+        requires member
+        remove Account(id)
+    api POST "/api/v2/accounts" -> signup status 201:
+        summary "Create an account."
+    api GET "/api/v2/me" -> me:
+        summary "The signed-in account."
+    api DELETE "/api/v2/sessions/{id}" -> revokeSession status 204
+    stream "/api/v2/events" requires member:
+        ping: SessionDTO "A ping."
+    contract "/api/v2/contract":
+        title "Contract"
+    view Home at "/":
+        box:
+            text "hi"
+`
+
+// TestRoutesListDeclaredContract proves `facet routes` lists every declared
+// `api` operation and the published contract document. Before this, the
+// table showed the generic /api/<Action> projection and the pages, and not
+// one of the routes the app's own contract promised — the F33D3R API facet
+// declares over a hundred and `facet routes` reported none of them.
+func TestRoutesListDeclaredContract(t *testing.T) {
+	g, err := compile.String(contractApp)
+	if err != nil {
+		t.Fatalf("contractApp must compile: %v", err)
+	}
+	routes := buildRoutes(g, false)
+
+	type key struct{ method, path string }
+	byKey := map[key]RouteEntry{}
+	for _, r := range routes {
+		if r.Kind == "contract" {
+			byKey[key{r.Method, r.Path}] = r
+		}
+	}
+	want := []struct {
+		method, path, name, requires, note string
+		params                             []string
+	}{
+		{"POST", "/api/v2/accounts", "signup", "", "→ 201", nil},
+		{"GET", "/api/v2/me", "me", "member", "me()", nil},
+		{"DELETE", "/api/v2/sessions/{id}", "revokeSession", "member", "→ 204", []string{"id"}},
+		{"GET", "/api/v2/contract", "contract", "", "document", nil},
+		{"GET", "/api/v2/contract/version", "contract", "", "version", nil},
+		{"GET", "/api/v2/contract/history", "contract", "", "every version", nil},
+		{"GET", "/api/v2/contract/diff", "contract", "", "changed", nil},
+		{"GET", "/api/v2/events", "stream", "member", "server-sent events: ping", nil},
+	}
+	for _, w := range want {
+		r, ok := byKey[key{w.method, w.path}]
+		if !ok {
+			t.Fatalf("expected a contract route %s %s, got %v", w.method, w.path, routes)
+		}
+		if r.Name != w.name {
+			t.Errorf("%s %s: Name = %q, want %q", w.method, w.path, r.Name, w.name)
+		}
+		if r.Requires != w.requires {
+			t.Errorf("%s %s: Requires = %q, want %q", w.method, w.path, r.Requires, w.requires)
+		}
+		if !strings.Contains(r.Note, w.note) {
+			t.Errorf("%s %s: Note = %q, want it to mention %q", w.method, w.path, r.Note, w.note)
+		}
+		if strings.Join(r.Params, ",") != strings.Join(w.params, ",") {
+			t.Errorf("%s %s: Params = %v, want %v", w.method, w.path, r.Params, w.params)
+		}
+	}
+
+	// The contract section sits between the generic API projection and the
+	// webhooks, and the human table names it.
+	var buf bytes.Buffer
+	writeRoutesText(&buf, RouteReport{App: g.App, Routes: routes})
+	out := buf.String()
+	api, contract := strings.Index(out, "\nAPI "), strings.Index(out, "\nCONTRACT ")
+	if contract < 0 {
+		t.Fatalf("the text table must have a CONTRACT section:\n%s", out)
+	}
+	if api < 0 || api > contract {
+		t.Errorf("CONTRACT must follow the API section:\n%s", out)
+	}
+	if !strings.Contains(out, "POST   /api/v2/accounts") && !strings.Contains(out, "POST /api/v2/accounts") {
+		t.Errorf("the table must list the declared operation:\n%s", out)
+	}
+}

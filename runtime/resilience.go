@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -40,8 +41,20 @@ const shutdownGrace = 25 * time.Second
 // shutdown signal arrives, then drains gracefully. It replaces a bare
 // http.ListenAndServe so a `facet run` is deploy-safe out of the box.
 func (s *Server) Serve(addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return s.ServeOn(ln)
+}
+
+// ServeOn is Serve over a listener the caller already bound — how a
+// supervisor (or a test) starts the app on a port it chose by binding it,
+// with no window in which another process could take the port between
+// choosing and serving. The listener is closed when serving ends.
+func (s *Server) ServeOn(ln net.Listener) error {
 	srv := &http.Server{
-		Addr:    addr,
+		Addr:    ln.Addr().String(),
 		Handler: s.Handler(),
 		// A slow client cannot hold a connection open indefinitely. No WriteTimeout:
 		// the SSE stream is a long-lived push and must not be cut off mid-stream.
@@ -51,7 +64,7 @@ func (s *Server) Serve(addr string) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
 	}()

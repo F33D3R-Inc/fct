@@ -28,6 +28,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -63,6 +64,10 @@ func fqServerFacet(t *testing.T) string {
 	return fqServerFacetBin
 }
 
+// fqFreePort asks the kernel for a port and releases it — racy, and no
+// longer used by this file's servers (they start on port 0 and say which
+// port they got: fqBannerPort). Kept for the fabric tests, whose
+// processes take a port number.
 func fqFreePort(t *testing.T) int {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -73,8 +78,42 @@ func fqFreePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
+// fqBannerRE matches the banner both servers print once bound: with port 0
+// asked for, the port named is the ephemeral one the kernel chose — the
+// harness never picks a port another process could take first.
+var fqBannerRE = regexp.MustCompile(`FacetQL Server Running on port (\d+)`)
+
+func fqBannerPort(out string) int {
+	m := fqBannerRE.FindStringSubmatch(out)
+	if m == nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n
+}
+
+// fqLockedBuf is a process's captured output, safe to read while the
+// process still writes it.
+type fqLockedBuf struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *fqLockedBuf) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *fqLockedBuf) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
 // fqServerPair starts the Rust and the fct server with the same extra
-// environment and returns their ports once both answer.
+// environment, each on port 0, and returns the ports their banners name
+// once both answer.
 func fqServerPair(t *testing.T, env ...string) (int, int) {
 	t.Helper()
 	return fqServerPairWith(t, nil, env...)
@@ -92,14 +131,14 @@ func fqServerPairWith(t *testing.T, perServer func(dir string) []string, env ...
 		t.Fatal(err)
 	}
 	base := []string{"FACETQL_TOKENS=tok:alice:admin,utok:bob", "FACETQL_ENV=development", "FACETQL_MASTER_KEY=" + facetqlCheckKey}
-	start := func(name string, argv []string, dir string, port int, extra ...string) {
+	start := func(name string, argv []string, dir string, extra ...string) int {
 		log, err := os.Create(dir + ".log")
 		if err != nil {
 			t.Fatal(err)
 		}
 		cmd := exec.Command(argv[0], argv[1:]...)
 		cmd.Dir = dir
-		cmd.Env = append(append(append(os.Environ(), base...), env...), append(extra, "FACETQL_DATA_DIR="+dir, fmt.Sprintf("FACETQL_PORT=%d", port))...)
+		cmd.Env = append(append(append(os.Environ(), base...), env...), append(extra, "FACETQL_DATA_DIR="+dir, "FACETQL_PORT=0")...)
 		if perServer != nil {
 			cmd.Env = append(cmd.Env, perServer(dir)...)
 		}
@@ -115,14 +154,18 @@ func fqServerPairWith(t *testing.T, perServer func(dir string) []string, env ...
 		})
 		deadline := time.Now().Add(60 * time.Second)
 		for time.Now().Before(deadline) {
-			if c, err := fqDial(port); err == nil {
-				c.Close()
-				return
+			out, _ := os.ReadFile(dir + ".log")
+			if port := fqBannerPort(string(out)); port != 0 {
+				if c, err := fqDial(port); err == nil {
+					c.Close()
+					return port
+				}
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
 		out, _ := os.ReadFile(dir + ".log")
 		t.Fatalf("%s never listened:\n%s", name, out)
+		return 0
 	}
 	root := t.TempDir()
 	rdir, fdir := filepath.Join(root, "rust"), filepath.Join(root, "fct")
@@ -131,9 +174,8 @@ func fqServerPairWith(t *testing.T, perServer func(dir string) []string, env ...
 			t.Fatal(err)
 		}
 	}
-	rp, fp := fqFreePort(t), fqFreePort(t)
-	start("facetql", []string{rust, "serve"}, rdir, rp)
-	start("fqserver.fct", []string{facet, "exec", server}, fdir, fp, "FACET_DATA_DIR="+fdir)
+	rp := start("facetql", []string{rust, "serve"}, rdir)
+	fp := start("fqserver.fct", []string{facet, "exec", server}, fdir, "FACET_DATA_DIR="+fdir)
 	return rp, fp
 }
 
@@ -688,13 +730,14 @@ func fqFacetqlStart(t *testing.T) string {
 
 type fqProc struct {
 	cmd            *exec.Cmd
-	stdout, stderr *strings.Builder
+	stdout, stderr *fqLockedBuf
 	done           chan struct{}
 }
 
 // fqStartProc starts one server — "rust" (`facetql start`) or "fct" —
-// in dir with env, without waiting for it.
-func fqStartProc(t *testing.T, which, dir string, port int, env ...string) *fqProc {
+// in dir with env, on port 0 (fqWaitListening learns which port it got),
+// without waiting for it.
+func fqStartProc(t *testing.T, which, dir string, env ...string) *fqProc {
 	t.Helper()
 	var cmd *exec.Cmd
 	if which == "rust" {
@@ -705,8 +748,8 @@ func fqStartProc(t *testing.T, which, dir string, port int, env ...string) *fqPr
 		env = append(env, "FACET_DATA_DIR="+dir)
 	}
 	cmd.Dir = dir
-	cmd.Env = append(append(os.Environ(), env...), "FACETQL_DATA_DIR="+dir, fmt.Sprintf("FACETQL_PORT=%d", port))
-	p := &fqProc{cmd: cmd, stdout: &strings.Builder{}, stderr: &strings.Builder{}, done: make(chan struct{})}
+	cmd.Env = append(append(os.Environ(), env...), "FACETQL_DATA_DIR="+dir, "FACETQL_PORT=0")
+	p := &fqProc{cmd: cmd, stdout: &fqLockedBuf{}, stderr: &fqLockedBuf{}, done: make(chan struct{})}
 	cmd.Stdout, cmd.Stderr = p.stdout, p.stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -730,13 +773,17 @@ func (p *fqProc) fqExit(t *testing.T) int {
 	return p.cmd.ProcessState.ExitCode()
 }
 
-func fqWaitListening(t *testing.T, p *fqProc, port int) {
+// fqWaitListening waits for the server's banner and answers the port it
+// names, once the server accepts a connection on it.
+func fqWaitListening(t *testing.T, p *fqProc) int {
 	t.Helper()
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
-		if c, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port)); err == nil {
-			c.Close()
-			return
+		if port := fqBannerPort(p.stdout.String()); port != 0 {
+			if c, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port)); err == nil {
+				c.Close()
+				return port
+			}
 		}
 		select {
 		case <-p.done:
@@ -745,6 +792,7 @@ func fqWaitListening(t *testing.T, p *fqProc, port int) {
 		}
 	}
 	t.Fatal("never listened")
+	return 0
 }
 
 // TestFqServerShutdownBothWays: SIGTERM finishes what is in flight, takes
@@ -755,9 +803,8 @@ func TestFqServerShutdownBothWays(t *testing.T) {
 	outcome := map[string]string{}
 	for _, which := range []string{"rust", "fct"} {
 		dir := t.TempDir()
-		port := fqFreePort(t)
-		p := fqStartProc(t, which, dir, port, env...)
-		fqWaitListening(t, p, port)
+		p := fqStartProc(t, which, dir, env...)
+		port := fqWaitListening(t, p)
 		if r := fqRaw(t, port, fqSend("POST", "/node", "tok", fqNode("s:1", "S", "{}", "")).raw(), 0); !strings.HasPrefix(r, "HTTP/1.1 201") {
 			t.Fatalf("%s: %q", which, r)
 		}
@@ -771,9 +818,8 @@ func TestFqServerShutdownBothWays(t *testing.T) {
 				lines = append(lines, l)
 			}
 		}
-		port2 := fqFreePort(t)
-		p2 := fqStartProc(t, which, dir, port2, env...)
-		fqWaitListening(t, p2, port2)
+		p2 := fqStartProc(t, which, dir, env...)
+		port2 := fqWaitListening(t, p2)
 		again := fqNorm(fqRaw(t, port2, fqGet("/node/s:1", "tok").raw(), 0))
 		outcome[which] = fmt.Sprintf("exit %d\n%s\n%s", code, strings.Join(lines, "\n"), again)
 	}
@@ -794,19 +840,18 @@ func TestFqServerRefusalsBothWays(t *testing.T) {
 	outcome := map[string]string{}
 	for _, which := range []string{"rust", "fct"} {
 		dir := t.TempDir()
-		p := fqStartProc(t, which, dir, fqFreePort(t))
+		p := fqStartProc(t, which, dir)
 		code := p.fqExit(t)
 		posture := fmt.Sprintf("exit %d\n%s", code, p.stderr.String())
 
 		env := []string{"FACETQL_TOKENS=tok:alice:admin", "FACETQL_ENV=development"}
-		port := fqFreePort(t)
-		w := fqStartProc(t, which, dir, port, append(env, "FACETQL_MASTER_KEY="+facetqlCheckKey)...)
-		fqWaitListening(t, w, port)
+		w := fqStartProc(t, which, dir, append(env, "FACETQL_MASTER_KEY="+facetqlCheckKey)...)
+		port := fqWaitListening(t, w)
 		fqRaw(t, port, fqSend("POST", "/node", "tok", fqNode("k:1", "K", "{}", "")).raw(), 0)
 		_ = w.cmd.Process.Signal(syscall.SIGTERM)
 		w.fqExit(t)
 		other := strings.Repeat("ab", 32)
-		r := fqStartProc(t, which, dir, fqFreePort(t), append(env, "FACETQL_MASTER_KEY="+other)...)
+		r := fqStartProc(t, which, dir, append(env, "FACETQL_MASTER_KEY="+other)...)
 		code2 := r.fqExit(t)
 		stderr := strings.ReplaceAll(r.stderr.String(), dir, "<dir>")
 		var failure []string

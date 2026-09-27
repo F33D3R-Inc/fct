@@ -234,7 +234,7 @@ func (r *channelRegistry) awaitAny(ids []int, ms int) (any, error) {
 
 // intListArg reads a builtin's [int] argument.
 func intListArg(name string, v any) ([]int, error) {
-	arr, ok := v.([]any)
+	arr, ok := listElems(v)
 	if !ok {
 		return nil, fmt.Errorf("%s: expected a list of channel handles", name)
 	}

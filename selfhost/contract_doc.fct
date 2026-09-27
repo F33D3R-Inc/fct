@@ -1,0 +1,935 @@
+import "upload_media.fct"
+
+app ContractDoc:
+    # contract_doc.fct — runtime/contract.go's buildContract: the OpenAPI
+    # 3.1 document of an app's declared surface — every `api` route with
+    # its parameters, request body, responses and security; every wire
+    # type, tagged message and entity a route reaches as a component
+    # schema; every `stream` route and its events (x-stream-events); the
+    # tagged mutations a dispatch route accepts (x-mutation-events); the
+    # contract's own routes — assembled as records and encoded exactly as
+    # encoding/json encodes Go's maps (keys sorted, HTML-safe strings).
+    # info.version is the sha256 of the document encoded with an empty
+    # version, so equal contracts have equal versions.
+    proc cRec(keys: [text], vals: [Val]) -> Val:
+        let r = do recordVal(keys, vals)
+        return r
+
+    proc cStr() -> Val:
+        let r = do cRec(["type"], [textVal("string")])
+        return r
+
+    proc cTyped(t: text) -> Val:
+        let r = do cRec(["type"], [textVal(t)])
+        return r
+
+    proc cDateTime() -> Val:
+        let r = do cRec(["type", "format"], [textVal("string"), textVal("date-time")])
+        return r
+
+    proc cAnyJSON() -> Val:
+        let r = do cRec(["description"], [textVal("Any JSON value.")])
+        return r
+
+    proc cRef(name: text) -> Val:
+        let r = do cRec(["$ref"], [textVal("#/components/schemas/" + name)])
+        return r
+
+    proc cTexts(xs: [text]) -> Val:
+        let mut items = []
+        let mut i = 0
+        loop i < len(xs):
+            items = append(items, textVal(xs[i]))
+            i = i + 1
+        let l = do listVal(items)
+        return l
+
+    proc cObjSchema(propKeys: [text], propVals: [Val], required: [text]) -> Val:
+        let props = do cRec(propKeys, propVals)
+        let mut r = do cRec(["type", "properties", "additionalProperties"], [textVal("object"), props, boolVal(false)])
+        if len(required) > 0:
+            r = do valSet(r, "required", cTexts(required))
+        return r
+
+    # cNullable: nullable — a $ref becomes oneOf [ref, null]; a typed schema
+    # gets "null" beside its type.
+    proc cNullable(schema: Val) -> Val:
+        let hasRef = do valHas(schema, "$ref")
+        if hasRef:
+            let r = do cRec(["oneOf"], [listVal([schema, cTyped("null")])])
+            return r
+        let mut out = schema
+        let t = do valGet(schema, "type")
+        if t.kind == "text":
+            out = do valSet(out, "type", listVal([t, textVal("null")]))
+        else:
+            if t.kind == "none":
+                out = do valSet(out, "type", listVal([textVal("null")]))
+        return out
+
+    proc cBodySchema(schema: Val) -> Val:
+        let hasRef = do valHas(schema, "$ref")
+        if hasRef:
+            let n = do cNullable(schema)
+            return n
+        return schema
+
+    proc cErrorSchemas() -> Val:
+        let inner = do cObjSchema(["code", "message"], [cStr(), cStr()], ["code", "message"])
+        let outer = do cObjSchema(["error"], [cRef("apiErrorBody")], ["error"])
+        let r = do cRec(["APIErrorDTO", "apiErrorBody"], [outer, inner])
+        return r
+
+    proc cErrResp(desc: text) -> Val:
+        let content = do cRec(["application/json"], [cRec(["schema"], [cNullable(cRef("APIErrorDTO"))])])
+        let r = do cRec(["description", "content"], [textVal(desc), content])
+        return r
+
+    proc cRateLimitDoc(w: RtWorld, class: text) -> Val:
+        let per = do rtRatePerMinute(w, class)
+        let r = do cRec(["limiter", "per_minute", "burst", "keyed_by", "headers"], [textVal(class), intVal(per), intVal(rtRateBurst(per)), textVal("ip"), cTexts(["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset", "Retry-After"])])
+        return r
+
+    # cOperationID: operationIDFor — the method, then each path segment
+    # (an /api/vN prefix dropped, braces stripped) title-cased on -_. .
+    proc cOperationID(method: text, path: text) -> text:
+        let mut segs = split(rtTrimSlashes(path), "/")
+        if len(segs) >= 2 && segs[0] == "api" && len(segs[1]) > 1 && charAt(segs[1], 0) == "v":
+            segs = slice(segs, 2, len(segs))
+        let mut out = lower(method)
+        let mut i = 0
+        loop i < len(segs):
+            let seg = replace(replace(segs[i], "{", ""), "}", "")
+            let parts = split(replace(replace(seg, "-", "."), "_", "."), ".")
+            let mut k = 0
+            loop k < len(parts):
+                if parts[k] != "":
+                    out = out + upper(slice(parts[k], 0, 1)) + slice(parts[k], 1, len(parts[k]))
+                k = k + 1
+            i = i + 1
+        return out
+
+    proc cStatusText(status: int) -> text:
+        if status == 200:
+            return "OK"
+        if status == 201:
+            return "Created"
+        if status == 202:
+            return "Accepted"
+        if status == 204:
+            return "No Content"
+        if status == 301:
+            return "Moved Permanently"
+        if status == 302:
+            return "Found"
+        if status == 303:
+            return "See Other"
+        if status == 304:
+            return "Not Modified"
+        if status == 307:
+            return "Temporary Redirect"
+        if status == 308:
+            return "Permanent Redirect"
+        let t = do rtStatusText(status)
+        return t
+
+    # ── wire schemas ────────────────────────────────────────────────────
+    # RtSch: a schema and the entities it referenced (usedEntities).
+    struct RtSch:
+        v: Val
+        used: [text]
+
+    proc cIsEnum(g: IRGraph, typ: text) -> int:
+        let mut i = 0
+        loop i < len(g.enums):
+            if g.enums[i].name == typ:
+                return i
+            i = i + 1
+        return -1
+
+    proc cSchemaNameOf(g: IRGraph, typ: text) -> text:
+        let mut i = 0
+        loop i < len(g.types):
+            if g.types[i].name == typ:
+                if g.types[i].schema != "":
+                    return g.types[i].schema
+                return g.types[i].name
+            i = i + 1
+        return typ
+
+    proc cAddUsed(used: [text], name: text) -> [text]:
+        let has = do rtInList(used, name)
+        if has:
+            return used
+        return append(used, name)
+
+    # cWireSchema: wireSchema — trackUsed false when the caller passes Go's
+    # nil map (an entity's own fields).
+    proc cWireSchema(g: IRGraph, typ: text, list: bool, used0: [text], trackUsed: bool) -> RtSch:
+        let mut used = used0
+        let mut sch = do noneVal()
+        if typ == "int" || typ == "money" || typ == "date":
+            sch = do cTyped("integer")
+        else:
+            if typ == "float" || typ == "number":
+                sch = do cTyped("number")
+            else:
+                if typ == "bool":
+                    sch = do cTyped("boolean")
+                else:
+                    if typ == "text":
+                        sch = do cStr()
+                    else:
+                        if typ == "datetime":
+                            sch = do cDateTime()
+                        else:
+                            if typ == "bytes":
+                                sch = do cRec(["type", "format"], [textVal("string"), textVal("binary")])
+                            else:
+                                if typ == "json":
+                                    sch = do cAnyJSON()
+                                else:
+                                    let ei = do cIsEnum(g, typ)
+                                    if ei >= 0:
+                                        let vals = do rtSortedTexts(g.enums[ei].values)
+                                        sch = do cRec(["type", "enum"], [textVal("string"), cTexts(vals)])
+                                    else:
+                                        let ent = do rtEntityIndex(g, typ)
+                                        if ent >= 0 && trackUsed:
+                                            used = do cAddUsed(used, typ)
+                                        sch = do cRef(cSchemaNameOf(g, typ))
+        if list:
+            let arr = do cRec(["type", "items"], [textVal("array"), sch])
+            return RtSch{v: arr, used: used}
+        return RtSch{v: sch, used: used}
+
+    proc cFieldSchema(g: IRGraph, f: IRWireField, used0: [text]) -> RtSch:
+        let base = do cWireSchema(g, f.type, false, used0, true)
+        let mut sch = base.v
+        if f.map:
+            sch = do cRec(["type", "additionalProperties"], [textVal("object"), sch])
+        else:
+            if f.list:
+                let mut depth = f.depth
+                if depth < 1:
+                    depth = 1
+                let mut d = 0
+                loop d < depth:
+                    sch = do cRec(["type", "items"], [textVal("array"), sch])
+                    d = d + 1
+        if f.nullable:
+            sch = do cNullable(sch)
+        return RtSch{v: sch, used: base.used}
+
+    proc cIsWireTypeOrMessage(g: IRGraph, name: text) -> bool:
+        let r = do rtIsWireTypeOrMessage(g, name)
+        return r
+
+    # ── one declared route ──────────────────────────────────────────────
+    struct RtDocs:
+        names: [text]
+        types: [text]
+        descs: [text]
+        enums: [Val]
+
+    proc cDocsOf(a: IRAPI) -> RtDocs:
+        let mut names = []
+        let mut types = []
+        let mut descs = []
+        let mut enums = []
+        let mut i = 0
+        loop i < len(a.paramDocs):
+            names = append(names, a.paramDocs[i].name)
+            types = append(types, a.paramDocs[i].type)
+            descs = append(descs, a.paramDocs[i].description)
+            enums = append(enums, cTexts(a.paramDocs[i].enum))
+            i = i + 1
+        return RtDocs{names: names, types: types, descs: descs, enums: enums}
+
+    proc cDocIndex(d: RtDocs, name: text) -> int:
+        let mut i = 0
+        loop i < len(d.names):
+            if d.names[i] == name:
+                return i
+            i = i + 1
+        return -1
+
+    proc cParamSchema(g: IRGraph, p: IRParam, d: RtDocs, used0: [text]) -> RtSch:
+        let di = do cDocIndex(d, p.name)
+        if di < 0:
+            let plain = do cWireSchema(g, p.type, p.list, used0, true)
+            return plain
+        let list = p.list && d.types[di] != "text"
+        let s = do cWireSchema(g, d.types[di], list, used0, true)
+        let mut sch = s.v
+        if len(d.enums[di].items) > 0:
+            if list:
+                let items = do valGet(sch, "items")
+                sch = do valSet(sch, "items", valSet(items, "enum", d.enums[di]))
+            else:
+                sch = do valSet(sch, "enum", d.enums[di])
+        return RtSch{v: sch, used: s.used}
+
+    proc cWithDoc(entry: Val, d: RtDocs, name: text) -> Val:
+        let di = do cDocIndex(d, name)
+        if di >= 0 && d.descs[di] != "":
+            let r = do valSet(entry, "description", textVal(d.descs[di]))
+            return r
+        return entry
+
+    proc cCollectStatuses(st: IRStmt, op: text) -> [int]:
+        let mut out = []
+        if st.op == op && st.status != 0:
+            out = append(out, st.status)
+        let mut i = 0
+        loop i < len(st.body):
+            let b = do cCollectStatuses(st.body[i], op)
+            out = out + b
+            i = i + 1
+        let mut j = 0
+        loop j < len(st.elseBody):
+            let e = do cCollectStatuses(st.elseBody[j], op)
+            out = out + e
+            j = j + 1
+        return out
+
+    struct RtOpOut:
+        op: Val
+        used: [text]
+        basic: text
+
+    proc cRouteOperation(w: RtWorld, a: IRAPI, act: IRAction, used0: [text]) -> RtOpOut:
+        let g = w.g
+        let mut used = used0
+        let d = do cDocsOf(a)
+        let mut params = []
+        let mut bodyKeys = []
+        let mut bodyVals = []
+        let mut required = []
+        let mut bodyWire = []
+        let mut hasBytes = false
+        let mut i = 0
+        loop i < len(act.params):
+            let p = act.params[i]
+            let skip = p.name == a.bearer || (a.basicId != "" && p.name == a.basicId) || (a.basicSecret != "" && p.name == a.basicSecret)
+            if !skip:
+                let s = do cWireSchema(g, p.type, p.list, used, true)
+                used = s.used
+                let inPath = do rtInList(a.params, p.name)
+                if inPath:
+                    let ps = do cParamSchema(g, p, d, used)
+                    used = ps.used
+                    let entry = do cRec(["name", "in", "required", "schema"], [textVal(p.name), textVal("path"), boolVal(true), ps.v])
+                    params = append(params, cWithDoc(entry, d, p.name))
+                else:
+                    if a.method == "GET":
+                        let qs = do cParamSchema(g, p, d, used)
+                        used = qs.used
+                        let mut qp = do cRec(["name", "in", "required", "schema"], [textVal(p.name), textVal("query"), boolVal(!p.optional), qs.v])
+                        let di = do cDocIndex(d, p.name)
+                        let docText = di >= 0 && d.types[di] == "text"
+                        if p.list && !docText:
+                            qp = do valSet(qp, "style", textVal("form"))
+                            qp = do valSet(qp, "explode", boolVal(false))
+                        params = append(params, cWithDoc(qp, d, p.name))
+                    else:
+                        if p.type == "bytes":
+                            hasBytes = true
+                        bodyWire = append(bodyWire, p.type)
+                        bodyKeys = append(bodyKeys, p.name)
+                        bodyVals = append(bodyVals, s.v)
+                        if !p.optional:
+                            required = append(required, p.name)
+            i = i + 1
+        let mut wholeBody = ""
+        if len(bodyWire) == 1:
+            let isWire = do cIsWireTypeOrMessage(g, bodyWire[0])
+            if isWire:
+                wholeBody = bodyWire[0]
+        let binary = a.ret == "bytes"
+        let mut opID = a.operation
+        if opID == "":
+            opID = do cOperationID(a.method, a.path)
+        let mut op = do cRec(["operationId", "x-auth", "x-since", "parameters"], [textVal(opID), textVal(a.auth), textVal(a.since), listVal(params)])
+        if a.summary != "":
+            op = do valSet(op, "summary", textVal(a.summary))
+        if a.description != "":
+            op = do valSet(op, "description", textVal(a.description))
+        if a.rate != "":
+            op = do valSet(op, "x-rate-limit", cRateLimitDoc(w, a.rate))
+        let conditional = a.method == "GET" && a.ret != "" && !binary
+        if conditional:
+            op = do valSet(op, "x-conditional-get", boolVal(true))
+        if a.body != "":
+            op = do valSet(op, "requestBody", cRec(["required", "content"], [boolVal(true), cRec(["application/json"], [cRec(["schema"], [cNullable(cRef(cSchemaNameOf(g, a.body)))])])]))
+        else:
+            if wholeBody != "":
+                let ws = do cWireSchema(g, wholeBody, false, used, true)
+                used = ws.used
+                op = do valSet(op, "requestBody", cRec(["required", "content"], [boolVal(true), cRec(["application/json"], [cRec(["schema"], [cBodySchema(ws.v)])])]))
+            else:
+                if len(bodyKeys) > 0:
+                    let mut bs = do cRec(["type", "properties"], [textVal("object"), cRec(bodyKeys, bodyVals)])
+                    if len(required) > 0:
+                        bs = do valSet(bs, "required", cTexts(rtSortedTexts(required)))
+                    let mut ct = "application/json"
+                    if hasBytes:
+                        ct = "multipart/form-data"
+                    else:
+                        if a.form:
+                            ct = "application/x-www-form-urlencoded"
+                    op = do valSet(op, "requestBody", cRec(["required", "content"], [boolVal(true), cRec([ct], [cRec(["schema"], [bs])])]))
+        let mut respKeys = []
+        let mut respVals = []
+        let mut okResp = do cRec(["description"], [textVal(cStatusText(a.status))])
+        if a.ret != "" && a.status != 204 && !binary:
+            let rs = do cWireSchema(g, a.ret, a.retList, used, true)
+            used = rs.used
+            okResp = do valSet(okResp, "content", cRec(["application/json"], [cRec(["schema"], [cBodySchema(rs.v)])]))
+        respKeys = append(respKeys, "" + a.status)
+        respVals = append(respVals, okResp)
+        let mut e = 0
+        loop e < len(a.errors):
+            respKeys = append(respKeys, "" + a.errors[e])
+            respVals = append(respVals, cErrResp(cStatusText(a.errors[e])))
+            e = e + 1
+        let mut basic = ""
+        let mut security = do listVal([])
+        if a.basicId != "":
+            let has401 = do rtInList(respKeys, "401")
+            if !has401:
+                respKeys = append(respKeys, "401")
+                respVals = append(respVals, cErrResp("Unauthorized"))
+            security = do listVal([cRec([a.auth], [listVal([])])])
+            basic = a.auth
+        else:
+            if a.auth == "session" || a.bearer != "":
+                let has401b = do rtInList(respKeys, "401")
+                if !has401b:
+                    respKeys = append(respKeys, "401")
+                    respVals = append(respVals, cErrResp("Unauthorized"))
+                security = do listVal([cRec(["bearer"], [listVal([])])])
+        op = do valSet(op, "security", security)
+        let mut responses = do cRec(respKeys, respVals)
+        let mut si = 0
+        loop si < len(act.body):
+            if len(a.errors) == 0:
+                let checks = do cCollectStatuses(act.body[si], "check")
+                let mut c = 0
+                loop c < len(checks):
+                    responses = do valSet(responses, "" + checks[c], cErrResp(cStatusText(checks[c])))
+                    c = c + 1
+            let rets = do cCollectStatuses(act.body[si], "return")
+            let mut r = 0
+            loop r < len(rets):
+                let mut alt = do cRec(["description"], [textVal(cStatusText(rets[r]))])
+                let hasContent = do valHas(okResp, "content")
+                if hasContent:
+                    alt = do valSet(alt, "content", valGet(okResp, "content"))
+                responses = do valSet(responses, "" + rets[r], alt)
+                r = r + 1
+            si = si + 1
+        if binary && len(a.errors) == 0:
+            responses = do valSet(responses, "502", cErrResp("Bad Gateway"))
+        op = do valSet(op, "responses", responses)
+        return RtOpOut{op: op, used: used, basic: basic}
+
+    # ── dispatch and mutations ──────────────────────────────────────────
+    proc cTagOf(g: IRGraph, msgName: text) -> text:
+        let mi = do rtMessageIndex(g, msgName)
+        if mi >= 0 && g.messages[mi].tag != "":
+            return g.messages[mi].tag
+        return "type"
+
+    proc cDispatchOperation(w: RtWorld, a: IRAPI) -> Val:
+        let g = w.g
+        let tag = do cTagOf(g, a.dispatch)
+        let bodySchema = do cRec(["type", "additionalProperties", "properties", "required"], [textVal("object"), boolVal(true), cRec([tag], [cStr()]), cTexts([tag])])
+        let mut opID = a.operation
+        if opID == "":
+            opID = do cOperationID(a.method, a.path)
+        let mut summary = a.summary
+        if summary == "":
+            summary = "One " + tag + " per call, as a form or a JSON object."
+        let mut description = a.description
+        if description == "":
+            description = "See x-mutation-events for every " + tag + ", its fields, and the JSON result it answers with (204 when it has none)."
+        let content = do cRec(["application/json", "application/x-www-form-urlencoded"], [cRec(["schema"], [bodySchema]), cRec(["schema"], [bodySchema])])
+        let responses = do cRec(["default"], [cRec(["description"], [textVal("Per " + tag + "; see x-mutation-events.")])])
+        let mut op = do cRec(["operationId", "summary", "description", "x-since", "security", "requestBody", "responses"], [textVal(opID), textVal(summary), textVal(description), textVal(a.since), listVal([cRec(["bearer"], [listVal([])])]), cRec(["required", "content"], [boolVal(true), content]), responses])
+        if a.rate != "":
+            op = do valSet(op, "x-rate-limit", cRateLimitDoc(w, a.rate))
+        return op
+
+    proc cMutationFieldType(f: IRWireField) -> text:
+        if f.list:
+            return "array"
+        if f.type == "int" || f.type == "money" || f.type == "date":
+            return "integer"
+        if f.type == "float" || f.type == "number":
+            return "number"
+        if f.type == "bool":
+            return "boolean"
+        if f.type == "text" || f.type == "datetime":
+            return "string"
+        return "object"
+
+    proc cWireNameOf(v: IRWireVariant) -> text:
+        if v.wire != "":
+            return v.wire
+        return v.name
+
+    proc cMutationEvents(g: IRGraph) -> Val:
+        let mut out = []
+        let mut seen = []
+        let mut ai = 0
+        loop ai < len(g.apis):
+            let a = g.apis[ai]
+            if a.dispatch != "":
+                let mi = do rtMessageIndex(g, a.dispatch)
+                if mi >= 0:
+                    let m = g.messages[mi]
+                    let mut vi = 0
+                    loop vi < len(m.variants):
+                        let v = m.variants[vi]
+                        let wire = do cWireNameOf(v)
+                        let dup = do rtInList(seen, wire)
+                        if !dup:
+                            seen = append(seen, wire)
+                            let mut fields = []
+                            let mut fi = 0
+                            loop fi < len(v.fields):
+                                let f = v.fields[fi]
+                                let mut fd = do cRec(["name", "type", "required"], [textVal(f.name), textVal(cMutationFieldType(f)), boolVal(!f.optional && f.default == "")])
+                                if f.description != "":
+                                    fd = do valSet(fd, "description", textVal(f.description))
+                                if len(f.enum) > 0:
+                                    fd = do valSet(fd, "enum", cTexts(f.enum))
+                                fields = append(fields, fd)
+                                fi = fi + 1
+                            let mut ev = do cRec(["event_type", "summary", "x-since", "fields"], [textVal(wire), textVal(v.summary), textVal(v.since), listVal(fields)])
+                            if v.bodyType != "":
+                                ev = do valSet(ev, "body", cRec(["oneOf"], [listVal([cRef(cSchemaNameOf(g, v.bodyType)), cTyped("null")])]))
+                            let mut ac = 0
+                            loop ac < len(g.actions):
+                                let act = g.actions[ac]
+                                if act.name == v.action && act.ret != "":
+                                    let isWire = do cIsWireTypeOrMessage(g, act.ret)
+                                    if isWire:
+                                        let mut r = do cRef(cSchemaNameOf(g, act.ret))
+                                        if act.retList:
+                                            r = do cRec(["type", "items"], [textVal("array"), r])
+                                        ev = do valSet(ev, "result", cRec(["oneOf"], [listVal([r, cTyped("null")])]))
+                                ac = ac + 1
+                            out = append(out, ev)
+                        vi = vi + 1
+            ai = ai + 1
+        let mut bi = 0
+        loop bi < len(g.apis):
+            let b = g.apis[bi]
+            let bai = do rtActionIndex(g, b.action)
+            if b.method != "GET" && bai >= 0:
+                let act2 = g.actions[bai]
+                let mut body = []
+                let mut pi = 0
+                loop pi < len(act2.params):
+                    let inPath = do rtInList(b.params, act2.params[pi].name)
+                    if !inPath && act2.params[pi].name != b.bearer:
+                        body = append(body, act2.params[pi].type)
+                    pi = pi + 1
+                if len(body) == 1:
+                    let mi2 = do rtMessageIndex(g, body[0])
+                    if mi2 >= 0:
+                        let m2 = g.messages[mi2]
+                        let mut vj = 0
+                        loop vj < len(m2.variants):
+                            let v2 = m2.variants[vj]
+                            let wire2 = do cWireNameOf(v2)
+                            let dup2 = do rtInList(seen, wire2)
+                            if !dup2:
+                                seen = append(seen, wire2)
+                                let mut fields2 = []
+                                let mut fj = 0
+                                loop fj < len(v2.fields):
+                                    let f2 = v2.fields[fj]
+                                    fields2 = append(fields2, cRec(["name", "type", "required"], [textVal(f2.name), textVal(cMutationFieldType(f2)), boolVal(!f2.optional)]))
+                                    fj = fj + 1
+                                out = append(out, cRec(["event_type", "summary", "x-since", "fields"], [textVal(v2.name), textVal(""), textVal(b.since), listVal(fields2)]))
+                            vj = vj + 1
+            bi = bi + 1
+        # sorted by event_type (sort.Slice: not stable, but keys are unique)
+        let mut keys = []
+        let mut k = 0
+        loop k < len(out):
+            let et = do valGet(out[k], "event_type")
+            keys = append(keys, et.t)
+            k = k + 1
+        let idx = do rtSortedIndex(keys)
+        let mut sorted = []
+        let mut si = 0
+        loop si < len(idx):
+            sorted = append(sorted, out[idx[si]])
+            si = si + 1
+        let l = do listVal(sorted)
+        return l
+
+    proc cMessageReferenced(g: IRGraph, name: text) -> bool:
+        let mut t = 0
+        loop t < len(g.types):
+            let mut f = 0
+            loop f < len(g.types[t].fields):
+                if g.types[t].fields[f].type == name:
+                    return true
+                f = f + 1
+            t = t + 1
+        let mut m = 0
+        loop m < len(g.messages):
+            let mut v = 0
+            loop v < len(g.messages[m].variants):
+                let mut f2 = 0
+                loop f2 < len(g.messages[m].variants[v].fields):
+                    if g.messages[m].variants[v].fields[f2].type == name:
+                        return true
+                    f2 = f2 + 1
+                v = v + 1
+            m = m + 1
+        let mut a = 0
+        loop a < len(g.actions):
+            if g.actions[a].ret == name:
+                return true
+            let mut p = 0
+            loop p < len(g.actions[a].params):
+                if g.actions[a].params[p].type == name:
+                    return true
+                p = p + 1
+            a = a + 1
+        let mut s = 0
+        loop s < len(g.streams):
+            let mut e = 0
+            loop e < len(g.streams[s].events):
+                if g.streams[s].events[e].type == name:
+                    return true
+                e = e + 1
+            s = s + 1
+        return false
+
+    # ── streams ─────────────────────────────────────────────────────────
+    proc cStreamParams(st: IRStream) -> Val:
+        let mut out = []
+        let mut i = 0
+        loop i < len(st.params):
+            let p = st.params[i]
+            let mut entry = do cRec(["name", "in", "required", "schema"], [textVal(p), textVal("path"), boolVal(true), cStr()])
+            let mut d = 0
+            loop d < len(st.paramDocs):
+                if st.paramDocs[d].name == p:
+                    if st.paramDocs[d].description != "":
+                        entry = do valSet(entry, "description", textVal(st.paramDocs[d].description))
+                    if len(st.paramDocs[d].enum) > 0:
+                        entry = do valSet(entry, "schema", cRec(["type", "enum"], [textVal("string"), cTexts(st.paramDocs[d].enum)]))
+                d = d + 1
+            out = append(out, entry)
+            i = i + 1
+        out = append(out, cRec(["name", "in", "required", "schema", "description"], [textVal("Last-Event-ID"), textVal("header"), boolVal(false), cStr(), textVal("The last `id:` seen; missed frames are replayed after it.")]))
+        out = append(out, cRec(["name", "in", "required", "schema", "description"], [textVal("last_event_id"), textVal("query"), boolVal(false), cStr(), textVal("The same resume point for a client that reconnects by hand; the header wins.")]))
+        let l = do listVal(out)
+        return l
+
+    proc cHelloEventSchema() -> Val:
+        let r = do cObjSchema(["session_id", "contract_version", "schema_version", "server_time"], [cStr(), cStr(), cStr(), cDateTime()], ["contract_version", "schema_version", "server_time", "session_id"])
+        return r
+
+    # ── the contract's own routes ───────────────────────────────────────
+    proc cList(name: text) -> Val:
+        let r = do cRec(["type", "items"], [textVal("array"), cRef(name)])
+        return r
+
+    proc cContractSchemas() -> Val:
+        let str = do cStr()
+        let boolean = do cTyped("boolean")
+        let integer = do cTyped("integer")
+        let dt = do cDateTime()
+        let anyJSON = do cAnyJSON()
+        let strs = do cRec(["type", "items"], [textVal("array"), str])
+        let mapOfAny = do cRec(["type", "additionalProperties"], [textVal("object"), anyJSON])
+        let doc = do cObjSchema(["openapi", "info", "components", "paths", "security", "x-schema-version", "x-stream-events", "x-mutation-events", "x-facet-catalog"], [str, cRef("APIContractInfoDTO"), cRef("APIContractComponentsDTO"), cRec(["type", "additionalProperties"], [textVal("object"), mapOfAny]), cRec(["type", "items"], [textVal("array"), cRec(["type", "additionalProperties"], [textVal("object"), strs])]), integer, cList("APIContractStreamEventDTO"), cList("APIContractMutationEventDTO"), cList("FacetCatalogBindingDTO")], ["components", "info", "openapi", "paths", "security", "x-facet-catalog", "x-mutation-events", "x-schema-version", "x-stream-events"])
+        let keys = ["APIContractDocumentDTO", "APIContractInfoDTO", "APIContractComponentsDTO", "APIContractStreamEventDTO", "APIContractMutationEventDTO", "APIContractMutationFieldDTO", "FacetCatalogBindingDTO", "APIContractVersionDTO", "APIContractHistoryDTO", "APIContractHistoryEntryDTO", "ContractDiffDTO", "ContractDiffSideDTO", "ContractRouteDiffDTO", "ContractResponseDiffDTO", "ContractEventDiffDTO", "ContractMutationDiffDTO", "ContractSchemaDiffDTO", "ContractFieldsDiffDTO", "ContractFieldDTO", "ContractFieldChangeDTO"]
+        let vals = [doc, cObjSchema(["title", "version", "description"], [str, str, str], ["description", "title", "version"]), cObjSchema(["schemas", "securitySchemes"], [mapOfAny, mapOfAny], ["schemas", "securitySchemes"]), cObjSchema(["name", "stream", "summary", "x-since", "payload"], [str, str, str, str, anyJSON], ["name", "stream", "summary", "x-since"]), cObjSchema(["event_type", "summary", "x-since", "fields", "body", "result"], [str, str, str, cList("APIContractMutationFieldDTO"), anyJSON, anyJSON], ["event_type", "fields", "summary", "x-since"]), cObjSchema(["name", "type", "required", "description", "enum"], [str, str, boolean, str, strs], ["name", "required", "type"]), cObjSchema(["name", "facet_id", "layer", "routes", "stream_events"], [str, str, str, strs, strs], ["facet_id", "layer", "name", "routes", "stream_events"]), cObjSchema(["version", "schema_version", "generated_at"], [str, integer, dt], ["generated_at", "schema_version", "version"]), cObjSchema(["current", "schema_version", "server_time", "versions"], [str, integer, dt, cList("APIContractHistoryEntryDTO")], ["current", "schema_version", "server_time", "versions"]), cObjSchema(["version", "schema_version", "first_seen", "current"], [str, integer, dt, boolean], ["current", "first_seen", "schema_version", "version"]), cObjSchema(["from", "to", "identical", "routes_added", "routes_removed", "routes_changed", "stream_events_added", "stream_events_removed", "stream_events_changed", "mutations_added", "mutations_removed", "mutations_changed", "schemas_added", "schemas_removed", "schemas_changed"], [cRef("ContractDiffSideDTO"), cRef("ContractDiffSideDTO"), boolean, strs, strs, cList("ContractRouteDiffDTO"), strs, strs, cList("ContractEventDiffDTO"), strs, strs, cList("ContractMutationDiffDTO"), strs, strs, cList("ContractSchemaDiffDTO")], ["from", "identical", "mutations_added", "mutations_changed", "mutations_removed", "routes_added", "routes_changed", "routes_removed", "schemas_added", "schemas_changed", "schemas_removed", "stream_events_added", "stream_events_changed", "stream_events_removed", "to"]), cObjSchema(["version", "schema_version"], [str, integer], ["schema_version", "version"]), cObjSchema(["route", "params", "request", "responses", "deprecated", "deprecated_changed"], [str, cRef("ContractFieldsDiffDTO"), cRef("ContractFieldsDiffDTO"), cList("ContractResponseDiffDTO"), boolean, boolean], ["deprecated", "deprecated_changed", "params", "request", "responses", "route"]), cObjSchema(["status", "added", "removed", "fields"], [str, boolean, boolean, cRef("ContractFieldsDiffDTO")], ["added", "fields", "removed", "status"]), cObjSchema(["stream", "name", "payload"], [str, str, cRef("ContractFieldsDiffDTO")], ["name", "payload", "stream"]), cObjSchema(["event_type", "fields", "body", "result"], [str, cRef("ContractFieldsDiffDTO"), cRef("ContractFieldsDiffDTO"), cRef("ContractFieldsDiffDTO")], ["body", "event_type", "fields", "result"]), cObjSchema(["name", "fields"], [str, cRef("ContractFieldsDiffDTO")], ["fields", "name"]), cObjSchema(["added", "removed", "type_changed", "required_changed"], [cList("ContractFieldDTO"), cList("ContractFieldDTO"), cList("ContractFieldChangeDTO"), cList("ContractFieldChangeDTO")], ["added", "removed", "required_changed", "type_changed"]), cObjSchema(["name", "type", "required"], [str, str, boolean], ["name", "required", "type"]), cObjSchema(["name", "from", "to"], [str, str, str], ["from", "name", "to"])]
+        let r = do cRec(keys, vals)
+        return r
+
+    proc cContractOp(w: RtWorld, c: IRContract, path: text, summary: text, schema: text, params: Val, errKeys: [text], errDescs: [text]) -> Val:
+        let ok = do cRec(["description", "content"], [textVal("OK"), cRec(["application/json"], [cRec(["schema"], [cNullable(cRef(schema))])])])
+        let mut responses = do cRec(["200"], [ok])
+        if path == c.path:
+            responses = do valSet(responses, "304", cRec(["description"], [textVal("Not Modified")]))
+        let mut e = 0
+        loop e < len(errKeys):
+            responses = do valSet(responses, errKeys[e], cErrResp(errDescs[e]))
+            e = e + 1
+        let mut o = do cRec(["operationId", "summary", "x-auth", "x-since", "x-conditional-get", "security", "responses", "parameters"], [textVal(cOperationID("GET", path)), textVal(summary), textVal("none"), textVal(c.since), boolVal(true), listVal([]), responses, params])
+        if c.rate != "":
+            o = do valSet(o, "x-rate-limit", cRateLimitDoc(w, c.rate))
+        return o
+
+    proc cQueryParam(name: text, desc: text, required: bool) -> Val:
+        let r = do cRec(["name", "in", "required", "schema", "description"], [textVal(name), textVal("query"), boolVal(required), cStr(), textVal(desc)])
+        return r
+
+    # ── the document ────────────────────────────────────────────────────
+    # RtContract: the built document, its encoding and version.
+    struct RtContract:
+        raw: text
+        version: text
+
+    proc cBuildContract(w: RtWorld, schemaVersion: int) -> RtContract:
+        let g = w.g
+        let mut schemas = do cErrorSchemas()
+        let mut used = []
+        let mut pathKeys = []
+        let mut pathVals = []
+        let mut basicSchemes = []
+        let mut ai = 0
+        loop ai < len(g.apis):
+            let a = g.apis[ai]
+            let mut opv = do noneVal()
+            let mut have = false
+            if a.dispatch != "":
+                opv = do cDispatchOperation(w, a)
+                have = true
+            else:
+                let acti = do rtActionIndex(g, a.action)
+                if acti >= 0:
+                    let ro = do cRouteOperation(w, a, g.actions[acti], used)
+                    used = ro.used
+                    opv = ro.op
+                    have = true
+                    if ro.basic != "":
+                        basicSchemes = do cAddUsed(basicSchemes, ro.basic)
+            if have:
+                let mut pi = -1
+                let mut k = 0
+                loop k < len(pathKeys):
+                    if pathKeys[k] == a.path:
+                        pi = k
+                    k = k + 1
+                if pi < 0:
+                    pathKeys = append(pathKeys, a.path)
+                    pathVals = append(pathVals, cRec([lower(a.method)], [opv]))
+                else:
+                    pathVals[pi] = do valSet(pathVals[pi], lower(a.method), opv)
+            ai = ai + 1
+        let mut ti = 0
+        loop ti < len(g.types):
+            let t = g.types[ti]
+            let mut pk = []
+            let mut pv = []
+            let mut req = []
+            let mut fi = 0
+            loop fi < len(t.fields):
+                let fs = do cFieldSchema(g, t.fields[fi], used)
+                used = fs.used
+                pk = append(pk, t.fields[fi].name)
+                pv = append(pv, fs.v)
+                if !t.fields[fi].optional:
+                    req = append(req, t.fields[fi].name)
+                fi = fi + 1
+            let mut sname = t.name
+            if t.schema != "":
+                sname = t.schema
+            schemas = do valSet(schemas, sname, cObjSchema(pk, pv, rtSortedTexts(req)))
+            ti = ti + 1
+        let mut dispatchOnly = []
+        let mut di = 0
+        loop di < len(g.apis):
+            if g.apis[di].dispatch != "":
+                dispatchOnly = do cAddUsed(dispatchOnly, g.apis[di].dispatch)
+            di = di + 1
+        let mut mi = 0
+        loop mi < len(g.messages):
+            let m = g.messages[mi]
+            let only = do rtInList(dispatchOnly, m.name)
+            let referenced = do cMessageReferenced(g, m.name)
+            if !(only && !referenced):
+                let tag = do cTagOf(g, m.name)
+                let mut variantRefs = []
+                let mut mapKeys = []
+                let mut mapVals = []
+                let mut vi = 0
+                loop vi < len(m.variants):
+                    let v = m.variants[vi]
+                    let vName = m.name + "_" + v.name
+                    let wire = do cWireNameOf(v)
+                    let mut pk2 = [tag]
+                    let mut pv2 = [cRec(["type", "enum"], [textVal("string"), cTexts([wire])])]
+                    let mut req2 = [tag]
+                    let mut f = 0
+                    loop f < len(v.fields):
+                        let ws = do cWireSchema(g, v.fields[f].type, v.fields[f].list, used, true)
+                        used = ws.used
+                        pk2 = append(pk2, v.fields[f].name)
+                        pv2 = append(pv2, ws.v)
+                        if !v.fields[f].optional:
+                            req2 = append(req2, v.fields[f].name)
+                        f = f + 1
+                    schemas = do valSet(schemas, vName, cRec(["type", "properties", "required"], [textVal("object"), cRec(pk2, pv2), cTexts(req2)]))
+                    let refText = "#/components/schemas/" + vName
+                    variantRefs = append(variantRefs, cRec(["$ref"], [textVal(refText)]))
+                    mapKeys = append(mapKeys, wire)
+                    mapVals = append(mapVals, textVal(refText))
+                    vi = vi + 1
+                schemas = do valSet(schemas, m.name, cRec(["oneOf", "discriminator"], [listVal(variantRefs), cRec(["propertyName", "mapping"], [textVal(tag), cRec(mapKeys, mapVals)])]))
+            mi = mi + 1
+        let mut ui = 0
+        loop ui < len(used):
+            let ei = do rtEntityIndex(g, used[ui])
+            if ei >= 0:
+                let e = g.entities[ei]
+                let mut epk = []
+                let mut epv = []
+                let mut ef = 0
+                loop ef < len(e.fields):
+                    let fl = e.fields[ef]
+                    if !(fl.secret || fl.e2e || fl.password):
+                        let es = do cWireSchema(g, fl.type, false, [], false)
+                        epk = append(epk, fl.name)
+                        epv = append(epv, es.v)
+                    ef = ef + 1
+                schemas = do valSet(schemas, used[ui], cRec(["type", "properties"], [textVal("object"), cRec(epk, epv)]))
+            ui = ui + 1
+        let mut streamEvents = []
+        let mut si = 0
+        loop si < len(g.streams):
+            let st = g.streams[si]
+            let mut evNames = []
+            let mut evTypes = []
+            let mut evSince = []
+            let mut evSummary = []
+            if st.hello != "":
+                schemas = do valSet(schemas, "HelloEventDTO", cHelloEventSchema())
+                evNames = append(evNames, "hello")
+                evTypes = append(evTypes, "HelloEventDTO")
+                evSince = append(evSince, st.hello)
+                evSummary = append(evSummary, "Connect frame: this connection's id, the contract and schema versions the server serves, its clock. Unnumbered.")
+            let mut ev = 0
+            loop ev < len(st.events):
+                evNames = append(evNames, st.events[ev].name)
+                evTypes = append(evTypes, st.events[ev].type)
+                evSince = append(evSince, st.events[ev].since)
+                evSummary = append(evSummary, st.events[ev].summary)
+                ev = ev + 1
+            let order = do rtSortedIndex(evNames)
+            let mut names = []
+            let mut oi = 0
+            loop oi < len(order):
+                let at = order[oi]
+                names = append(names, evNames[at])
+                let payload = do cRec(["oneOf"], [listVal([cRef(cSchemaNameOf(g, evTypes[at])), cTyped("null")])])
+                streamEvents = append(streamEvents, cRec(["name", "stream", "summary", "x-since", "payload"], [textVal(evNames[at]), textVal(st.path), textVal(evSummary[at]), textVal(evSince[at]), payload]))
+                oi = oi + 1
+            let mut namesV = do cTexts(names)
+            if len(names) == 0:
+                namesV = do noneVal()
+            let desc = "text/event-stream; events: " + rtJoinTexts(names, ", ") + " (schemas in x-stream-events)"
+            let mut responses = do cRec(["200"], [cRec(["description", "content", "x-stream-events"], [textVal(desc), cRec(["text/event-stream"], [cRec(["schema"], [cStr()])]), namesV])])
+            let mut op = do cRec(["operationId", "x-auth", "x-since", "parameters", "responses"], [textVal(cOperationID("GET", st.path)), textVal(st.auth), textVal(st.since), cStreamParams(st), responses])
+            if st.summary != "":
+                op = do valSet(op, "summary", textVal(st.summary))
+            if st.description != "":
+                op = do valSet(op, "description", textVal(st.description))
+            let mut se = 0
+            loop se < len(st.errors):
+                responses = do valSet(responses, "" + st.errors[se], cErrResp(cStatusText(st.errors[se])))
+                se = se + 1
+            if len(st.errors) == 0:
+                let mut ci = 0
+                loop ci < len(st.connects):
+                    let hai = do rtActionIndex(g, st.connects[ci].action)
+                    if hai >= 0:
+                        let mut bi = 0
+                        loop bi < len(g.actions[hai].body):
+                            let checks = do cCollectStatuses(g.actions[hai].body[bi], "check")
+                            let mut c = 0
+                            loop c < len(checks):
+                                responses = do valSet(responses, "" + checks[c], cErrResp(cStatusText(checks[c])))
+                                c = c + 1
+                            bi = bi + 1
+                    ci = ci + 1
+            if st.rate != "":
+                op = do valSet(op, "x-rate-limit", cRateLimitDoc(w, st.rate))
+            if st.auth == "session":
+                op = do valSet(op, "security", listVal([cRec(["bearer"], [listVal([])])]))
+                responses = do valSet(responses, "401", cErrResp("Unauthorized"))
+            else:
+                op = do valSet(op, "security", listVal([]))
+            op = do valSet(op, "responses", responses)
+            pathKeys = append(pathKeys, st.path)
+            pathVals = append(pathVals, cRec(["get"], [op]))
+            si = si + 1
+        # x-stream-events sorted by (stream, name)
+        let mut sk = []
+        let mut ski = 0
+        loop ski < len(streamEvents):
+            let sv = do valGet(streamEvents[ski], "stream")
+            let nv = do valGet(streamEvents[ski], "name")
+            sk = append(sk, sv.t + "\x00" + nv.t)
+            ski = ski + 1
+        let sidx = do rtSortedIndex(sk)
+        let mut sortedEvents = []
+        let mut sj = 0
+        loop sj < len(sidx):
+            sortedEvents = append(sortedEvents, streamEvents[sidx[sj]])
+            sj = sj + 1
+        let mut title = g.app
+        let mut description = do cContractDescription()
+        let mut bearerDesc = "The session token the app's sign-in answers with (or a route's own credential, per its x-auth), as `Authorization: Bearer <token>`."
+        if len(g.contract) > 0:
+            let c = g.contract[0]
+            let cs = do cContractSchemas()
+            let mut csi = 0
+            loop csi < len(cs.keys):
+                schemas = do valSet(schemas, cs.keys[csi], cs.items[csi])
+                csi = csi + 1
+            let docParams = do listVal([cRec(["name", "in", "required", "schema", "description"], [textVal("If-None-Match"), textVal("header"), boolVal(false), cStr(), textVal("The ETag last received; a match is answered 304.")])])
+            let diffParams = do listVal([cQueryParam("from", "The older version (its info.version), or `current`.", true), cQueryParam("to", "The newer version, or `current`; default current.", false)])
+            pathKeys = append(pathKeys, c.path)
+            pathVals = append(pathVals, cRec(["get"], [cContractOp(w, c, c.path, "This contract: an OpenAPI document of every declared route, stream event and mutation.", "APIContractDocumentDTO", docParams, [], [])]))
+            pathKeys = append(pathKeys, c.path + "/version")
+            pathVals = append(pathVals, cRec(["get"], [cContractOp(w, c, c.path + "/version", "The contract's version, the data schema version, and when this process generated it.", "APIContractVersionDTO", listVal([]), [], [])]))
+            pathKeys = append(pathKeys, c.path + "/history")
+            pathVals = append(pathVals, cRec(["get"], [cContractOp(w, c, c.path + "/history", "Every distinct contract this deployment has served, newest first.", "APIContractHistoryDTO", listVal([]), [], [])]))
+            pathKeys = append(pathKeys, c.path + "/diff")
+            pathVals = append(pathVals, cRec(["get"], [cContractOp(w, c, c.path + "/diff", "What changed between two contract versions, computed on the server.", "ContractDiffDTO", diffParams, ["400", "404"], ["Bad Request", "Not Found"])]))
+            if c.title != "":
+                title = c.title
+            if c.description != "":
+                description = c.description
+            if c.bearer != "":
+                bearerDesc = c.bearer
+        let mut ssKeys = ["bearer"]
+        let mut ssVals = [cRec(["type", "scheme", "bearerFormat", "description"], [textVal("http"), textVal("bearer"), textVal("opaque"), textVal(bearerDesc)])]
+        let mut bsi = 0
+        loop bsi < len(basicSchemes):
+            ssKeys = append(ssKeys, basicSchemes[bsi])
+            ssVals = append(ssVals, cRec(["type", "scheme", "description"], [textVal("http"), textVal("basic"), textVal("The app's client id and secret as HTTP Basic credentials (`Authorization: Basic base64(client_id:client_secret)`).")]))
+            bsi = bsi + 1
+        let info = do cRec(["title", "version", "description"], [textVal(title), textVal(""), textVal(description)])
+        let doc = do cRec(["openapi", "info", "paths", "components", "security", "x-schema-version", "x-stream-events", "x-mutation-events", "x-facet-catalog"], [textVal("3.1.0"), info, cRec(pathKeys, pathVals), cRec(["schemas", "securitySchemes"], [schemas, cRec(ssKeys, ssVals)]), listVal([cRec(["bearer"], [listVal([])])]), intVal(schemaVersion), listVal(sortedEvents), cMutationEvents(g), listVal([])])
+        let unversioned = do rtValJSON(doc)
+        let version = sha256Hex(unversioned)
+        let versioned = do valSet(doc, "info", valSet(info, "version", textVal(version)))
+        let raw = do rtValJSON(versioned)
+        return RtContract{raw: raw, version: version}
+
+    proc rtJoinTexts(xs: [text], sep: text) -> text:
+        let mut out = ""
+        let mut i = 0
+        loop i < len(xs):
+            if i > 0:
+                out = out + sep
+            out = out + xs[i]
+            i = i + 1
+        return out
+
+    proc cContractDescription() -> text:
+        return "The app's declared HTTP surface, generated by the Facet runtime from the compiled graph: every `api` route, every `stream` and its events (x-stream-events), and the tagged-union mutations a whole-body route accepts (x-mutation-events). info.version is the sha256 of this document without it, so equal contracts have equal versions; x-schema-version is the data schema's ordinal in this deployment's history. Every GET answering JSON is a conditional GET (x-conditional-get): a 200 carries a strong ETag over its bytes and Cache-Control: private, no-cache; send If-None-Match to be answered 304. Every error body is an APIErrorDTO. A route over its x-rate-limit budget is answered 429 with Retry-After. A stream opens with an unnumbered hello frame; every other frame carries an id, and a client reconnecting with Last-Event-ID is replayed what it missed."

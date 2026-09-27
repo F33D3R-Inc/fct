@@ -25,6 +25,9 @@ import (
 )
 
 func byteArg(name, what string, v any) ([]byte, error) {
+	if b, ok := v.(bytesVal); ok {
+		return b, nil
+	}
 	arr, ok := v.([]any)
 	if !ok {
 		return nil, fmt.Errorf("%s: %s is not a byte buffer", name, what)
@@ -40,12 +43,8 @@ func byteArg(name, what string, v any) ([]byte, error) {
 	return out, nil
 }
 
-func byteBuf(b []byte) []any {
-	out := make([]any, len(b))
-	for i, x := range b {
-		out[i] = boxedInts[x]
-	}
-	return out
+func byteBuf(b []byte) any {
+	return bytesVal(b)
 }
 
 func aesGcmFor(name string, keyV, nonceV any) (cipher.AEAD, []byte, error) {

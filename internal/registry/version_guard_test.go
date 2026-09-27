@@ -67,9 +67,10 @@ func TestToolchainVersionCoversBuiltins(t *testing.T) {
 	for _, n := range strings.Fields(`accept aesGcmAuthentic aesGcmOpen aesGcmSeal append appendFile bytes bytesToText channel
 		closeConn connError connOpen connect envSet envVar fileExists fileSize httpGet httpPost listen listenOn monoMs nowMs signals
 		awaitAny closeChannel exitProcess processStats listenTls connPeer connectTls
-		closeListener listenError grantRead
-		pollBytes randomBytes readBytes readFile readFileAt readStdin recv removeFile renameFile send setTimeoutMs
-		shutdownConn sleepMs syncFile textToBytes truncateFile writeBytes writeFile writeFileAt writeStderr writeStdout`) {
+		closeListener listenError listenerPort grantRead
+		pollBytes randomBytes readBytes readFile readFileAt readStdin recv removeFile renameFile lockFile crc32 send setTimeoutMs
+		shutdownConn sleepMs syncFile textToBytes truncateFile writeBytes writeFile writeFileAt writeStderr writeStdout
+		sha256Bytes hmacSha256 base64UrlRaw bcryptHash bcryptMatches fileModTime indexOf`) {
 		known[n] = parser.SiteProc
 	}
 	var changed []string

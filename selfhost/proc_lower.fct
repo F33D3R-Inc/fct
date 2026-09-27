@@ -512,9 +512,9 @@ app ProcLowerSelfHost:
 
     # plBuiltinCap: builtinCapability().
     proc plBuiltinCap(name: text) -> text:
-        if name == "readFile" || name == "writeFile" || name == "appendFile" || name == "fileExists" || name == "truncateFile" || name == "fileSize" || name == "readFileAt" || name == "writeFileAt" || name == "syncFile" || name == "renameFile" || name == "removeFile" || name == "grantRead":
+        if name == "readFile" || name == "writeFile" || name == "appendFile" || name == "fileExists" || name == "truncateFile" || name == "fileSize" || name == "fileModTime" || name == "readFileAt" || name == "writeFileAt" || name == "syncFile" || name == "renameFile" || name == "removeFile" || name == "lockFile" || name == "grantRead":
             return "io.file"
-        if name == "closeListener" || name == "listenError":
+        if name == "closeListener" || name == "listenError" || name == "listenerPort":
             return "io.net.listen"
         if name == "httpGet" || name == "httpPost" || name == "connect" || name == "connectTls":
             return "io.net"
@@ -682,13 +682,13 @@ app ProcLowerSelfHost:
         let name = e.text
         if name == "append" || name == "split":
             return "array"
-        if name == "bytes" || name == "textToBytes" || name == "readBytes" || name == "pollBytes" || name == "readFileAt" || name == "aesGcmSeal" || name == "aesGcmOpen" || name == "randomBytes":
+        if name == "bytes" || name == "textToBytes" || name == "readBytes" || name == "pollBytes" || name == "readFileAt" || name == "aesGcmSeal" || name == "aesGcmOpen" || name == "randomBytes" || name == "sha256Bytes" || name == "hmacSha256":
             return "bytes"
-        if name == "bytesToText" || name == "readFile" || name == "httpGet" || name == "httpPost" || name == "recv" || name == "connError" || name == "connPeer" || name == "listenError" || name == "readStdin" || name == "envVar" || name == "processStats":
+        if name == "bytesToText" || name == "readFile" || name == "httpGet" || name == "httpPost" || name == "recv" || name == "connError" || name == "connPeer" || name == "listenError" || name == "readStdin" || name == "envVar" || name == "processStats" || name == "base64UrlRaw" || name == "bcryptHash":
             return "text"
-        if name == "byteLen" || name == "listen" || name == "listenOn" || name == "listenTls" || name == "awaitAny" || name == "accept" || name == "connect" || name == "connectTls" || name == "channel" || name == "monoMs" || name == "nowMs" || name == "signals" || name == "floatBits" || name == "toInt" || name == "floor" || name == "round" || name == "fileSize":
+        if name == "byteLen" || name == "crc32" || name == "listenerPort" || name == "listen" || name == "listenOn" || name == "listenTls" || name == "awaitAny" || name == "accept" || name == "connect" || name == "connectTls" || name == "channel" || name == "monoMs" || name == "nowMs" || name == "signals" || name == "floatBits" || name == "toInt" || name == "floor" || name == "round" || name == "fileSize" || name == "fileModTime" || name == "indexOf":
             return "int"
-        if name == "aesGcmAuthentic" || name == "closeListener" || name == "grantRead" || name == "envSet" || name == "closeChannel" || name == "exitProcess" || name == "connOpen" || name == "shutdownConn" || name == "sleepMs" || name == "writeBytes" || name == "closeConn" || name == "setTimeoutMs" || name == "send" || name == "writeFile" || name == "appendFile" || name == "fileExists" || name == "truncateFile" || name == "writeFileAt" || name == "syncFile" || name == "renameFile" || name == "removeFile" || name == "writeStdout" || name == "writeStderr":
+        if name == "aesGcmAuthentic" || name == "bcryptMatches" || name == "closeListener" || name == "grantRead" || name == "envSet" || name == "closeChannel" || name == "exitProcess" || name == "connOpen" || name == "lockFile" || name == "shutdownConn" || name == "sleepMs" || name == "writeBytes" || name == "closeConn" || name == "setTimeoutMs" || name == "send" || name == "writeFile" || name == "appendFile" || name == "fileExists" || name == "truncateFile" || name == "writeFileAt" || name == "syncFile" || name == "renameFile" || name == "removeFile" || name == "writeStdout" || name == "writeStderr":
             return "bool"
         if name == "toFloat" || name == "floatFromBits" || name == "u64ToFloat":
             return "float"
@@ -823,7 +823,7 @@ app ProcLowerSelfHost:
                 let q = do plQuote(free[i])
                 return "unknown reference " + q + " — a proc sees only its own parameters and `let` locals (no state or entities in this milestone)"
             i = i + 1
-        let ce = CallEnv{fnNames: [], fnArities: [], procNames: env.procNames, procArities: env.procArities, procDerives: [], listNames: [], jsonNames: [], deriveKeys: [], inAction: false, inDerive: false, inProc: true, ty: tyEmptyEnv(), tsc: tyEmptyScope()}
+        let ce = CallEnv{fnNames: [], fnArities: [], procNames: env.procNames, procArities: env.procArities, procDerives: [], listNames: [], jsonNames: [], deriveKeys: [], inAction: false, inDerive: false, inProc: true, ty: tyEmptyEnv(), tsc: tyEmptyScope(), actionNames: env.actionNames, stateNames: []}
         let nodes = do allNodes(e)
         let bd = do checkBuiltins(nodes, [], [], ce)
         if bd != "":
@@ -1055,6 +1055,37 @@ app ProcLowerSelfHost:
                     k = k + 1
                 let mut env2 = env
                 env2.texts = env.texts + ds.texts
+                let sub = do plBlock(env2, synth, names, muts, types, loopDepth)
+                if sub.diag != "":
+                    return PLBlock{stmts: [], diag: sub.diag}
+                out = out + sub.stmts
+            if s.kind == "assignDoNested":
+                # `s.f = do Proc(args)`: parseProcBody's composition — the
+                # result into a `let mut` temporary numbered like a nested
+                # write's (nestedWriteTemp), then the ordinary write of that
+                # temporary (one level, or desugarNestedWrite's chain).
+                let mut line = 0
+                if s.lineIdx < len(env.lineNos):
+                    line = env.lineNos[s.lineIdx]
+                let n1 = nestedN + 1
+                let tmp = "__w" + line + "_" + n1
+                let pn0 = do assignDoProcName(lineText)
+                let none = do emptyNode()
+                let ds = do plDesugar(s.index, refNode(tmp), line, n1, [])
+                nestedN = ds.n
+                if ds.err != "":
+                    return PLBlock{stmts: [], diag: ds.err}
+                let base = len(env.texts)
+                let letTmp = Stmt{kind: "letMutDo", lineIdx: base, expr: none, args: s.args, body: [], elseBody: [], index: none}
+                let mut synth = [letTmp]
+                let mut k = 0
+                loop k < len(ds.stmts):
+                    let mut st0 = do plStmtNodeOf(ds.stmts[k])
+                    st0.lineIdx = base + 1 + k
+                    synth = append(synth, st0)
+                    k = k + 1
+                let mut env2 = env
+                env2.texts = env.texts + ["let mut " + tmp + " = do " + pn0 + "("] + ds.texts
                 let sub = do plBlock(env2, synth, names, muts, types, loopDepth)
                 if sub.diag != "":
                     return PLBlock{stmts: [], diag: sub.diag}

@@ -90,14 +90,33 @@ type App struct {
 	Contract   *ContractDecl
 	// Source is the file this module was parsed from (its base name), for
 	// cross-module collision errors; "" for a string-compiled app.
-	Source    string
-	Streams   []*Stream
-	Triggers  []*Trigger
-	Theme     []ThemeVar   // base design tokens (the light palette)
-	DarkTheme []ThemeVar   // `theme dark:` — token overrides applied under prefers-color-scheme: dark
-	Themes    []NamedTheme // `theme <name>:` — alternate palettes selectable at runtime
-	CSS       string       // raw stylesheet from `css:` blocks, emitted verbatim into the page
-	Line      int
+	Source string
+	// Expects are this module's `expect` declarations: what it needs its host
+	// app to provide — an entity with certain fields, an action with a certain
+	// signature, a state cell, a served route. A library facet is a fragment:
+	// its StreamCard is written against `s: Stream`, its PayButton calls
+	// `pay(...)`, its UserChip links to `/profile/{h}` — declarations that
+	// only the host app makes. Without a way to state them the fragment could
+	// not be compiled on its own, only inside some host that happened to
+	// declare them. `expect` states them; internal/compile resolves them after
+	// the modules merge (compile/expect.go): an expectation a host declaration
+	// satisfies structurally is discharged, one it contradicts is an error, and
+	// one nothing satisfies stands in for the declaration, so a fragment
+	// compiles standalone. They never survive into a compiled graph.
+	Expects []*Expect
+	// ExpectedRoutes are the `expect view at "..."` patterns no view serves,
+	// left for internal/ir's link check to accept (compile/expect.go fills it).
+	ExpectedRoutes []string
+	// ExpectedEvents are the `expect event` declarations no stream carries,
+	// left for internal/ir's emit check to accept (compile/expect.go fills it).
+	ExpectedEvents []StreamEvent
+	Streams        []*Stream
+	Triggers       []*Trigger
+	Theme          []ThemeVar   // base design tokens (the light palette)
+	DarkTheme      []ThemeVar   // `theme dark:` — token overrides applied under prefers-color-scheme: dark
+	Themes         []NamedTheme // `theme <name>:` — alternate palettes selectable at runtime
+	CSS            string       // raw stylesheet from `css:` blocks, emitted verbatim into the page
+	Line           int
 }
 
 // Trigger is a programmatic event reaction: when the action named On completes
@@ -153,6 +172,14 @@ type API struct {
 	// Bearer, and the contract names the scheme as the route's x-auth.
 	AuthScheme string
 	Bearer     string
+	// BasicID and BasicSecret are `auth <scheme> basic <id> <secret>`: the
+	// two action parameters the HTTP Basic credential (client id and secret)
+	// binds to, for a server-to-server route such as an OAuth token exchange.
+	BasicID, BasicSecret string
+	// Form is `body form`: the request body is application/x-www-form-urlencoded
+	// (a multipart form is accepted too) and the action's body parameters bind
+	// from its fields, the way an OAuth token endpoint reads grant_type and code.
+	Form bool
 	// The block form's contract documentation (the header ending in `:`):
 	//
 	//	api POST "/api/v2/numbers" -> mintNumber status 201 rate write since "…":
@@ -709,6 +736,31 @@ type EntityField struct {
 
 // State is one `state name: Type = default [@client|@server]` cell. Scalar
 // server state is per-session; client state is per-browser-instance.
+// Expect is one `expect` declaration (see App.Expects): exactly one of
+// Entity, Action, State or Route is set. Entity carries the fields the module
+// reads (the shape a host entity must have — structurally: any entity with
+// those fields, of those types, satisfies it), Action the signature the
+// module invokes (no body), State the cell it binds (no default), Route the
+// path pattern it links to.
+type Expect struct {
+	Entity *Entity
+	Action *Action
+	State  *State
+	Route  string
+	// Event is `expect event <name>: <Type>`: an event this module emits and
+	// expects some host stream to carry under that name with that payload.
+	Event *StreamEvent
+	// Policy is `expect policy <name>[(params)]`: a guard this module's
+	// actions `requires` and expects the host to declare — name and parameter
+	// signature only; who passes is the host's rule. Standalone the stand-in
+	// admits everyone.
+	Policy *Policy
+	Line   int
+	// Source is the module file the expectation was written in, for the
+	// diagnostic when a host contradicts it (compile fills it while merging).
+	Source string
+}
+
 type State struct {
 	Name      string
 	Type      string // scalar, an enum name, or `[Elem]` for a list

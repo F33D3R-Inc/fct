@@ -1,0 +1,703 @@
+import "api_json.fct"
+
+app APIDecl:
+    # api_decl.fct — runtime/apidecl.go: the app's declared `api` routes
+    # (its own contract), matched first — by method and path pattern, the
+    # most literal pattern winning — ahead of the generic /api/ projection
+    # and the view router. One route binds its path parameters, the bearer
+    # token, the query string and the JSON body (a lone wire-typed body
+    # parameter takes the whole object) to the action's parameters, refuses
+    # a missing or ill-typed one as `{"error":{"code","message"}}`, meters
+    # the route's rate class (X-RateLimit-* on every answer), demands a
+    # session where the route says so, runs the action and answers with
+    # its declared status — a conditional GET carrying a strong ETag over
+    # the bytes. A `dispatch` route routes a tagged message body to the
+    # variant's action (serveDispatch).
+    struct RtRoute:
+        segs: [text]
+        literal: int
+        api: IRAPI
+        actIndex: int
+
+    # rtCompileAPIs: compileAPIs — every declared route, sorted by literal
+    # segment count descending (stable).
+    proc rtCompileAPIs(g: IRGraph) -> [RtRoute]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(g.apis):
+            let a = g.apis[i]
+            let ai = do rtActionIndex(g, a.action)
+            if ai >= 0 || a.dispatch != "":
+                let parts = split(rtTrimSlashes(a.path), "/")
+                let mut segs = []
+                let mut lit = 0
+                let mut k = 0
+                loop k < len(parts):
+                    if len(parts[k]) > 0 && charAt(parts[k], 0) == "{":
+                        segs = append(segs, "")
+                    else:
+                        segs = append(segs, parts[k])
+                        lit = lit + 1
+                    k = k + 1
+                let r = RtRoute{segs: segs, literal: lit, api: a, actIndex: ai}
+                let mut j = len(out)
+                let mut placed = false
+                loop j > 0 && !placed:
+                    if out[j - 1].literal < lit:
+                        j = j - 1
+                    else:
+                        placed = true
+                out = slice(out, 0, j) + [r] + slice(out, j, len(out))
+            i = i + 1
+        return out
+
+    struct RtAPIMatch:
+        found: bool
+        pathMatched: bool
+        route: RtRoute
+        vals: [text]
+
+    proc rtEmptyRoute() -> RtRoute:
+        return RtRoute{segs: [], literal: 0, api: IRAPI{method: "", path: "", params: [], action: "", status: 0, rate: "", since: "", auth: "", ret: "", retList: false, bearer: "", basicId: "", basicSecret: "", form: false, dispatch: "", summary: "", description: "", body: "", errors: [], operation: "", paramDocs: []}, actIndex: -1}
+
+    proc rtMatchAPI(routes: [RtRoute], method: text, path: text) -> RtAPIMatch:
+        let parts = split(rtTrimSlashes(path), "/")
+        let mut pathMatched = false
+        let mut i = 0
+        loop i < len(routes):
+            let r = routes[i]
+            if len(r.segs) == len(parts):
+                let mut ok = true
+                let mut vals = []
+                let mut k = 0
+                loop k < len(r.segs) && ok:
+                    if r.segs[k] == "":
+                        vals = append(vals, parts[k])
+                    else:
+                        if r.segs[k] != parts[k]:
+                            ok = false
+                    k = k + 1
+                if ok:
+                    pathMatched = true
+                    if r.api.method == method:
+                        return RtAPIMatch{found: true, pathMatched: true, route: r, vals: vals}
+            i = i + 1
+        let none = do rtEmptyRoute()
+        return RtAPIMatch{found: false, pathMatched: pathMatched, route: none, vals: []}
+
+    # ── errors ──────────────────────────────────────────────────────────
+    proc rtStatusText(status: int) -> text:
+        if status == 400:
+            return "Bad Request"
+        if status == 401:
+            return "Unauthorized"
+        if status == 402:
+            return "Payment Required"
+        if status == 403:
+            return "Forbidden"
+        if status == 404:
+            return "Not Found"
+        if status == 405:
+            return "Method Not Allowed"
+        if status == 406:
+            return "Not Acceptable"
+        if status == 408:
+            return "Request Timeout"
+        if status == 409:
+            return "Conflict"
+        if status == 410:
+            return "Gone"
+        if status == 411:
+            return "Length Required"
+        if status == 412:
+            return "Precondition Failed"
+        if status == 413:
+            return "Request Entity Too Large"
+        if status == 415:
+            return "Unsupported Media Type"
+        if status == 422:
+            return "Unprocessable Entity"
+        if status == 423:
+            return "Locked"
+        if status == 428:
+            return "Precondition Required"
+        if status == 429:
+            return "Too Many Requests"
+        if status == 451:
+            return "Unavailable For Legal Reasons"
+        if status == 500:
+            return "Internal Server Error"
+        if status == 501:
+            return "Not Implemented"
+        if status == 502:
+            return "Bad Gateway"
+        if status == 503:
+            return "Service Unavailable"
+        if status == 504:
+            return "Gateway Timeout"
+        return ""
+
+    # rtErrorCode: errorCode — a fixed word for the statuses that have one,
+    # else the status text lowercased with spaces as underscores.
+    proc rtErrorCode(status: int) -> text:
+        if status == 401:
+            return "unauthenticated"
+        if status == 429:
+            return "rate_limited"
+        if status == 500:
+            return "server_error"
+        if status == 502:
+            return "upstream_unavailable"
+        if status == 503:
+            return "unavailable"
+        let text = do rtStatusText(status)
+        if text == "":
+            return "error"
+        let a = replace(text, "-", " ")
+        let b = replace(a, "'", "")
+        return replace(lower(b), " ", "_")
+
+    proc rtAPIError(status: int, msg: text) -> HttpServerResponse:
+        let r = do rtAPIErrorCode(status, "", msg)
+        return r
+
+    proc rtAPIErrorCode(status: int, code0: text, msg: text) -> HttpServerResponse:
+        let mut code = code0
+        if code == "":
+            code = do rtErrorCode(status)
+        let inner = do rtObjectJSONRaw(["code", "message"], [jsonQuote(code), jsonQuote(msg)])
+        let body = "{\"error\":" + inner + "}\n"
+        let r = do rtJSONResponse(status, body)
+        return r
+
+    # ── rate metering ───────────────────────────────────────────────────
+    # rtRatePerMinute: rateLimitFromEnvClass — FACET_RATE_LIMIT_<CLASS>,
+    # else FACET_RATE_LIMIT, else the class default; the environment was
+    # read at boot into the world (rtRateConfig), since a request handler
+    # holds no io.env capability.
+    proc rtRatePerMinute(w: RtWorld, class: text) -> int:
+        let mut i = 0
+        loop i < len(w.rateClassNames):
+            if w.rateClassNames[i] == class:
+                return w.rateClassLimits[i]
+            i = i + 1
+        if w.rateDefault > 0:
+            return w.rateDefault
+        if class == "read":
+            return 300
+        if class == "write":
+            return 60
+        if class == "auth":
+            return 40
+        return 600
+
+    # rtRateConfig: the per-class overrides and the generic one, read once.
+    struct RtRateConfig:
+        names: [text]
+        limits: [int]
+        fallback: int
+
+    proc rtRateConfig() -> RtRateConfig uses io.env:
+        let classes = ["read", "write", "auth"]
+        let mut names = []
+        let mut limits = []
+        let mut i = 0
+        loop i < len(classes):
+            let key = "FACET_RATE_LIMIT_" + upper(classes[i])
+            let has = envSet(key)
+            if has:
+                let n = toInt(envVar(key))
+                if n > 0:
+                    names = append(names, classes[i])
+                    limits = append(limits, n)
+            i = i + 1
+        let mut fallback = 0
+        let hasAny = envSet("FACET_RATE_LIMIT")
+        if hasAny:
+            let n2 = toInt(envVar("FACET_RATE_LIMIT"))
+            if n2 > 0:
+                fallback = n2
+        return RtRateConfig{names: names, limits: limits, fallback: fallback}
+
+    proc rtRateBurst(perMinute: int) -> int:
+        let b = perMinute / 4
+        if b > 0:
+            return b
+        return 1
+
+    struct RtRateOut:
+        w: RtWorld
+        allowed: bool
+        headers: [HttpHeader]
+
+    # rtMeterRate: meterRate — a token bucket per (class, client ip):
+    # burst = perMinute/4 tokens, refilled at perMinute/60 per second.
+    proc rtMeterRate(w0: RtWorld, class: text, ip: text) -> RtRateOut:
+        let mut w = w0
+        if class == "":
+            return RtRateOut{w: w, allowed: true, headers: []}
+        let per = do rtRatePerMinute(w, class)
+        let burst = toFloat(rtRateBurst(per))
+        let rate = toFloat(per) / 60.0
+        let key = class + "\n" + ip
+        let now = monoMs()
+        let mut at = -1
+        let mut i = 0
+        loop i < len(w.rateKeys):
+            if w.rateKeys[i] == key:
+                at = i
+            i = i + 1
+        let mut tokens = burst
+        let mut last = now
+        if at >= 0:
+            tokens = w.rateTokens[at]
+            last = w.rateLast[at]
+        tokens = tokens + toFloat(now - last) / 1000.0 * rate
+        if tokens > burst:
+            tokens = burst
+        let allowed = tokens >= 1.0
+        if allowed:
+            tokens = tokens - 1.0
+        if at >= 0:
+            w.rateTokens[at] = tokens
+            w.rateLast[at] = now
+        else:
+            w.rateKeys = append(w.rateKeys, key)
+            w.rateTokens = append(w.rateTokens, tokens)
+            w.rateLast = append(w.rateLast, now)
+        let remaining = floor(tokens)
+        let resetMs = now + floor((burst - tokens) / rate * 1000.0)
+        let reset = (nowMs() - now + resetMs) / 1000
+        let mut headers = [HttpHeader{name: "x-ratelimit-limit", value: "" + per}, HttpHeader{name: "x-ratelimit-remaining", value: "" + remaining}, HttpHeader{name: "x-ratelimit-reset", value: "" + reset}]
+        if !allowed:
+            let wait = (1.0 - tokens) / rate
+            let mut retry = floor(wait)
+            if toFloat(retry) < wait:
+                retry = retry + 1
+            if retry < 1:
+                retry = 1
+            headers = append(headers, HttpHeader{name: "retry-after", value: "" + retry})
+        return RtRateOut{w: w, allowed: allowed, headers: headers}
+
+    proc rtClientIP(req: HttpServerRequest, peer: text) -> text:
+        let xff = do rtHeaderValue(req.headers, "x-forwarded-for")
+        if xff != "":
+            let c = do rtIndexOfText(xff, ",")
+            if c >= 0:
+                return trim(slice(xff, 0, c))
+            return trim(xff)
+        return peer
+
+    # ── binding ─────────────────────────────────────────────────────────
+    proc rtIsWireTypeOrMessage(g: IRGraph, name: text) -> bool:
+        let mut i = 0
+        loop i < len(g.types):
+            if g.types[i].name == name:
+                return true
+            i = i + 1
+        let mut m = 0
+        loop m < len(g.messages):
+            if g.messages[m].name == name:
+                return true
+            m = m + 1
+        return false
+
+    proc rtInList(xs: [text], s: text) -> bool:
+        let mut i = 0
+        loop i < len(xs):
+            if xs[i] == s:
+                return true
+            i = i + 1
+        return false
+
+    # rtWholeBodyParam: wholeBodyParam — the one non-path parameter of a
+    # wire type, which takes the whole body object.
+    proc rtWholeBodyParam(g: IRGraph, r: RtRoute, act: IRAction) -> text:
+        let mut found = ""
+        let mut n = 0
+        let mut i = 0
+        loop i < len(act.params):
+            let inPath = do rtInList(r.api.params, act.params[i].name)
+            if !inPath:
+                n = n + 1
+                found = act.params[i].name
+                let wire = do rtIsWireTypeOrMessage(g, act.params[i].type)
+                if !wire:
+                    found = "\x00"
+            i = i + 1
+        if n != 1 || found == "\x00":
+            return ""
+        return found
+
+    proc rtHasBytesParam(r: RtRoute, act: IRAction) -> bool:
+        let mut i = 0
+        loop i < len(act.params):
+            let inPath = do rtInList(r.api.params, act.params[i].name)
+            if !inPath && act.params[i].type == "bytes":
+                return true
+            i = i + 1
+        return false
+
+    struct RtBound:
+        names: [text]
+        vals: [Val]
+
+    proc rtBoundHas(b: RtBound, name: text) -> bool:
+        let has = do rtInList(b.names, name)
+        return has
+
+    proc rtBind(b0: RtBound, name: text, v: Val) -> RtBound:
+        let mut b = b0
+        let mut i = 0
+        loop i < len(b.names):
+            if b.names[i] == name:
+                b.vals[i] = v
+                return b
+            i = i + 1
+        b.names = append(b.names, name)
+        b.vals = append(b.vals, v)
+        return b
+
+    proc rtBoundGet(b: RtBound, name: text) -> Val:
+        let v = do lookupRef(name, b.names, b.vals)
+        return v
+
+    struct RtServed:
+        handled: bool
+        resp: HttpServerResponse
+        w: RtWorld
+
+    proc rtWithHeaders(r0: HttpServerResponse, hs: [HttpHeader]) -> HttpServerResponse:
+        let mut r = r0
+        r.headers = r.headers + hs
+        return r
+
+    # rtServeDeclaredAPI: serveDeclaredAPI.
+    proc rtServeDeclaredAPI(w0: RtWorld, req: HttpServerRequest, peer: text) -> RtServed:
+        let mut w = w0
+        let g = w.g
+        if len(g.apis) == 0:
+            let none0 = do rtNotFound()
+            return RtServed{handled: false, resp: none0, w: w}
+        let routes = do rtCompileAPIs(g)
+        let m = do rtMatchAPI(routes, req.method, req.path)
+        if !m.found:
+            if m.pathMatched:
+                let mna = do rtAPIError(405, "method not allowed")
+                return RtServed{handled: true, resp: mna, w: w}
+            let none1 = do rtNotFound()
+            return RtServed{handled: false, resp: none1, w: w}
+        let r = m.route
+        let ip = do rtClientIP(req, peer)
+        let rate = do rtMeterRate(w, r.api.rate, ip)
+        w = rate.w
+        if !rate.allowed:
+            let limited = do rtAPIError(429, "rate limited")
+            let lr = do rtWithHeaders(limited, rate.headers)
+            return RtServed{handled: true, resp: lr, w: w}
+        if r.api.dispatch != "":
+            let d = do rtServeDispatch(w, req, r.api)
+            let dr = do rtWithHeaders(d.resp, rate.headers)
+            return RtServed{handled: true, resp: dr, w: d.w}
+        let act = g.actions[r.actIndex]
+        let mut bound = RtBound{names: [], vals: []}
+        let mut i = 0
+        loop i < len(r.api.params):
+            if i < len(m.vals):
+                bound = do rtBind(bound, r.api.params[i], textVal(m.vals[i]))
+            i = i + 1
+        if r.api.bearer != "":
+            let h = do rtHeaderValue(req.headers, "authorization")
+            let mut tok = ""
+            if len(h) > 7 && slice(h, 0, 7) == "Bearer ":
+                tok = trim(slice(h, 7, len(h)))
+            if tok == "":
+                let mut ua = do rtAPIError(401, "a bearer token (" + r.api.auth + ") is required")
+                ua.headers = append(ua.headers, HttpHeader{name: "www-authenticate", value: "Bearer"})
+                let uar = do rtWithHeaders(ua, rate.headers)
+                return RtServed{handled: true, resp: uar, w: w}
+            bound = do rtBind(bound, r.api.bearer, textVal(tok))
+        let qp = do rtQueryParams(req.query, req.hasQuery)
+        let mut pi = 0
+        loop pi < len(act.params):
+            let p = act.params[pi]
+            let already = do rtBoundHas(bound, p.name)
+            if !already:
+                let hasKey = do rtInList(qp.names, p.name)
+                if p.list && hasKey:
+                    let mut vs = []
+                    let mut qi = 0
+                    loop qi < len(qp.names):
+                        if qp.names[qi] == p.name:
+                            vs = append(vs, textVal(qp.vals[qi]))
+                        qi = qi + 1
+                    bound = do rtBind(bound, p.name, listVal(vs))
+                else:
+                    if hasKey:
+                        let qv = do rtParamFirst(qp, p.name)
+                        bound = do rtBind(bound, p.name, textVal(qv))
+            pi = pi + 1
+        if req.method == "POST" || req.method == "PUT" || req.method == "PATCH" || req.method == "DELETE":
+            let hasBytes = do rtHasBytesParam(r, act)
+            if hasBytes:
+                let mp = do rtAPIError(400, "request body must be multipart/form-data")
+                let mpr = do rtWithHeaders(mp, rate.headers)
+                return RtServed{handled: true, resp: mpr, w: w}
+            let mut body = do jNone()
+            if trim(req.body) != "":
+                body = do jsonParse(req.body)
+                if body.kind != "obj":
+                    let bj = do rtAPIError(400, "request body must be a JSON object")
+                    let bjr = do rtWithHeaders(bj, rate.headers)
+                    return RtServed{handled: true, resp: bjr, w: w}
+            let whole = do rtWholeBodyParam(g, r, act)
+            if whole != "":
+                let bv = do rtJValToVal(body)
+                if body.kind == "obj":
+                    bound = do rtBind(bound, whole, bv)
+                else:
+                    bound = do rtBind(bound, whole, recordVal([], []))
+            else:
+                let mut bi = 0
+                loop bi < len(body.keys):
+                    let has2 = do rtBoundHas(bound, body.keys[bi])
+                    if !has2:
+                        let fv = do rtJValToVal(body.vals[bi])
+                        bound = do rtBind(bound, body.keys[bi], fv)
+                    bi = bi + 1
+        let mut args = []
+        let mut ai = 0
+        loop ai < len(act.params):
+            let p2 = act.params[ai]
+            let has3 = do rtBoundHas(bound, p2.name)
+            if !has3:
+                if !p2.optional:
+                    let mp2 = do rtAPIError(400, "missing parameter \"" + p2.name + "\"")
+                    let mp2r = do rtWithHeaders(mp2, rate.headers)
+                    return RtServed{handled: true, resp: mp2r, w: w}
+                args = append(args, noneVal())
+            else:
+                let raw = do rtBoundGet(bound, p2.name)
+                let cv = do rtParamArg(raw, p2)
+                if !cv.ok:
+                    let bad = do rtAPIError(400, "parameter \"" + p2.name + "\" expects " + rtParamTypeName(p2))
+                    let badr = do rtWithHeaders(bad, rate.headers)
+                    return RtServed{handled: true, resp: badr, w: w}
+                args = append(args, cv.v)
+            ai = ai + 1
+        let so = do rtSidForRequest(w, req)
+        w = so.w
+        let mut sid = so.sid
+        if r.api.auth == "session" && sid == "":
+            let mut si = do rtAPIError(401, "sign in to call this endpoint")
+            si.headers = append(si.headers, HttpHeader{name: "www-authenticate", value: "Bearer"})
+            let sir = do rtWithHeaders(si, rate.headers)
+            return RtServed{handled: true, resp: sir, w: w}
+        let mut cookie = HttpHeader{name: "", value: ""}
+        if sid == "" && req.method != "GET":
+            let ss = do rtSession(w, req)
+            w = ss.w
+            sid = ss.sid
+            cookie = ss.cookie
+        let run = do rtRunActionValue(w, sid, act, args)
+        w = run.w
+        if run.status != 200:
+            let mut er = do rtAPIErrorCode(run.status, run.code, run.msg)
+            if cookie.name != "":
+                er.headers = append(er.headers, cookie)
+            let err = do rtWithHeaders(er, rate.headers)
+            return RtServed{handled: true, resp: err, w: w}
+        let mut okStatus = r.api.status
+        if run.retStatus != 0:
+            okStatus = run.retStatus
+        let mut headers = rate.headers
+        let mut hi = 0
+        loop hi < len(run.headerNames):
+            headers = append(headers, HttpHeader{name: lower(run.headerNames[hi]), value: run.headerVals[hi]})
+            hi = hi + 1
+        if sid != "":
+            let adopted = do rtAdoptSession(w, sid, run.sid, cookie)
+            headers = headers + adopted
+        if r.api.status == 204:
+            return RtServed{handled: true, resp: HttpServerResponse{status: 204, reason: "", headers: headers, body: ""}, w: w}
+        if r.api.ret == "bytes":
+            let nf = do rtAPIError(404, "no file")
+            let nfr = do rtWithHeaders(nf, headers)
+            return RtServed{handled: true, resp: nfr, w: w}
+        headers = append(headers, HttpHeader{name: "content-type", value: "application/json"})
+        if r.api.ret == "":
+            return RtServed{handled: true, resp: HttpServerResponse{status: r.api.status, reason: "", headers: headers, body: "{}"}, w: w}
+        let body2 = do rtValJSON(run.value)
+        if req.method == "GET":
+            let etag = "\"" + slice(sha256Hex(body2), 0, 32) + "\""
+            headers = append(headers, HttpHeader{name: "etag", value: etag})
+            headers = append(headers, HttpHeader{name: "cache-control", value: "private, no-cache"})
+            let inm = do rtHeaderValue(req.headers, "if-none-match")
+            let hit = do rtIndexOfText(inm, etag)
+            if hit >= 0:
+                return RtServed{handled: true, resp: HttpServerResponse{status: 304, reason: "", headers: headers, body: ""}, w: w}
+        return RtServed{handled: true, resp: HttpServerResponse{status: okStatus, reason: "", headers: headers, body: body2}, w: w}
+
+    # rtAdoptSession: adoptSession — the cookie (and X-Session-Token) for a
+    # session an action re-keyed, the cookie cleared for one it ended.
+    proc rtAdoptSession(w: RtWorld, before: text, after: text, minted: HttpHeader) -> [HttpHeader]:
+        if after == before:
+            if minted.name != "":
+                return [minted]
+            return []
+        if after == "":
+            let mut v = "fa_sid=; Path=/; Max-Age=0; HttpOnly"
+            if w.secure:
+                v = v + "; Secure"
+            v = v + "; SameSite=Lax"
+            return [HttpHeader{name: "set-cookie", value: v}]
+        let ck = do rtSetCookieHeader(w, after)
+        let tok = do rtSignValue(w, after)
+        return [ck, HttpHeader{name: "x-session-token", value: tok}]
+
+    # ── dispatch ────────────────────────────────────────────────────────
+    proc rtMessageIndex(g: IRGraph, name: text) -> int:
+        let mut i = 0
+        loop i < len(g.messages):
+            if g.messages[i].name == name:
+                return i
+            i = i + 1
+        return -1
+
+    proc rtServeDispatch(w0: RtWorld, req: HttpServerRequest, decl: IRAPI) -> RtHandled:
+        let mut w = w0
+        let g = w.g
+        let mi = do rtMessageIndex(g, decl.dispatch)
+        if mi < 0:
+            let e0 = do rtAPIError(500, "no such message " + decl.dispatch)
+            return RtHandled{resp: e0, w: w}
+        let msg = g.messages[mi]
+        let ct = do rtHeaderValue(req.headers, "content-type")
+        let mut body = do jNone()
+        let form = do rtHasPrefix(ct, "application/x-www-form-urlencoded")
+        let multi = do rtHasPrefix(ct, "multipart/form-data")
+        if form || multi:
+            let qp = do rtQueryParams(req.body, true)
+            let mut keys = []
+            let mut vals = []
+            let mut qi = 0
+            loop qi < len(qp.names):
+                keys = append(keys, qp.names[qi])
+                vals = append(vals, JVal{kind: "str", s: qp.vals[qi], keys: [], vals: []})
+                qi = qi + 1
+            body = JVal{kind: "obj", s: "", keys: keys, vals: vals}
+        else:
+            if trim(req.body) != "":
+                body = do jsonParse(req.body)
+                if body.kind != "obj":
+                    let e1 = do rtAPIError(400, "request body must be a JSON object")
+                    return RtHandled{resp: e1, w: w}
+            else:
+                body = JVal{kind: "obj", s: "", keys: [], vals: []}
+        let mut tagName = msg.tag
+        if tagName == "":
+            tagName = "type"
+        let tagV = do jGet(body, tagName)
+        let tag = do rtJValText(tagV)
+        let mut vi = -1
+        let mut k = 0
+        loop k < len(msg.variants):
+            let mut wire = msg.variants[k].wire
+            if wire == "":
+                wire = msg.variants[k].name
+            if wire == tag:
+                vi = k
+            k = k + 1
+        if vi < 0:
+            let e2 = do rtAPIError(400, "unknown " + tagName + " \"" + tag + "\"")
+            return RtHandled{resp: e2, w: w}
+        let v = msg.variants[vi]
+        let ai = do rtActionIndex(g, v.action)
+        let act = g.actions[ai]
+        let mut args = []
+        let mut pi = 0
+        loop pi < len(act.params):
+            let p = act.params[pi]
+            if p.name == v.bodyParam:
+                let whole = do rtJValToVal(body)
+                args = append(args, whole)
+            else:
+                let mut has = do jHas(body, p.name)
+                let mut raw = do jGet(body, p.name)
+                let mut fi = -1
+                let mut f = 0
+                loop f < len(v.fields):
+                    if v.fields[f].name == p.name:
+                        fi = f
+                    f = f + 1
+                if fi >= 0 && !has:
+                    let mut a = 0
+                    loop a < len(v.fields[fi].aliases) && !has:
+                        let ah = do jHas(body, v.fields[fi].aliases[a])
+                        if ah:
+                            has = true
+                            raw = do jGet(body, v.fields[fi].aliases[a])
+                        a = a + 1
+                if has && raw.kind == "null":
+                    has = false
+                if fi >= 0 && !has && v.fields[fi].default != "":
+                    raw = do jsonParse(v.fields[fi].default)
+                    has = raw.kind != "none"
+                if !has:
+                    if !p.optional:
+                        let e3 = do rtAPIError(400, tag + " requires \"" + p.name + "\"")
+                        return RtHandled{resp: e3, w: w}
+                    args = append(args, noneVal())
+                else:
+                    let mut rv = do rtJValToVal(raw)
+                    if p.type == "text" && !p.list && (raw.kind == "arr" || raw.kind == "obj"):
+                        let cj = do rtCanonicalJSON(rv)
+                        rv = do textVal(cj)
+                    if p.type == "json" && raw.kind == "str":
+                        let decoded = do jsonParse(raw.s)
+                        if decoded.kind != "none":
+                            rv = do rtJValToVal(decoded)
+                    let cv = do rtParamArg(rv, p)
+                    if !cv.ok:
+                        let e4 = do rtAPIError(400, tag + ": \"" + p.name + "\" expects " + rtParamTypeName(p))
+                        return RtHandled{resp: e4, w: w}
+                    args = append(args, cv.v)
+            pi = pi + 1
+        let so = do rtSidForRequest(w, req)
+        w = so.w
+        let mut sid = so.sid
+        if len(act.requires) > 0 && sid == "":
+            let mut e5 = do rtAPIError(401, "sign in to call this endpoint")
+            e5.headers = append(e5.headers, HttpHeader{name: "www-authenticate", value: "Bearer"})
+            return RtHandled{resp: e5, w: w}
+        let mut cookie = HttpHeader{name: "", value: ""}
+        if sid == "":
+            let ss = do rtSession(w, req)
+            w = ss.w
+            sid = ss.sid
+            cookie = ss.cookie
+        let run = do rtRunActionValue(w, sid, act, args)
+        w = run.w
+        if run.status != 200:
+            let mut er = do rtAPIErrorCode(run.status, run.code, run.msg)
+            if cookie.name != "":
+                er.headers = append(er.headers, cookie)
+            return RtHandled{resp: er, w: w}
+        let mut headers = do rtAdoptSession(w, sid, run.sid, cookie)
+        let mut hi = 0
+        loop hi < len(run.headerNames):
+            headers = append(headers, HttpHeader{name: lower(run.headerNames[hi]), value: run.headerVals[hi]})
+            hi = hi + 1
+        if act.ret == "":
+            return RtHandled{resp: HttpServerResponse{status: 204, reason: "", headers: headers, body: ""}, w: w}
+        let mut status = run.retStatus
+        if status == 0:
+            status = 200
+        headers = append(headers, HttpHeader{name: "content-type", value: "application/json"})
+        let out = do rtValJSON(run.value)
+        return RtHandled{resp: HttpServerResponse{status: status, reason: "", headers: headers, body: out}, w: w}
+
+    proc rtJValText(v: JVal) -> text:
+        if v.kind == "str" || v.kind == "num" || v.kind == "bool":
+            return v.s
+        return ""
