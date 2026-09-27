@@ -451,7 +451,12 @@ fn admin_case(line: &str) -> String {
 /// optimizer: `base|token|seconds` -> the hottest profile seen polling every
 /// 500 ms (after a baseline), stopping once one is hot:
 /// `pressure|hot|cpu|queue|write_latency_us|write_ratio|action`.
-fn loaded_poll_case(line: &str) -> String {
+/// `daemon-loaded-poll`: the first stdin line is `base|token|seconds`; the
+/// window ends at the deadline, once a profile is hot, or when stdin closes —
+/// the Go test closes it the instant the port's own poller has finished, so
+/// both pollers observe the same loaded window and neither polls an instance
+/// whose load has stopped.
+fn loaded_poll_case(line: &str, stop: &std::sync::atomic::AtomicBool) -> String {
     use fabric_facetql::poller::{PollOutcome, PollTarget, TelemetryPoller};
     use fabric_facetql::FacetqlEndpoint;
     use fabric_optimizer::WorkloadOptimizer;
@@ -468,7 +473,7 @@ fn loaded_poll_case(line: &str) -> String {
         poller.poll_once().await;
         let mut hottest: Option<WorkloadProfile> = None;
         let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
-        while std::time::Instant::now() < deadline {
+        while std::time::Instant::now() < deadline && !stop.load(std::sync::atomic::Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(500)).await;
             for (_, outcome) in poller.poll_once().await {
                 let PollOutcome::Sampled(batch) = outcome else { continue };
@@ -561,9 +566,21 @@ pub fn run(mode: &str) {
             }
         }
         "daemon-loaded-poll" => {
-            for line in stdin_lines() {
-                println!("{}", loaded_poll_case(&line));
-            }
+            use std::io::BufRead;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::Arc;
+            let mut line = String::new();
+            std::io::stdin().lock().read_line(&mut line).expect("stdin");
+            let stop = Arc::new(AtomicBool::new(false));
+            let closed = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut rest = String::new();
+                while std::io::stdin().lock().read_line(&mut rest).map(|n| n > 0).unwrap_or(false) {
+                    rest.clear();
+                }
+                closed.store(true, Ordering::SeqCst);
+            });
+            println!("{}", loaded_poll_case(line.trim_end(), &stop));
         }
         "daemon-admin" => {
             for line in stdin_lines() {

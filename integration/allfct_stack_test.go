@@ -20,12 +20,13 @@ package integration
 // fail, the stream stays open across the cutover, and afterwards the rows
 // are on the new holder and a new write lands there alone.
 //
-// The door in front is fabricd's own data port, not
-// selfhost/fabric_frontdoor_main.fct: both are fabric_frontdoor.fct, but
-// the standalone command is configured once from its environment
-// (FRONTDOOR_PLACEMENTS) and cannot learn that a cell moved, whereas the
-// daemon's port is re-fed the routing table every cycle — which is what a
-// migration with no failed request needs.
+// The door in front is fabricd's own data port, re-fed the routing table
+// every cycle, or — in the standalone-door stacks — a separate process,
+// selfhost/fabric_frontdoor_main.fct, following the daemon's published
+// routing over its operator port (FRONTDOOR_ROUTING_FEED;
+// selfhost/fabric_routing_feed.fct). The daemon then moves authority only
+// once that door has confirmed the fenced table, so the same migration
+// runs with no failed request through either door.
 //
 // Two engine properties the daemon depends on are asserted explicitly,
 // because a fleet fails on them silently: the daemon's liveness probe
@@ -39,11 +40,14 @@ package integration
 // refused copy; and the destination is probed directly, under the mover's
 // load, with the daemon's own timeout.
 //
-// Three stacks are run, each as a subtest, so a failure names its layer:
+// Four stacks are run, each as a subtest, so a failure names its layer:
 //   go-runtime/rust-facetql        the reference; no fabric
 //   go-runtime/fct-fabric          the fct daemon and engines, under a
 //                                  runtime that persists through them
 //   fct-runtime/fct-fabric         everything in fct
+//   fct-runtime/fct-fabric/standalone-door
+//                                  everything in fct, the app talking to a
+//                                  front door that is its own process
 // Known gap, asserted rather than hidden (the last stack): the fct
 // runtime holds its rows in memory — no runtime_*.fct uses io.net, and
 // runtime_server.fct reads no FACET_DATABASE_URL — so nothing it serves
@@ -58,6 +62,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"os"
@@ -89,6 +94,27 @@ type afProc struct {
 	done chan struct{}
 }
 
+// afProcs is every process a test started, so a failing step can show what
+// each of them said.
+var (
+	afProcsMu sync.Mutex
+	afProcs   = map[*testing.T][]*afProc{}
+)
+
+// afLogs is what every process the test (or its parent) started has
+// written, each under its command line.
+func afLogs(t *testing.T) string {
+	afProcsMu.Lock()
+	defer afProcsMu.Unlock()
+	var b strings.Builder
+	for _, ps := range afProcs {
+		for _, p := range ps {
+			fmt.Fprintf(&b, "── %s ──\n%s\n", strings.Join(p.cmd.Args, " "), p.log.String())
+		}
+	}
+	return b.String()
+}
+
 type afLog struct {
 	mu sync.Mutex
 	b  bytes.Buffer
@@ -114,9 +140,15 @@ func afStart(t *testing.T, cmd *exec.Cmd) *afProc {
 		t.Fatalf("starting %s: %v", cmd.Path, err)
 	}
 	go func() { _ = cmd.Wait(); close(p.done) }()
+	afProcsMu.Lock()
+	afProcs[t] = append(afProcs[t], p)
+	afProcsMu.Unlock()
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
 		<-p.done
+		afProcsMu.Lock()
+		delete(afProcs, t)
+		afProcsMu.Unlock()
 	})
 	return p
 }
@@ -143,7 +175,6 @@ func afEngineEnv(dir string, port int) []string {
 func afStartEngine(t *testing.T, kind string) *afEngine {
 	t.Helper()
 	dir := t.TempDir()
-	port := freePort(t)
 	var cmd *exec.Cmd
 	if kind == "rust" {
 		cmd = exec.Command(facetqlBinary(t), "start")
@@ -155,11 +186,46 @@ func afStartEngine(t *testing.T, kind string) *afEngine {
 		cmd = exec.Command(facetBinary(t), "exec", server)
 	}
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), afEngineEnv(dir, port)...)
-	e := &afEngine{base: fmt.Sprintf("http://127.0.0.1:%d", port), proc: afStart(t, cmd)}
+	// Port 0: the engine binds whatever the kernel gives it and names it in
+	// its banner, so no port is chosen here that another process could take
+	// first (stack_test.go's bannerPort, read off this process's log).
+	cmd.Env = append(os.Environ(), afEngineEnv(dir, 0)...)
+	p := afStart(t, cmd)
+	port := afBanner(t, p, bannerPortRE, 60*time.Second)[0]
+	e := &afEngine{base: fmt.Sprintf("http://127.0.0.1:%d", port), proc: p}
 	afWaitHTTP(t, e.base+"/", "", 200, 60*time.Second, e.proc)
 	return e
 }
+
+// afBanner waits for a process to print the line re matches and answers
+// its captured numbers — the ports a process bound on port 0 and named.
+func afBanner(t *testing.T, p *afProc, re *regexp.Regexp, budget time.Duration) []int {
+	t.Helper()
+	for end := time.Now().Add(budget); ; time.Sleep(20 * time.Millisecond) {
+		if m := re.FindStringSubmatch(p.log.String()); m != nil {
+			var out []int
+			for _, g := range m[1:] {
+				var n int
+				fmt.Sscanf(g, "%d", &n)
+				out = append(out, n)
+			}
+			return out
+		}
+		select {
+		case <-p.done:
+			t.Fatalf("%s exited before saying which port it bound:\n%s", strings.Join(p.cmd.Args, " "), p.log.String())
+		default:
+		}
+		if time.Now().After(end) {
+			t.Fatalf("%s never said which port it bound:\n%s", strings.Join(p.cmd.Args, " "), p.log.String())
+		}
+	}
+}
+
+var (
+	afFabricdBannerRE = regexp.MustCompile(`fabricd: serving FacetQL's wire on 127\.0\.0\.1:(\d+) and the operator surface on 127\.0\.0\.1:(\d+)`)
+	afDoorBannerRE    = regexp.MustCompile(`fabric front door serving on port (\d+)`)
+)
 
 // afWaitHTTP polls url until it answers status, or fails with the process
 // log. An empty token sends no credential.
@@ -208,9 +274,10 @@ type afFabric struct {
 func afStartFabric(t *testing.T, source, destination *afEngine) *afFabric {
 	t.Helper()
 	dir := t.TempDir()
-	dataPort, adminPort := freePort(t), freePort(t)
+	// Port 0 on both listeners: fabricd names the ports it bound in its
+	// banner (daemon.rs's local_addr), and those are read back.
 	config := fmt.Sprintf(`{
-		"data_listen": "127.0.0.1:%d", "admin_listen": "127.0.0.1:%d",
+		"data_listen": "127.0.0.1:0", "admin_listen": "127.0.0.1:0",
 		"backends": [
 			{"id": %q, "url": %q, "region": "us-east", "token_env": "FABRIC_DB_TOKEN", "placements": [{"shard": 1, "x": 0, "y": 0}]},
 			{"id": %q, "url": %q, "region": "us-west", "token_env": "FABRIC_DB_TOKEN", "placements": [{"shard": 2, "x": 0, "y": 0}]}
@@ -220,7 +287,7 @@ func afStartFabric(t *testing.T, source, destination *afEngine) *afFabric {
 		"silence_budget_ms": 5000, "probe_timeout_ms": 500,
 		"policy": {"measurement_settle_ms": 0, "phase_timeout_ms": 120000},
 		"drain_ms": 5000
-	}`, dataPort, adminPort, afSource, source.base, afDestination, destination.base)
+	}`, afSource, source.base, afDestination, destination.base)
 	if err := os.WriteFile(filepath.Join(dir, "fabric.json"), []byte(config), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -232,18 +299,10 @@ func afStartFabric(t *testing.T, source, destination *afEngine) *afFabric {
 	cmd.Dir = dir
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "FACET_DATA_DIR=" + dir,
 		"FABRIC_ADMIN_TOKEN=" + afAdminToken, "FABRIC_DB_TOKEN=" + afEngineToken}
-	f := &afFabric{data: fmt.Sprintf("http://127.0.0.1:%d", dataPort), admin: fmt.Sprintf("http://127.0.0.1:%d", adminPort),
-		dir: dir, proc: afStart(t, cmd), source: source, destination: destination}
-	for end := time.Now().Add(30 * time.Second); !strings.Contains(f.proc.log.String(), "serving FacetQL's wire"); time.Sleep(20 * time.Millisecond) {
-		select {
-		case <-f.proc.done:
-			t.Fatalf("fabricd exited: %s", f.proc.log.String())
-		default:
-		}
-		if time.Now().After(end) {
-			t.Fatalf("fabricd never served: %s", f.proc.log.String())
-		}
-	}
+	p := afStart(t, cmd)
+	ports := afBanner(t, p, afFabricdBannerRE, 60*time.Second)
+	f := &afFabric{data: fmt.Sprintf("http://127.0.0.1:%d", ports[0]), admin: fmt.Sprintf("http://127.0.0.1:%d", ports[1]),
+		dir: dir, proc: p, source: source, destination: destination}
 	afWaitHTTP(t, f.admin+"/status", afAdminToken, 200, 10*time.Second, f.proc)
 	return f
 }
@@ -419,10 +478,26 @@ func afStartGoRuntime(t *testing.T, g *ir.IR, dsn, apiRead string) *afSide {
 	if err != nil {
 		t.Fatalf("starting the Go runtime: %v", err)
 	}
-	port := freePort(t)
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	go func() { _ = srv.Serve(addr) }()
-	side := &afSide{name: "go", base: "http://" + addr, client: afClient(t)}
+	// As `facet serve` and `facet exec` do (and the fct runtime does before
+	// it listens): the `on start` jobs run — api/main.fct seeds its feed
+	// surfaces in one — and the daemons start.
+	srv.StartJobs()
+	// A listener this process bound, handed over (no port chosen and then
+	// released), and the runtime stopped with the test: its jobs and daemons
+	// would otherwise go on running against engines the test has killed,
+	// for as long as the test binary does.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan struct{})
+	go func() { _ = srv.ServeOn(ln); close(served) }()
+	t.Cleanup(func() {
+		ln.Close()
+		<-served
+		srv.Shutdown()
+	})
+	side := &afSide{name: "go", base: "http://" + ln.Addr().String(), client: afClient(t)}
 	afWaitSide(t, side, nil)
 	return side
 }
@@ -634,6 +709,11 @@ type afSession struct {
 	rowKind               string // the kind whose rows must reach the engine
 }
 
+// The API feed reads are newest-first by id, not by `created`: `created` is
+// now() in whole seconds, stamped by two runtimes reading two clocks, so
+// rows posted within one second tie on one side and not the other and a
+// by=created page may order them differently — the same reason the masks
+// zero the value. The id sequence is the insertion order on both sides.
 func afHomeSession() afSession {
 	return afSession{
 		before: []afStep{
@@ -646,19 +726,19 @@ func afHomeSession() afSession {
 			{name: "post second", method: "POST", path: "/api/post", body: `{"args":["second post with #facet and @alan"]}`},
 			{name: "like via event", method: "POST", path: "/event", body: `{"action":"like","args":[1]}`, csrf: true},
 			{name: "feed as grace", method: "GET", path: "/"},
-			{name: "api feed", method: "GET", path: "/api/Tweet?by=created&desc=1&limit=5"},
+			{name: "api feed", method: "GET", path: "/api/Tweet?by=id&desc=1&limit=5"},
 		},
 		seed: 40,
 		during: []afStep{
 			{name: "post during the copy", method: "POST", path: "/api/post", body: `{"args":["written while the cell is being copied"]}`},
 			{name: "feed during the copy", method: "GET", path: "/"},
-			{name: "api feed during the copy", method: "GET", path: "/api/Tweet?by=created&desc=1&limit=5"},
+			{name: "api feed during the copy", method: "GET", path: "/api/Tweet?by=id&desc=1&limit=5"},
 			{name: "follow during the copy", method: "POST", path: "/api/follow", body: `{"args":["alan"]}`},
 		},
 		after: []afStep{
 			{name: "post after the cutover", method: "POST", path: "/api/post", body: `{"args":["written after the cell moved"]}`},
 			{name: "feed after the cutover", method: "GET", path: "/"},
-			{name: "api feed after the cutover", method: "GET", path: "/api/Tweet?by=created&desc=1&limit=5"},
+			{name: "api feed after the cutover", method: "GET", path: "/api/Tweet?by=id&desc=1&limit=5"},
 			{name: "api feed filtered", method: "GET", path: "/api/Tweet?author=grace&by=id&limit=3"},
 			{name: "logout", method: "POST", path: "/api/logout", body: `{"args":[]}`},
 			{name: "login wrong password", method: "POST", path: "/api/login", body: `{"args":["grace","nope"]}`},
@@ -773,7 +853,7 @@ func afRun(t *testing.T, app string, s afSession, boot func(t *testing.T, g *ir.
 			sa := afDo(t, stack.side, st)
 			afCompare(t, st, ra, sa)
 			if t.Failed() {
-				t.Fatalf("stopping at the first failing step (%s)", st.name)
+				t.Fatalf("stopping at the first failing step (%s); the stack's processes said:\n%s", st.name, afLogs(t))
 			}
 		}
 	}
@@ -851,13 +931,47 @@ func afMigrate(t *testing.T, stack afStack, s afSession, run func([]afStep)) {
 		return len(copying) > 0
 	})
 	// A read load on the app and the daemon's own probe on the destination,
-	// under the mover's transactions, until authority moves.
+	// under the mover's transactions, until authority moves — and the
+	// migration's phases as routing publishes them, sampled from this
+	// instant: the `during` steps below take real time on a real runtime,
+	// and a small cell can be copied and cut over before they return.
 	stop := make(chan struct{})
 	var load sync.WaitGroup
 	var loadMu sync.Mutex
 	var loadFailures []string
 	loadReads, probes := 0, 0
-	load.Add(2)
+	phases := map[string]bool{}
+	holderNow := func() (string, string) {
+		routing, _ := f.adminJSON("/routing").(map[string]any)
+		placements, _ := routing["placements"].([]any)
+		if len(placements) == 0 {
+			return "", ""
+		}
+		p := placements[0].(map[string]any)
+		phase := ""
+		if m, ok := p["migration"].(map[string]any); ok {
+			phase, _ = m["phase"].(string)
+		}
+		holder, _ := p["holder"].(string)
+		return holder, phase
+	}
+	load.Add(3)
+	go func() {
+		defer load.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, phase := holderNow(); phase != "" {
+				loadMu.Lock()
+				phases[phase] = true
+				loadMu.Unlock()
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
 	go func() {
 		defer load.Done()
 		client := &http.Client{Timeout: 30 * time.Second, Jar: stack.side.client.Jar}
@@ -910,27 +1024,16 @@ func afMigrate(t *testing.T, stack afStack, s afSession, run func([]afStep)) {
 		}
 	}()
 	run(s.during)
-	phases := map[string]bool{}
 	until("the cell to move", 120*time.Second, func() bool {
-		routing, _ := f.adminJSON("/routing").(map[string]any)
-		placements, _ := routing["placements"].([]any)
-		if len(placements) == 0 {
-			return false
-		}
-		p := placements[0].(map[string]any)
-		if m, ok := p["migration"].(map[string]any); ok {
-			if phase, _ := m["phase"].(string); phase != "" {
-				phases[phase] = true
-			}
-		}
-		return p["holder"] == afDestination
+		holder, _ := holderNow()
+		return holder == afDestination
 	})
 	close(stop)
 	load.Wait()
+	loadMu.Lock()
 	if !phases["copying"] {
 		t.Errorf("routing never published the copying phase; saw %v", phases)
 	}
-	loadMu.Lock()
 	for _, fl := range loadFailures {
 		t.Errorf("a request failed during the migration: %s", fl)
 	}
@@ -979,6 +1082,8 @@ func afAfterMigration(t *testing.T, stack afStack, s afSession) {
 		t.Errorf("the write after the migration: destination held %d %s rows, now %d", before, s.rowKind, len(after))
 	}
 	srcAfter := afEngineNodes(t, f.source, s.rowKind)
+	t.Logf("after the migration (%s runtime): the new holder %s held %d %s rows through the runtime's own store, %d after one more write; the old holder %d",
+		stack.side.name, afDestination, before, s.rowKind, len(after), len(srcAfter))
 	for addr := range after {
 		if _, ok := onDestination[addr]; ok {
 			continue
@@ -1003,6 +1108,40 @@ func afBootFctOnFctFabric(t *testing.T, g *ir.IR, apiRead string) afStack {
 	return afStack{name: "fct-runtime/fct-fabric", side: side, fabric: f}
 }
 
+// afStartStandaloneDoor runs selfhost/fabric_frontdoor_main.fct in front of
+// the fabric's engines, following its routing, and waits until the door
+// holds a table (before its first feed answer it refuses everything, 503).
+func afStartStandaloneDoor(t *testing.T, f *afFabric) string {
+	t.Helper()
+	program, err := filepath.Abs("../selfhost/fabric_frontdoor_main.fct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	cmd := exec.Command(facetBinary(t), "exec", program)
+	cmd.Dir = dir
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "FACET_DATA_DIR=" + dir,
+		"FRONTDOOR_PORT=0",
+		"FRONTDOOR_BACKENDS=" + afSource + "=" + f.source.base + "," + afDestination + "=" + f.destination.base,
+		"FRONTDOOR_FALLBACK_SHARD=1",
+		"FRONTDOOR_ROUTING_FEED=" + f.admin,
+		"FRONTDOOR_ROUTING_TOKEN=" + afAdminToken,
+		"FRONTDOOR_DOOR_ID=allfct-door",
+		"FRONTDOOR_FEED_INTERVAL_MS=50",
+	}
+	p := afStart(t, cmd)
+	base := fmt.Sprintf("http://127.0.0.1:%d", afBanner(t, p, afDoorBannerRE, 60*time.Second)[0])
+	afWaitHTTP(t, base+"/", afEngineToken, 200, 60*time.Second, p)
+	return base
+}
+
+func afBootFctOnStandaloneDoor(t *testing.T, g *ir.IR, apiRead string) afStack {
+	f := afStartFabric(t, afStartEngine(t, "fct"), afStartEngine(t, "fct"))
+	door := afStartStandaloneDoor(t, f)
+	side := afStartFctRuntime(t, g, "facetql://"+afEngineToken+"@"+strings.TrimPrefix(door, "http://"), apiRead)
+	return afStack{name: "fct-runtime/fct-fabric/standalone-door", side: side, fabric: f}
+}
+
 func afBootGoOnRust(t *testing.T, g *ir.IR, apiRead string) afStack {
 	e := afStartEngine(t, "rust")
 	side := afStartGoRuntime(t, g, "facetql://"+afEngineToken+"@"+strings.TrimPrefix(e.base, "http://"), apiRead)
@@ -1023,6 +1162,7 @@ func TestAllFctStackHome(t *testing.T) {
 	t.Run("go-runtime/rust-facetql", func(t *testing.T) { afRun(t, app, afHomeSession(), afBootGoOnRust) })
 	t.Run("go-runtime/fct-fabric", func(t *testing.T) { afRun(t, app, afHomeSession(), afBootGoOnFctFabric) })
 	t.Run("fct-runtime/fct-fabric", func(t *testing.T) { afRun(t, app, afHomeSession(), afBootFctOnFctFabric) })
+	t.Run("fct-runtime/fct-fabric/standalone-door", func(t *testing.T) { afRun(t, app, afHomeSession(), afBootFctOnStandaloneDoor) })
 }
 
 func TestAllFctStackAPI(t *testing.T) {
@@ -1031,4 +1171,5 @@ func TestAllFctStackAPI(t *testing.T) {
 	t.Run("go-runtime/rust-facetql", func(t *testing.T) { afRun(t, app, afAPISession(), afBootGoOnRust) })
 	t.Run("go-runtime/fct-fabric", func(t *testing.T) { afRun(t, app, afAPISession(), afBootGoOnFctFabric) })
 	t.Run("fct-runtime/fct-fabric", func(t *testing.T) { afRun(t, app, afAPISession(), afBootFctOnFctFabric) })
+	t.Run("fct-runtime/fct-fabric/standalone-door", func(t *testing.T) { afRun(t, app, afAPISession(), afBootFctOnStandaloneDoor) })
 }

@@ -17,148 +17,18 @@ app UploadMedia:
     # carries them beside the text body (x-facet-body-b64), and a stored
     # file leaves the same way (x-facet-body-b64 on the response), so a
     # binary payload never passes through a text conversion.
-    proc rtUploadDir(w: RtWorld) -> text:
-        if w.uploadDir != "":
-            return w.uploadDir
-        return "facet-uploads"
-
-    proc rtRandomName() -> text:
-        let b = randomBytes(16)
-        let h = do rtHex(b)
-        return h
-
-    proc rtHex(bs: [int]) -> text:
-        let digits = "0123456789abcdef"
-        let mut out = ""
-        let mut i = 0
-        loop i < len(bs):
-            out = out + charAt(digits, bs[i] / 16) + charAt(digits, bs[i] % 16)
-            i = i + 1
-        return out
-
-    # rtSafeExt: safeExt — a lowercase extension of at most 5 letters or
-    # digits, else none.
-    proc rtSafeExt(filename: text) -> text:
-        let mut dot = -1
-        let mut i = len(filename) - 1
-        loop i >= 0 && dot < 0:
-            let c = charAt(filename, i)
-            if c == ".":
-                dot = i
-            if c == "/" || c == "\\":
-                i = -1
-            i = i - 1
-        if dot < 0:
-            return ""
-        let ext = lower(slice(filename, dot, len(filename)))
-        if ext == "" || len(ext) > 6:
-            return ""
-        let mut k = 1
-        loop k < len(ext):
-            let c2 = charAt(ext, k)
-            if !((c2 >= "a" && c2 <= "z") || (c2 >= "0" && c2 <= "9")):
-                return ""
-            k = k + 1
-        return ext
-
-    # rtBodyBytes: the request body as the bytes that arrived.
-    proc rtBodyBytes(req: HttpServerRequest) -> [int]:
-        let b64 = do rtHeaderValue(req.headers, "x-facet-body-b64")
-        if b64 == "":
-            return textToBytes(req.body)
-        let bs = do rtBase64UrlDecode(b64)
-        return bs
-
-    # ── multipart/form-data ─────────────────────────────────────────────
-    struct RtPart:
-        name: text
-        filename: text
-        data: [int]
-
-    proc rtBoundaryOf(contentType: text) -> text:
-        let at = do rtIndexOfText(lower(contentType), "boundary=")
-        if at < 0:
-            return ""
-        let mut b = slice(contentType, at + 9, len(contentType))
-        let semi = do rtIndexOfText(b, ";")
-        if semi >= 0:
-            b = slice(b, 0, semi)
-        b = trim(b)
-        if len(b) >= 2 && charAt(b, 0) == "\"":
-            b = slice(b, 1, len(b) - 1)
-        return b
-
-    proc rtBytesIndexOf(hay: [int], needle: [int], from: int) -> int:
-        let n = len(hay)
-        let m = len(needle)
-        let mut i = from
-        loop i + m <= n:
-            let mut k = 0
-            let mut same = true
-            loop k < m && same:
-                if hay[i + k] != needle[k]:
-                    same = false
-                k = k + 1
-            if same:
-                return i
-            i = i + 1
-        return -1
-
-    proc rtDispositionParam(header: text, key: text) -> text:
-        let at = do rtIndexOfText(header, key + "=\"")
-        if at < 0:
-            return ""
-        let rest = slice(header, at + len(key) + 2, len(header))
-        let q = do rtIndexOfText(rest, "\"")
-        if q < 0:
-            return rest
-        return slice(rest, 0, q)
-
-    # rtParseMultipart: every part of a multipart/form-data body; an empty
-    # list when the body is not one.
-    proc rtParseMultipart(contentType: text, body: [int]) -> [RtPart]:
-        let boundary = do rtBoundaryOf(contentType)
-        let isMulti = do rtHasPrefix(lower(contentType), "multipart/form-data")
-        if boundary == "" || !isMulti:
-            return []
-        let delim = textToBytes("--" + boundary)
-        let crlf = textToBytes("\r\n")
-        let mut parts = []
-        let mut pos = do rtBytesIndexOf(body, delim, 0)
-        let mut going = pos >= 0
-        loop going:
-            pos = pos + len(delim)
-            if pos + 2 <= len(body) && body[pos] == 45 && body[pos + 1] == 45:
-                going = false
-            else:
-                let headEnd = do rtBytesIndexOf(body, textToBytes("\r\n\r\n"), pos)
-                if headEnd < 0:
-                    going = false
-                else:
-                    let head = bytesToText(slice(body, pos + 2, headEnd))
-                    let next = do rtBytesIndexOf(body, crlf + delim, headEnd + 4)
-                    if next < 0:
-                        going = false
-                    else:
-                        let data = slice(body, headEnd + 4, next)
-                        let lines = split(head, "\r\n")
-                        let mut name = ""
-                        let mut filename = ""
-                        let mut li = 0
-                        loop li < len(lines):
-                            let isDisp = do rtHasPrefix(lower(lines[li]), "content-disposition:")
-                            if isDisp:
-                                name = do rtDispositionParam(lines[li], "name")
-                                filename = do rtDispositionParam(lines[li], "filename")
-                            li = li + 1
-                        parts = append(parts, RtPart{name: name, filename: filename, data: data})
-                        pos = next + 2
-        return parts
-
     # ── POST /upload ────────────────────────────────────────────────────
-    proc rtUploadedJSON(name: text) -> HttpServerResponse:
+    # rtUploadedJSON: writeUploaded — the stored file's reference, and with
+    # signing on the URL to render it by.
+    proc rtUploadedJSON(w: RtWorld, name: text) -> HttpServerResponse:
         let ref = "/uploads/" + name
-        let r = do rtJSONResponse(200, rtObjectJSONRaw(["url"], [jsonQuote(ref)]) + "\n")
+        let mut keys = ["url"]
+        let mut raws = [jsonQuote(ref)]
+        let grants = do rtMediaGrants(w.mediaTTL, w.signKey, textVal(ref))
+        if len(grants.keys) > 0:
+            keys = append(keys, "media")
+            raws = append(raws, rtValJSON(grants))
+        let r = do rtJSONResponse(200, rtObjectJSONRaw(keys, raws) + "\n")
         return r
 
     proc rtHandleUpload(w0: RtWorld, req: HttpServerRequest) -> RtHandled uses io.file:
@@ -188,7 +58,7 @@ app UploadMedia:
         let name = rtRandomName() + rtSafeExt(parts[at].filename)
         let path = rtUploadDir(w) + "/" + name
         let wrote = writeFileAt(path, 0, parts[at].data)
-        let ok = do rtUploadedJSON(name)
+        let ok = do rtUploadedJSON(w, name)
         return RtHandled{resp: ok, w: w}
 
     # ── the resumable endpoints ─────────────────────────────────────────
@@ -252,7 +122,7 @@ app UploadMedia:
             let name2 = w.upNames[at]
             let moved = renameFile(dir + "/" + w.upIds[at] + ".part", dir + "/" + name2)
             w = do rtDropUploadSession(w, at)
-            let done = do rtUploadedJSON(name2)
+            let done = do rtUploadedJSON(w, name2)
             return RtHandled{resp: done, w: w}
         if op == "abort":
             if at >= 0:
@@ -326,25 +196,246 @@ app UploadMedia:
             i = i - 1
         return ""
 
-    # rtMediaSig / rtMediaAccessOK: a signed media link's exp/sig, over the
-    # name and expiry under the signing key (media.go's mediaSig).
-    proc rtMediaSig(w: RtWorld, name: text, exp: int) -> text:
-        let s = do rtSign(w, "media:" + name + ":" + exp)
-        return s
+    # rtIsIntText: strconv.ParseInt's accepted spelling — an optional sign,
+    # then one or more digits.
+    proc rtIsIntText(s: text) -> bool:
+        let mut i = 0
+        if len(s) > 0 && (charAt(s, 0) == "-" || charAt(s, 0) == "+"):
+            i = 1
+        if i >= len(s):
+            return false
+        loop i < len(s):
+            let c = charAt(s, i)
+            if !(c >= "0" && c <= "9"):
+                return false
+            i = i + 1
+        return true
 
+    # rtMediaAccessOK: mediaAccessOK — with signing on, a link must carry
+    # an integer `exp` not yet passed and the signature of name:exp.
     proc rtMediaAccessOK(w: RtWorld, name: text, query: text) -> bool:
         if w.mediaTTL <= 0:
             return true
         let expT = do rtQueryValue(query, "exp")
-        let num = do rtIsNumericText(expT)
-        if expT == "" || !num:
+        let num = do rtIsIntText(expT)
+        if !num:
             return false
         let exp = toInt(expT)
         if nowMs() / 1000 > exp:
             return false
         let sig = do rtQueryValue(query, "sig")
-        let want = do rtMediaSig(w, name, exp)
+        let want = do rtMediaSig(w.signKey, name, exp)
         return sig == want
+
+    # ── ServeFile ───────────────────────────────────────────────────────
+    struct RtRange:
+        start: int
+        length: int
+
+    struct RtRanges:
+        ok: bool
+        noOverlap: bool
+        ranges: [RtRange]
+
+    # rtParseRange: net/http's parseRange — "bytes=" then comma-separated
+    # ranges, each start-end, start- or -suffix; ok false is "invalid range",
+    # noOverlap with no range left is "invalid range: failed to overlap".
+    proc rtParseRange(s: text, size: int) -> RtRanges:
+        let pre = do rtHasPrefix(s, "bytes=")
+        if !pre:
+            return RtRanges{ok: false, noOverlap: false, ranges: []}
+        let items = split(slice(s, 6, len(s)), ",")
+        let mut out = []
+        let mut noOverlap = false
+        let mut i = 0
+        loop i < len(items):
+            let ra = trim(items[i])
+            if ra != "":
+                let dash = do rtIndexOfText(ra, "-")
+                if dash < 0:
+                    return RtRanges{ok: false, noOverlap: false, ranges: []}
+                let st = trim(slice(ra, 0, dash))
+                let en = trim(slice(ra, dash + 1, len(ra)))
+                if st == "":
+                    let enOK = do rtIsDigitsOnly(en)
+                    if !enOK:
+                        return RtRanges{ok: false, noOverlap: false, ranges: []}
+                    let mut n = toInt(en)
+                    if n > size:
+                        n = size
+                    out = append(out, RtRange{start: size - n, length: n})
+                else:
+                    let stOK = do rtIsDigitsOnly(st)
+                    if !stOK:
+                        return RtRanges{ok: false, noOverlap: false, ranges: []}
+                    let start = toInt(st)
+                    if start >= size:
+                        noOverlap = true
+                    else:
+                        if en == "":
+                            out = append(out, RtRange{start: start, length: size - start})
+                        else:
+                            let enOK2 = do rtIsDigitsOnly(en)
+                            if !enOK2 || start > toInt(en):
+                                return RtRanges{ok: false, noOverlap: false, ranges: []}
+                            let mut e = toInt(en)
+                            if e >= size:
+                                e = size - 1
+                            out = append(out, RtRange{start: start, length: e - start + 1})
+            i = i + 1
+        if noOverlap && len(out) == 0:
+            return RtRanges{ok: false, noOverlap: true, ranges: []}
+        return RtRanges{ok: true, noOverlap: false, ranges: out}
+
+    proc rtIsDigitsOnly(s: text) -> bool:
+        if s == "":
+            return false
+        let mut i = 0
+        loop i < len(s):
+            let c = charAt(s, i)
+            if !(c >= "0" && c <= "9"):
+                return false
+            i = i + 1
+        return true
+
+    # rtParseHTTPDate: http.ParseTime for the IMF-fixdate form
+    # ("Mon, 02 Jan 2006 15:04:05 GMT"), -1 when it is not one.
+    proc rtParseHTTPDate(s: text) -> int:
+        let parts = split(trim(s), " ")
+        if len(parts) != 6 || parts[5] != "GMT":
+            return -1
+        let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        let mut mo = -1
+        let mut i = 0
+        loop i < 12:
+            if months[i] == parts[2]:
+                mo = i + 1
+            i = i + 1
+        let hms = split(parts[4], ":")
+        if mo < 0 || len(hms) != 3:
+            return -1
+        let ok = rtIsDigitsOnly(parts[1]) && rtIsDigitsOnly(parts[3]) && rtIsDigitsOnly(hms[0]) && rtIsDigitsOnly(hms[1]) && rtIsDigitsOnly(hms[2])
+        if !ok:
+            return -1
+        let pad = do rtPad2(toInt(parts[1]))
+        let t = fromIso(parts[3] + "-" + rtPad2(mo) + "-" + pad + "T" + hms[0] + ":" + hms[1] + ":" + hms[2] + "Z")
+        return t
+
+    proc rtPad2(n: int) -> text:
+        if n < 10:
+            return "0" + n
+        return "" + n
+
+    proc rtHasHeader(hs: [HttpHeader], name: text) -> bool:
+        let mut i = 0
+        loop i < len(hs):
+            if hs[i].name == name:
+                return true
+            i = i + 1
+        return false
+
+    # rtServeFile: http.ServeFile for a stored upload — Last-Modified,
+    # If-Modified-Since (304), Range (206 / multipart/byteranges / 416),
+    # Accept-Ranges and Content-Length; the body travels as bytes.
+    proc rtServeFile(req: HttpServerRequest, path: text, ctype: text, extra: [HttpHeader]) -> HttpServerResponse uses io.file:
+        let size = fileSize(path)
+        let mtime = fileModTime(path)
+        let lm = do httpServerDate(mtime)
+        let mut headers = extra + [HttpHeader{name: "last-modified", value: lm}]
+        # If-Modified-Since is consulted only when no If-None-Match came
+        # (checkPreconditions); an upload has no ETag, so one never matches.
+        let ims = do rtHeaderValue(req.headers, "if-modified-since")
+        let inmHas = do rtHasHeader(req.headers, "if-none-match")
+        if (req.method == "GET" || req.method == "HEAD") && ims != "" && mtime > 0 && !inmHas:
+            let t = do rtParseHTTPDate(ims)
+            if t >= 0 && mtime <= t:
+                return HttpServerResponse{status: 304, reason: "", headers: headers, body: ""}
+        headers = append(headers, HttpHeader{name: "content-type", value: ctype})
+        let rangeReq = do rtHeaderValue(req.headers, "range")
+        let mut ranges = []
+        if rangeReq != "":
+            let pr = do rtParseRange(rangeReq, size)
+            if !pr.ok:
+                if pr.noOverlap && size == 0:
+                    ranges = []
+                else:
+                    let mut refused = do rtTextError(416, "invalid range")
+                    if pr.noOverlap:
+                        refused = do rtTextError(416, "invalid range: failed to overlap")
+                        refused.headers = append(refused.headers, HttpHeader{name: "content-range", value: "bytes */" + size})
+                    return refused
+            else:
+                ranges = pr.ranges
+        let mut sum = 0
+        let mut k = 0
+        loop k < len(ranges):
+            sum = sum + ranges[k].length
+            k = k + 1
+        if sum > size:
+            ranges = []
+        let data = readFileAt(path, 0, size)
+        let mut status = 200
+        let mut body = data
+        if len(ranges) == 1:
+            status = 206
+            let ra = ranges[0]
+            body = slice(data, ra.start, ra.start + ra.length)
+            headers = append(headers, HttpHeader{name: "content-range", value: "bytes " + ra.start + "-" + (ra.start + ra.length - 1) + "/" + size})
+        if len(ranges) > 1:
+            status = 206
+            let boundary = do rtHex(randomBytes(30))
+            let mut out = []
+            let mut r = 0
+            loop r < len(ranges):
+                let ra2 = ranges[r]
+                let mut head = "--" + boundary + "\r\n"
+                if r > 0:
+                    head = "\r\n" + head
+                head = head + "Content-Range: bytes " + ra2.start + "-" + (ra2.start + ra2.length - 1) + "/" + size + "\r\nContent-Type: " + ctype + "\r\n\r\n"
+                out = out + textToBytes(head) + slice(data, ra2.start, ra2.start + ra2.length)
+                r = r + 1
+            out = out + textToBytes("\r\n--" + boundary + "--\r\n")
+            body = out
+            headers = do rtWithoutHeader(headers, "content-type")
+            headers = append(headers, HttpHeader{name: "content-type", value: "multipart/byteranges; boundary=" + boundary})
+        headers = append(headers, HttpHeader{name: "accept-ranges", value: "bytes"})
+        headers = append(headers, HttpHeader{name: "x-facet-body-b64", value: base64UrlRaw(body)})
+        return HttpServerResponse{status: status, reason: "", headers: headers, body: ""}
+
+    proc rtWithoutHeader(hs: [HttpHeader], name: text) -> [HttpHeader]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(hs):
+            if hs[i].name != name:
+                out = append(out, hs[i])
+            i = i + 1
+        return out
+
+    # rtServeHLSPlaylist: serveHLSPlaylist — with signing on, every URI line
+    # of the playlist signed (one expiry for the whole answer).
+    proc rtServeHLSPlaylist(w: RtWorld, path: text) -> HttpServerResponse uses io.file:
+        let exists = fileExists(path)
+        if !exists:
+            let nf = do rtNotFound()
+            return nf
+        let src = readFile(path)
+        let headers = [HttpHeader{name: "content-type", value: "application/vnd.apple.mpegurl"}]
+        if w.mediaTTL <= 0:
+            return HttpServerResponse{status: 200, reason: "", headers: headers, body: src}
+        let exp = nowMs() / 1000 + w.mediaTTL
+        let lines = split(src, "\n")
+        let mut out = []
+        let mut i = 0
+        loop i < len(lines):
+            let t = trim(lines[i])
+            let tag = do rtHasPrefix(t, "#")
+            if t == "" || tag:
+                out = append(out, lines[i])
+            else:
+                let sig = do rtMediaSig(w.signKey, t, exp)
+                out = append(out, t + "?exp=" + exp + "&sig=" + sig)
+            i = i + 1
+        return HttpServerResponse{status: 200, reason: "", headers: headers, body: rtJoinTexts(out, "\n")}
 
     proc rtHandleUploads(w0: RtWorld, req: HttpServerRequest) -> RtHandled uses io.file:
         let mut w = w0
@@ -360,14 +451,13 @@ app UploadMedia:
             let fb = do rtTextError(403, "expired or invalid media link")
             return RtHandled{resp: fb, w: w}
         let path = rtUploadDir(w) + "/" + name
+        let ext = do rtExtOf(name)
+        if ext == ".m3u8":
+            let pl = do rtServeHLSPlaylist(w, path)
+            return RtHandled{resp: pl, w: w}
         let exists = fileExists(path)
         if !exists:
             let nf2 = do rtNotFound()
             return RtHandled{resp: nf2, w: w}
-        let size = fileSize(path)
-        let data = readFileAt(path, 0, size)
-        let ext = do rtExtOf(name)
-        let mtime = fileModTime(path)
-        let lm = do httpServerDate(mtime)
-        let headers = [HttpHeader{name: "accept-ranges", value: "bytes"}, HttpHeader{name: "content-type", value: rtMimeType(ext)}, HttpHeader{name: "last-modified", value: lm}, HttpHeader{name: "x-facet-body-b64", value: base64UrlRaw(data)}]
-        return RtHandled{resp: HttpServerResponse{status: 200, reason: "", headers: headers, body: ""}, w: w}
+        let served = do rtServeFile(req, path, rtMimeType(ext), [])
+        return RtHandled{resp: served, w: w}

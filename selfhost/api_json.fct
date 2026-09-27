@@ -188,7 +188,7 @@ app APIJSON:
         resp.headers = append(resp.headers, so.cookie)
         return RtHandled{resp: resp, w: w}
 
-    proc rtHandleAPI(w0: RtWorld, req: HttpServerRequest) -> RtHandled:
+    proc rtHandleAPI(w0: RtWorld, req: HttpServerRequest) -> RtHandled uses io.net:
         let mut w = w0
         let name = slice(req.path, 5, len(req.path))
         let slash = do rtIndexOfText(name, "/")
@@ -223,7 +223,15 @@ app APIJSON:
             if !q.ok:
                 let bq = do rtTextError(400, q.err)
                 return RtHandled{resp: bq, w: w}
-            let page = do rtStoreQuery(w, name, q, sc)
+            let mut page = RtQueryPage{rows: [], next: ""}
+            if w.storeOn:
+                let ep = do rtEngineQuery(w, name, q, sc)
+                if !ep.ok:
+                    let qf = do rtTextError(500, "query failed")
+                    return RtHandled{resp: qf, w: w}
+                page = RtQueryPage{rows: ep.rows, next: ep.next}
+            else:
+                page = do rtStoreQuery(w, name, q, sc)
             let visible = do rtVisibleRows(name, page.rows, sc, false)
             let mut keys = ["rows"]
             let mut raws = [rtValJSON(listVal(visible))]
@@ -448,26 +456,6 @@ app APIJSON:
             return -1
         return toInt(iv.s)
 
-    proc rtBase64UrlDecode(s: text) -> [int]:
-        let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-        let mut out = []
-        let mut acc = 0
-        let mut bits = 0
-        let mut i = 0
-        loop i < len(s):
-            let c = charAt(s, i)
-            let v = do rtIndexOfText(alphabet, c)
-            if v < 0 || len(c) != 1:
-                return []
-            acc = acc * 64 + v
-            bits = bits + 6
-            if bits >= 8:
-                bits = bits - 8
-                out = append(out, (acc / (1 << bits)) % 256)
-                acc = acc % (1 << bits)
-            i = i + 1
-        return out
-
     # rtStoreQuery: memStore.Query — filter, order (field then id, reversed
     # for desc), skip past the cursor's row, cap at limit (50 by default),
     # and mint the next cursor when the page is full.
@@ -518,7 +506,7 @@ app APIJSON:
         return RtQueryPage{rows: sorted, next: next}
 
     # ── POST /region: re-answer one region ──────────────────────────────
-    proc rtHandleRegion(w0: RtWorld, req: HttpServerRequest) -> RtHandled:
+    proc rtHandleRegion(w0: RtWorld, req: HttpServerRequest) -> RtHandled uses io.net:
         let mut w = w0
         if req.method != "POST":
             let m = do rtTextError(405, "POST only")
@@ -566,7 +554,13 @@ app APIJSON:
                 let mut fb = do rtTextError(403, "forbidden")
                 fb.headers = append(fb.headers, so.cookie)
                 return RtHandled{resp: fb, w: w}
-        let pg = do rtPageSetup(w.g, page)
+        let mut pg = do rtPageSetup(w.g, page)
+        pg.storeOn = w.storeOn
+        pg.fqlBase = w.fqlBase
+        pg.fqlToken = w.fqlToken
+        pg.encKey = w.encKey
+        pg.mediaTTL = w.mediaTTL
+        pg.signKey = w.signKey
         sc.matOn = true
         let rd0 = do rtRenderNew(sc)
         let rd = do rtChildren(pg, rd0, page.view, "", 0)
@@ -590,7 +584,120 @@ app APIJSON:
                 return RtHandled{resp: ur, w: w}
             keys = append(keys, "rows")
             raws = append(raws, rtValJSON(rd.regVals[at]))
+        # media: the signed URL of every media value this answer carries
+        if w.mediaTTL > 0:
+            let payload = do jsonParse(rtObjectJSONRaw(keys, raws))
+            let grants = do rtMediaGrants(w.mediaTTL, w.signKey, rtJValToVal(payload))
+            if len(grants.keys) > 0:
+                keys = append(keys, "media")
+                raws = append(raws, rtValJSON(grants))
         let body = do rtObjectJSONRaw(keys, raws)
         let mut resp = do rtJSONResponse(200, body + "\n")
         resp.headers = append(resp.headers, so.cookie)
         return RtHandled{resp: resp, w: w}
+
+    # ── the entity list through the engine (fqStore.Query) ─────────────
+    # With a store attached the page comes from the engine: a filter that
+    # pins `id` is one GET /node (byIdentity, the rest of the predicate
+    # applied in memory, a cursor page after it empty); anything else is
+    # POST /nodes/query with the predicate as it is (the wire's Expr has the
+    # IR's own key names), the engine's cursor passed through untouched,
+    # and `limit` defaulting to fqStore's page (100), not memStore's (50).
+    struct RtEnginePage:
+        ok: bool
+        rows: [Val]
+        next: text
+
+    proc rtEngineQuery(w: RtWorld, entity: text, q: RtAPIQuery, caller: RtScope) -> RtEnginePage uses io.net:
+        let ei = do rtEntityIndex(w.g, entity)
+        let ent = w.g.entities[ei]
+        let c = do rtFqlClient(w)
+        # identity pin: `r.id == <lit>` among the conjuncts
+        let mut pinned = false
+        let mut pinID = 0
+        let mut rest = []
+        if len(q.where) > 0:
+            let conj = do rtSplitConj(q.where[0])
+            let mut i = 0
+            loop i < len(conj):
+                let pin = do rtPinnedID(conj[i], "r")
+                if pin.found && !pinned:
+                    pinned = true
+                    pinID = pin.id
+                else:
+                    if len(rest) == 0:
+                        rest = [conj[i]]
+                    else:
+                        rest = [irBin("&&", rest[0], conj[i])]
+                i = i + 1
+        if pinned:
+            if q.after != "":
+                return RtEnginePage{ok: true, rows: [], next: ""}
+            let got = do fqlGetNode(c, rtFqAddress(entity, pinID))
+            if !got.ok:
+                return RtEnginePage{ok: false, rows: [], next: ""}
+            if !got.found:
+                return RtEnginePage{ok: true, rows: [], next: ""}
+            let rec = do rtNodeRecord(w, ent, got.v.data)
+            if len(rest) > 0:
+                let mut sc = do rtScopeNew()
+                sc = do rtSet(sc, "r", rec)
+                let r = do rtEval(rest[0], sc, -1)
+                let keep = do valTruthy(r.v)
+                if !keep:
+                    return RtEnginePage{ok: true, rows: [], next: ""}
+            let one = do rtFilterByReadPolicy(entity, [rec], caller)
+            return RtEnginePage{ok: true, rows: one, next: ""}
+        let mut limit = q.limit
+        if limit <= 0:
+            limit = 100
+        let mut parts = ["\"kind\":" + jsonQuote(entity)]
+        if len(q.where) > 0:
+            let wj = do irExprJSON(q.where[0])
+            parts = append(parts, "\"where\":" + wj)
+        parts = append(parts, "\"item_var\":\"r\"")
+        parts = append(parts, "\"order\":" + jsonQuote(q.order))
+        parts = append(parts, "\"desc\":" + rtBoolWord(q.desc))
+        parts = append(parts, "\"limit\":" + limit)
+        if q.after != "":
+            parts = append(parts, "\"after\":" + jsonQuote(q.after))
+        let body = "{" + rtJoinTexts(parts, ",") + "}"
+        let sent = do fqlPostJson(c, "/nodes/query", body, "POST /nodes/query")
+        if !sent.ok:
+            return RtEnginePage{ok: false, rows: [], next: ""}
+        let page = do fqlDecodeQueryPage(sent.body)
+        if !page.ok:
+            return RtEnginePage{ok: false, rows: [], next: ""}
+        let mut rows = []
+        let mut k = 0
+        loop k < len(page.v.nodes):
+            let rec2 = do rtNodeRecord(w, ent, page.v.nodes[k].data)
+            rows = append(rows, rec2)
+            k = k + 1
+        let visible = do rtFilterByReadPolicy(entity, rows, caller)
+        return RtEnginePage{ok: true, rows: visible, next: page.v.next}
+
+    proc rtSplitConj(e: IRExpr) -> [IRExpr]:
+        if e.kind == "bin" && e.op == "&&" && len(e.l) > 0 && len(e.r) > 0:
+            let a = do rtSplitConj(e.l[0])
+            let b = do rtSplitConj(e.r[0])
+            return a + b
+        return [e]
+
+    struct RtPin:
+        found: bool
+        id: int
+
+    proc rtPinnedID(c: IRExpr, itemVar: text) -> RtPin:
+        if c.kind != "bin" || c.op != "==" || len(c.l) == 0 || len(c.r) == 0:
+            return RtPin{found: false, id: 0}
+        let lIsID = do rtIsIDField(c.l[0], itemVar)
+        let rIsID = do rtIsIDField(c.r[0], itemVar)
+        if lIsID && c.r[0].kind == "lit":
+            return RtPin{found: true, id: toInt(c.r[0].val)}
+        if rIsID && c.l[0].kind == "lit":
+            return RtPin{found: true, id: toInt(c.l[0].val)}
+        return RtPin{found: false, id: 0}
+
+    proc rtIsIDField(e: IRExpr, itemVar: text) -> bool:
+        return e.kind == "get" && e.field == "id" && len(e.obj) > 0 && e.obj[0].kind == "ref" && e.obj[0].name == itemVar

@@ -21,7 +21,11 @@ func TestLiveAppRendersOnBothSides(t *testing.T) {
 		{"mintKey", []any{1}},
 		{"setSource", []any{1, "/m/stream.m3u8", "/m/thumb.jpg", false}},
 		{"goLive", []any{1}},
-		{"heartbeat", []any{1, 1834}},
+		// The count is presence — who holds the room — as the reference
+		// computes it (feed-engine handler/live_core.go: ViewerCount =
+		// liveRuntime.count), never a number the broadcaster reports; the
+		// app dropped its `heartbeat(id, viewers)` for joinRoom/leaveRoom.
+		{"joinRoom", []any{1}},
 		{"pin", []any{1, "Be kind."}},
 		{"say", []any{1, "hello chat #facet"}},
 		{"tip", []any{1, 500, "great stream"}},
@@ -57,7 +61,7 @@ func TestLiveAppRendersOnBothSides(t *testing.T) {
 	if strings.Contains(browse, "live_ada_") {
 		t.Errorf("a guest's browse page carries a stream key")
 	}
-	if m := mountedMarkup(browse); !strings.Contains(m, `class="fa-box x-streamcard"`) || !strings.Contains(m, "1.8K watching") || !strings.Contains(m, `href="/live/1"`) || !strings.Contains(m, `class="x-grid"`) {
+	if m := mountedMarkup(browse); !strings.Contains(m, `class="fa-box x-streamcard"`) || !strings.Contains(m, "1 watching") || !strings.Contains(m, `href="/live/1"`) || !strings.Contains(m, `class="x-grid"`) {
 		t.Errorf("the browse grid is missing the live channel card: %q", serverText(browse))
 	}
 
@@ -82,7 +86,7 @@ func TestLiveAppRendersOnBothSides(t *testing.T) {
 		}
 	}
 	text := serverText(page)
-	for _, want := range []string{"Bekind.", "hellochat", "tipped5.00", "Logintochat", "1.8Kwatching", "Tipgoal"} {
+	for _, want := range []string{"Bekind.", "hellochat", "tipped5.00", "Logintochat", "1watching", "Tipgoal"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("the theater page is missing %q in %q", want, text)
 		}

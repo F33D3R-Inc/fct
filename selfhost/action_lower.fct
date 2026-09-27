@@ -116,6 +116,9 @@ app ActionLowerSelfHost:
     #   (see lowerActionSrc's closing note).
     struct ALowEnv:
         stateNames: [text]
+        # stateDeclPlacements: the cells' declared placements (see
+        # check.fct's CallEnv), parallel to stateNames.
+        stateDeclPlacements: [text]
         # actionNames: every action `pending()`/`failed()` may name
         # (build.go's e.actionSet — see check.fct's CallEnv).
         actionNames: [text]
@@ -217,7 +220,7 @@ app ActionLowerSelfHost:
 
     # alowEnvScoped: env with the typed locals of the statement at hand.
     private proc alowEnvScoped(env: ALowEnv, tsc: TyScope) -> ALowEnv:
-        return ALowEnv{stateNames: env.stateNames, actionNames: env.actionNames, statePlacements: env.statePlacements, entityNames: env.entityNames, entityFields: env.entityFields, entityDerives: env.entityDerives, enumNames: env.enumNames, policyNames: env.policyNames, policyParamCounts: env.policyParamCounts, inlineNames: env.inlineNames, inlineExprs: env.inlineExprs, serviceNames: env.serviceNames, serviceOps: env.serviceOps, serviceArgCounts: env.serviceArgCounts, serviceRets: env.serviceRets, serviceRetLists: env.serviceRetLists, procNames: env.procNames, procParamCounts: env.procParamCounts, procRets: env.procRets, procRetLists: env.procRetLists, structNames: env.structNames, renameFrom: env.renameFrom, renameTo: env.renameTo, e2eFields: env.e2eFields, actionParams: env.actionParams, wireTypes: env.wireTypes, actionName: env.actionName, actionRet: env.actionRet, recordNames: env.recordNames, low: env.low, privateStates: env.privateStates, ty: env.ty, tsc: tsc}
+        return ALowEnv{stateNames: env.stateNames, stateDeclPlacements: env.stateDeclPlacements, actionNames: env.actionNames, statePlacements: env.statePlacements, entityNames: env.entityNames, entityFields: env.entityFields, entityDerives: env.entityDerives, enumNames: env.enumNames, policyNames: env.policyNames, policyParamCounts: env.policyParamCounts, inlineNames: env.inlineNames, inlineExprs: env.inlineExprs, serviceNames: env.serviceNames, serviceOps: env.serviceOps, serviceArgCounts: env.serviceArgCounts, serviceRets: env.serviceRets, serviceRetLists: env.serviceRetLists, procNames: env.procNames, procParamCounts: env.procParamCounts, procRets: env.procRets, procRetLists: env.procRetLists, structNames: env.structNames, renameFrom: env.renameFrom, renameTo: env.renameTo, e2eFields: env.e2eFields, actionParams: env.actionParams, wireTypes: env.wireTypes, actionName: env.actionName, actionRet: env.actionRet, recordNames: env.recordNames, low: env.low, privateStates: env.privateStates, ty: env.ty, tsc: tsc}
 
     private proc alowFail(a: ALowAcc, msg: text) -> ALowAcc:
         return ALowAcc{body: a.body, err: msg, writes: a.writes, reads: a.reads, entWrite: a.entWrite, impure: a.impure, usesPrint: a.usesPrint, callsService: a.callsService, callsProc: a.callsProc, establishesID: a.establishesID, locals: a.locals, seal: a.seal, usesSecret: a.usesSecret, emits: a.emits, setsHeader: a.setsHeader, tsc: a.tsc}
@@ -416,7 +419,7 @@ app ActionLowerSelfHost:
             fnNames = append(fnNames, env.low.fns[fi].name)
             fnArities = append(fnArities, len(env.low.fns[fi].params))
             fi = fi + 1
-        let ce = CallEnv{fnNames: fnNames, fnArities: fnArities, procNames: env.procNames, procArities: env.procParamCounts, procDerives: [], listNames: [], jsonNames: [], deriveKeys: env.entityDerives, inAction: true, inDerive: false, inProc: false, ty: env.ty, tsc: env.tsc, actionNames: env.actionNames, stateNames: env.stateNames}
+        let ce = CallEnv{fnNames: fnNames, fnArities: fnArities, procNames: env.procNames, procArities: env.procParamCounts, procDerives: [], listNames: [], jsonNames: [], deriveKeys: env.entityDerives, inAction: true, inDerive: false, inProc: false, ty: env.ty, tsc: env.tsc, actionNames: env.actionNames, stateNames: env.stateNames, stateDeclPlacements: env.stateDeclPlacements}
         let sd = do exprStructureDiag(n, env.entityNames, env.entityFields, ce)
         if sd != "":
             return sd
@@ -501,9 +504,13 @@ app ActionLowerSelfHost:
             return []
         if e.kind == "agg":
             let mut aout = []
+            # a `[T]` list cell ranged is read like an entity's rows (depsIR)
+            if e.name in env.stateNames:
+                aout = [e.name]
             if len(e.where) > 0:
                 let viaWhere = do alowStateDeps(e.where[0], env)
-                aout = viaWhere
+                let m0 = do alowMergeNames(aout, viaWhere)
+                aout = m0
             if len(e.sel) > 0:
                 let viaSel = do alowStateDeps(e.sel[0], env)
                 let m1 = do alowMergeNames(aout, viaSel)
@@ -770,7 +777,7 @@ app ActionLowerSelfHost:
     # alowServerOnlyBuiltins: every builtin internal/parser/builtins.go does
     # not mark SiteEverywhere — the ones the browser has no mirror of.
     private proc alowServerOnlyBuiltins() -> [text]:
-        return ["print", "given", "floatBits", "floatFromBits", "verifyPassword", "totpSecret", "totpValid", "randomToken", "fileDigest", "ed25519Verify", "ecdsaP256Verify", "sha256Hex", "canonicalJson", "shuffleOrder", "u64Cmp", "u64Min", "u64Max", "u64SatSub", "u64Div", "u64Rem", "u64Text", "u64Parse", "u64ParseError", "u64ToFloat", "fromLocal", "formatIn", "zoneValid", "append", "bytes", "textToBytes", "bytesToText", "aesGcmSeal", "aesGcmOpen", "aesGcmAuthentic", "randomBytes", "indexOf", "sha256Bytes", "hmacSha256", "base64UrlRaw", "bcryptHash", "bcryptMatches", "readFile", "writeFile", "appendFile", "fileExists", "truncateFile", "fileSize", "fileModTime", "readFileAt", "writeFileAt", "syncFile", "renameFile", "removeFile", "lockFile", "crc32", "listenerPort", "httpGet", "httpPost", "listen", "listenOn", "accept", "connect", "connectTls", "readBytes", "writeBytes", "closeConn", "setTimeoutMs", "connError", "pollBytes", "connOpen", "shutdownConn", "closeListener", "listenError", "grantRead", "writeStdout", "writeStderr", "readStdin", "envVar", "envSet", "channel", "send", "recv", "sleepMs", "monoMs", "nowMs", "signals", "awaitAny", "closeChannel", "exitProcess", "processStats", "listenTls", "connPeer"]
+        return ["print", "given", "floatBits", "floatFromBits", "exp", "ln", "sqrt", "verifyPassword", "totpSecret", "totpValid", "randomToken", "fileDigest", "ed25519Verify", "ecdsaP256Verify", "sha256Hex", "canonicalJson", "shuffleOrder", "u64Cmp", "u64Min", "u64Max", "u64SatSub", "u64Div", "u64Rem", "u64Text", "u64Parse", "u64ParseError", "u64ToFloat", "fromLocal", "formatIn", "zoneValid", "append", "bytes", "textToBytes", "bytesToText", "aesGcmSeal", "aesGcmOpen", "aesGcmAuthentic", "randomBytes", "indexOf", "sha256Bytes", "hmacSha256", "base64UrlRaw", "bcryptHash", "bcryptMatches", "readFile", "writeFile", "appendFile", "fileExists", "truncateFile", "fileSize", "fileModTime", "readFileAt", "writeFileAt", "syncFile", "renameFile", "removeFile", "lockFile", "crc32", "listenerPort", "bytesCmp", "bytesCmpRange", "uintLE", "toHex", "fromHex", "httpGet", "httpPost", "listen", "listenOn", "accept", "connect", "connectTls", "readBytes", "writeBytes", "closeConn", "setTimeoutMs", "connError", "pollBytes", "connOpen", "shutdownConn", "closeListener", "listenError", "grantRead", "writeStdout", "writeStderr", "readStdin", "envVar", "envSet", "channel", "send", "recv", "sleepMs", "monoMs", "nowMs", "signals", "awaitAny", "closeChannel", "exitProcess", "processStats", "listenTls", "connPeer"]
 
     # alowExprFirstCall / alowStmtsFirstCall: build.go's stmtsCall — the
     # first call (same walk order) whose name is in names, or "".
@@ -1629,7 +1636,7 @@ app ActionLowerSelfHost:
                 pl = "[" + pl + "]"
             psc = do tyScopeWith(psc, paramNames[pti], pl)
             pti = pti + 1
-        let env = ALowEnv{stateNames: env0.stateNames, actionNames: env0.actionNames, statePlacements: env0.statePlacements, entityNames: env0.entityNames, entityFields: env0.entityFields, entityDerives: env0.entityDerives, enumNames: env0.enumNames, policyNames: env0.policyNames, policyParamCounts: env0.policyParamCounts, inlineNames: env0.inlineNames, inlineExprs: env0.inlineExprs, serviceNames: env0.serviceNames, serviceOps: env0.serviceOps, serviceArgCounts: env0.serviceArgCounts, serviceRets: env0.serviceRets, serviceRetLists: env0.serviceRetLists, procNames: env0.procNames, procParamCounts: env0.procParamCounts, procRets: env0.procRets, procRetLists: env0.procRetLists, structNames: env0.structNames, renameFrom: env0.renameFrom, renameTo: env0.renameTo, e2eFields: env0.e2eFields, actionParams: env0.actionParams, wireTypes: env0.wireTypes, actionName: name, actionRet: ret, recordNames: env0.recordNames, low: env0.low, privateStates: env0.privateStates, ty: env0.ty, tsc: psc}
+        let env = ALowEnv{stateNames: env0.stateNames, stateDeclPlacements: env0.stateDeclPlacements, actionNames: env0.actionNames, statePlacements: env0.statePlacements, entityNames: env0.entityNames, entityFields: env0.entityFields, entityDerives: env0.entityDerives, enumNames: env0.enumNames, policyNames: env0.policyNames, policyParamCounts: env0.policyParamCounts, inlineNames: env0.inlineNames, inlineExprs: env0.inlineExprs, serviceNames: env0.serviceNames, serviceOps: env0.serviceOps, serviceArgCounts: env0.serviceArgCounts, serviceRets: env0.serviceRets, serviceRetLists: env0.serviceRetLists, procNames: env0.procNames, procParamCounts: env0.procParamCounts, procRets: env0.procRets, procRetLists: env0.procRetLists, structNames: env0.structNames, renameFrom: env0.renameFrom, renameTo: env0.renameTo, e2eFields: env0.e2eFields, actionParams: env0.actionParams, wireTypes: env0.wireTypes, actionName: name, actionRet: ret, recordNames: env0.recordNames, low: env0.low, privateStates: env0.privateStates, ty: env0.ty, tsc: psc}
         let mut params = []
         let mut loc = ["actor", "role", "verified", "tenant", "tenantRole", "session", "sessionToken"]
         let pn = len(paramNames)
@@ -1681,7 +1688,7 @@ app ActionLowerSelfHost:
             reqs = append(reqs, IRRequire{name: rs.policyName, args: args})
             r = r + 1
         # the body (with this action's parameters known, for e2eWrite)
-        let benv = ALowEnv{stateNames: env.stateNames, actionNames: env.actionNames, statePlacements: env.statePlacements, entityNames: env.entityNames, entityFields: env.entityFields, entityDerives: env.entityDerives, enumNames: env.enumNames, policyNames: env.policyNames, policyParamCounts: env.policyParamCounts, inlineNames: env.inlineNames, inlineExprs: env.inlineExprs, serviceNames: env.serviceNames, serviceOps: env.serviceOps, serviceArgCounts: env.serviceArgCounts, serviceRets: env.serviceRets, serviceRetLists: env.serviceRetLists, procNames: env.procNames, procParamCounts: env.procParamCounts, procRets: env.procRets, procRetLists: env.procRetLists, structNames: env.structNames, renameFrom: env.renameFrom, renameTo: env.renameTo, e2eFields: env.e2eFields, actionParams: paramNames, wireTypes: env.wireTypes, actionName: env.actionName, actionRet: env.actionRet, recordNames: env.recordNames, low: env.low, privateStates: env.privateStates, ty: env.ty, tsc: env.tsc}
+        let benv = ALowEnv{stateNames: env.stateNames, stateDeclPlacements: env.stateDeclPlacements, actionNames: env.actionNames, statePlacements: env.statePlacements, entityNames: env.entityNames, entityFields: env.entityFields, entityDerives: env.entityDerives, enumNames: env.enumNames, policyNames: env.policyNames, policyParamCounts: env.policyParamCounts, inlineNames: env.inlineNames, inlineExprs: env.inlineExprs, serviceNames: env.serviceNames, serviceOps: env.serviceOps, serviceArgCounts: env.serviceArgCounts, serviceRets: env.serviceRets, serviceRetLists: env.serviceRetLists, procNames: env.procNames, procParamCounts: env.procParamCounts, procRets: env.procRets, procRetLists: env.procRetLists, structNames: env.structNames, renameFrom: env.renameFrom, renameTo: env.renameTo, e2eFields: env.e2eFields, actionParams: paramNames, wireTypes: env.wireTypes, actionName: env.actionName, actionRet: env.actionRet, recordNames: env.recordNames, low: env.low, privateStates: env.privateStates, ty: env.ty, tsc: env.tsc}
         let accNew = do alowAccNew(loc)
         let acc0 = ALowAcc{body: accNew.body, err: accNew.err, writes: accNew.writes, reads: accNew.reads, entWrite: accNew.entWrite, impure: accNew.impure, usesPrint: accNew.usesPrint, callsService: accNew.callsService, callsProc: accNew.callsProc, establishesID: accNew.establishesID, locals: accNew.locals, seal: accNew.seal, usesSecret: accNew.usesSecret, emits: accNew.emits, setsHeader: accNew.setsHeader, tsc: psc}
         let acc = do alowBlock(bodyStmts, acc0, benv)
@@ -1906,7 +1913,7 @@ app ActionLowerSelfHost:
             q = q + 1
         let structNames = do lowerSplitLines(structLines)
         let lowBasicCtx = do lowCtxBasic(inlineNames, inlineExprs, enumNames)
-        return ALowEnv{stateNames: stateNames, actionNames: [], statePlacements: statePlacements, entityNames: entityNames, entityFields: entityFields, entityDerives: entityDerives, enumNames: enumNames, policyNames: policyNames, policyParamCounts: policyParamCounts, inlineNames: inlineNames, inlineExprs: inlineExprs, serviceNames: serviceNames, serviceOps: serviceOps, serviceArgCounts: serviceArgCounts, serviceRets: serviceRets, serviceRetLists: serviceRetLists, procNames: procNames, procParamCounts: procParamCounts, procRets: procRets, procRetLists: procRetLists, structNames: structNames, renameFrom: [], renameTo: [], e2eFields: [], actionParams: [], wireTypes: [], actionName: "", actionRet: "", recordNames: [], low: lowBasicCtx, privateStates: [], ty: tyEmptyEnv(), tsc: tyEmptyScope()}
+        return ALowEnv{stateNames: stateNames, stateDeclPlacements: [], actionNames: [], statePlacements: statePlacements, entityNames: entityNames, entityFields: entityFields, entityDerives: entityDerives, enumNames: enumNames, policyNames: policyNames, policyParamCounts: policyParamCounts, inlineNames: inlineNames, inlineExprs: inlineExprs, serviceNames: serviceNames, serviceOps: serviceOps, serviceArgCounts: serviceArgCounts, serviceRets: serviceRets, serviceRetLists: serviceRetLists, procNames: procNames, procParamCounts: procParamCounts, procRets: procRets, procRetLists: procRetLists, structNames: structNames, renameFrom: [], renameTo: [], e2eFields: [], actionParams: [], wireTypes: [], actionName: "", actionRet: "", recordNames: [], low: lowBasicCtx, privateStates: [], ty: tyEmptyEnv(), tsc: tyEmptyScope()}
 
     proc lowerActionLinesJSON(name: text, paramLines: text, optimistic: bool, bodySrc: text, stateLines: text, entityLines: text, fieldLines: text, deriveLines: text, enumLines: text, policyLines: text, inlineNameLines: text, inlineJSONLines: text, serviceLines: text, procLines: text, structLines: text) -> text:
         let params = do lowerSplitLines(paramLines)

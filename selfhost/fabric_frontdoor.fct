@@ -332,10 +332,20 @@ app FabricFrontDoorSelfHost:
     # budget. Retrying is safe because the fence is met while RESOLVING:
     # nothing has been forwarded, so a retry is a first send.
     proc fdResolveColocated(keys: [PlanKeyIntent]) -> FdResolved:
+        let r = do fdResolveColocatedNoting(keys, 0, 0)
+        return r
+
+    # fdResolveColocatedNoting: the same, telling `note` (a channel, 0 for
+    # none) `g|<conn>|<generation>` for the table each attempt reads — how a
+    # door following a control plane's routing (fabric_frontdoor_main.fct)
+    # knows which table a request waiting out a fence is being routed by.
+    proc fdResolveColocatedNoting(keys: [PlanKeyIntent], note: int, conn: int) -> FdResolved:
         let config = fdConfig
         let deadline = monoMs() + config.fenceRetryBudgetMs
         loop true:
             let fleet = fdFleet
+            if note > 0:
+                let noted = send(note, "g|" + conn + "|" + sjU64Text(fleet.routing.generation))
             let attempt = do fdResolveOnce(fleet, keys)
             let fenced = !attempt.ok && attempt.err.kind == "Routing" && attempt.err.routing.kind == "WriteFenced"
             if fenced && monoMs() < deadline:
@@ -745,9 +755,15 @@ app FabricFrontDoorSelfHost:
     # fdDispatch: `dispatch`'s back half for a colocated or broadcast plan —
     # resolve and forward, or broadcast.
     proc fdDispatch(req: HttpServerRequest, plan: PlanValue) -> HttpServerResponse uses io.net:
+        let r = do fdDispatchNoting(req, plan, 0, 0)
+        return r
+
+    # fdDispatchNoting: fdDispatch, its resolution noted as
+    # fdResolveColocatedNoting says.
+    proc fdDispatchNoting(req: HttpServerRequest, plan: PlanValue, note: int, conn: int) -> HttpServerResponse uses io.net:
         let config = fdConfig
         if plan.kind == 0:
-            let resolved = do fdResolveColocated(plan.keys)
+            let resolved = do fdResolveColocatedNoting(plan.keys, note, conn)
             if !resolved.ok:
                 let r = do fdDoorErrorResponse(resolved.err)
                 return r

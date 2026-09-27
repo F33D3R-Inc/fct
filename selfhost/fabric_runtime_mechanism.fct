@@ -283,6 +283,20 @@ app FabricRuntimeMechanismSelfHost:
                 let f4 = do mechFailed("cutover", "the copy of " + shownTarget + " onto '" + job.destination + "' did not verify against its source: " + verdict.val.reason)
                 let r7 = do mechPollFault(m, fabric, f4)
                 return r7
+        # Front doors in other processes (fabric_routing_feed.fct) route by
+        # the table they last fetched. Authority moves only once every one of
+        # them has confirmed adopting a table in which this migration is
+        # fenced — one at least as new as the generation the fence went up at
+        # (so a poll that raised the fence always waits here) — with nothing
+        # still in flight under an older table. Moving it sooner would let a
+        # door that has not seen the fence send a write to the source after
+        # the mover stopped watching it. A wait, like the drain below; with
+        # no door subscribed, the crate's cutover unchanged.
+        let seen = do placementFabricDoorsHaveSeenFence(fabric, target)
+        if !seen:
+            let adopting = do phaseProgressRunning(0.9)
+            let r11 = do mechPollOk(m, fabric, adopting)
+            return r11
         let finish = do migrationStepOf("completeCutover", atMs)
         let finished = do placementFabricStepMigration(fabric, target, finish)
         fabric = finished.fabric

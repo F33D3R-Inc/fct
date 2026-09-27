@@ -1,0 +1,233 @@
+import "../../fabric_runtime_cases.fct"
+import "../../fabric_routing_feed.fct"
+import "../fabric_leafb/table_check.fct"
+
+app FabricFeedCheck:
+    # Checks for fabric_routing_feed.fct and the cutover gate it drives,
+    # run by fabric_routing_feed_test.go.
+    #
+    #   runFeedCodec   every table a door can be handed — placements,
+    #                  coordinate overrides, shard-wide and per-cell replica
+    #                  sets, a per-cell migration through every phase, a
+    #                  fenced range, a node gone unreachable, proven health
+    #                  required, shard ids past i64::MAX — encoded, decoded,
+    #                  and compared with the original through
+    #                  table_check.fct's full digest (lbTbl: the one the Rust
+    #                  crate's table is checked against) and through every
+    #                  routing answer a door asks for; then encoded again,
+    #                  byte for byte. One `ok` line per table, or what differs.
+    #   runFeedLeases  the daemon's lease registry and the door's in-flight
+    #                  accounting, step by step.
+    #   runFeedGate    fabric_runtime_mechanism.fct's cutover with no door
+    #                  (the crate's), with a door that has not confirmed the
+    #                  fenced table (held), and once it has (authority moves).
+
+    state feedOut: text = ""
+
+    proc fcLines(xs: [text]) -> text:
+        let mut out = ""
+        let mut i = 0
+        loop i < len(xs):
+            if i > 0:
+                out = out + "\n"
+            out = out + xs[i]
+            i = i + 1
+        return out
+
+    # Every routing answer a door asks for, at the cells these tables hold.
+    proc fcAnswers(t: TableRoutingTable) -> text:
+        let cells = [Coordinate{x: 0, y: 0}, Coordinate{x: 1, y: 0}, Coordinate{x: 7, y: 3}]
+        let prefs = ["Primary", "AnyFresh", "AnyCopy"]
+        let mut out = ""
+        let mut i = 0
+        loop i < len(cells):
+            let w = do lbWriteAt(t, cells[i].x, cells[i].y)
+            out = out + "w" + i + "=" + w + ";"
+            let mut j = 0
+            loop j < len(prefs):
+                let r = do lbReadAt(t, cells[i].x, cells[i].y, lbPref(prefs[j]))
+                out = out + prefs[j] + i + "=" + r + ";"
+                j = j + 1
+            let rg = do lbReadAt(t, cells[i].x, cells[i].y, lbRegion("dallas"))
+            out = out + "dallas" + i + "=" + rg + ";"
+            i = i + 1
+        return out
+
+    proc fcRoundTrip(name: text, t: TableRoutingTable) -> text:
+        let e = do rtfEncode(t)
+        let d = do rtfDecode(e)
+        if !d.ok:
+            return name + ": does not decode: " + d.err
+        let e2 = do rtfEncode(d.table)
+        if e2 != e:
+            return name + ": re-encodes differently:\n  " + e + "\n  " + e2
+        let a = do lbTbl(t)
+        let b = do lbTbl(d.table)
+        if a != b:
+            return name + ": digest differs:\n  " + a + "\n  " + b
+        let ra = do fcAnswers(t)
+        let rb = do fcAnswers(d.table)
+        if ra != rb:
+            return name + ": routes differ:\n  " + ra + "\n  " + rb
+        return name + ": ok"
+
+    proc fcTables() -> [TableRoutingTable]:
+        let mut out = []
+        let t0 = do lbTwoCelled()
+        out = append(out, t0)
+        # A coordinate held by another node than the shard's owner.
+        let r0 = do topologyRegistryNew()
+        let r1 = do topologyRegistryPlace(r0, "db-a", 42, Coordinate{x: 0, y: 0}, "phoenix")
+        let r2 = do topologyRegistryPlace(r1, "db-b", 42, Coordinate{x: 1, y: 0}, "dallas")
+        out = append(out, tableApplyPlacements(tableFromTopology(lbTopology()), r2))
+        # Shard-wide and per-cell replica sets.
+        let wide = do tableSetReplicaSet(t0, lbReplicaSet(), false, Coordinate{x: 0, y: 0})
+        out = append(out, wide.table)
+        let cell = do tableSetReplicaSet(t0, lbReplicaSet(), true, Coordinate{x: 1, y: 0})
+        out = append(out, cell.table)
+        # A per-cell migration through every phase, and a shard-wide one.
+        let m0 = do lbMigration()
+        out = append(out, lbObserveAt(t0, m0, 0, 0))
+        let m1 = do lbCaughtUpCopy(m0)
+        out = append(out, lbObserveAt(t0, m1, 0, 0))
+        let fenced = do migrationBeginCutover(m1, 5000)
+        out = append(out, lbObserveAt(t0, fenced.value, 0, 0))
+        out = append(out, lbObserve(t0, fenced.value))
+        let cut = do migrationCompleteCutover(fenced.value, 5100)
+        out = append(out, lbObserveAt(t0, cut.value, 0, 0))
+        let done = do migrationComplete(cut.value, 6000)
+        out = append(out, lbObserveAt(t0, done.value, 0, 0))
+        # Two cells in two phases at once, over a replica set.
+        let both = do lbObserveAt(lbObserveAt(cell.table, cut.value, 0, 0), fenced.value, 1, 0)
+        out = append(out, both)
+        # A node gone unreachable, and proven health required.
+        let gone = do tableSetAvailability(wide.table, "db-b", "unreachable")
+        out = append(out, gone.table)
+        out = append(out, tableRequireProvenHealth(gone.table, true))
+        # Shard ids past i64::MAX.
+        let big = u64Parse("18446744073709551615")
+        let a0 = do tableTopologyNodeNew("db-a", "phoenix")
+        let a1 = do tableTopologyNodeAddShard(a0, big)
+        let a2 = do tableTopologyNodeAddShard(a1, u64Parse("9223372036854775808"))
+        out = append(out, tableFromTopology(TableTopology{nodes: [a2]}))
+        return out
+
+    proc fcCodec() -> text:
+        let tables = do fcTables()
+        let mut lines = []
+        let mut i = 0
+        loop i < len(tables):
+            lines = append(lines, fcRoundTrip("table " + i, tables[i]))
+            i = i + 1
+        # Not a table, and a table missing its parts.
+        let bad = do rtfDecode("[1,2]")
+        lines = append(lines, "array: " + bad.ok + " " + bad.err)
+        let empty = do rtfDecode("{}")
+        lines = append(lines, "empty object: " + empty.ok + " generation " + empty.table.generation + " nodes " + len(empty.table.nodes))
+        # The feed's answer: the table only when the door has not adopted it.
+        let t = tables[4]
+        let fresh = do rtfReadAnswer(rtfAnswer(t, 0, 2000))
+        let same = do rtfReadAnswer(rtfAnswer(t, t.generation, 2000))
+        lines = append(lines, "answer to a stale door: " + fresh.ok + " generation " + fresh.generation + " lease " + fresh.leaseMs + " table " + fresh.hasTable + " digest-equal " + (lbTbl(fresh.table) == lbTbl(t)))
+        lines = append(lines, "answer to a current door: " + same.ok + " table " + same.hasTable)
+        let noLease = do rtfReadAnswer("{\"generation\":3,\"lease_ms\":0,\"table\":null}")
+        lines = append(lines, "answer with no lease: " + noLease.ok + " " + noLease.err)
+        return fcLines(lines)
+
+    proc fcLeases(ls: [DoorLease]) -> text:
+        let v = do doorLeasesView(ls)
+        let mut out = "subscribed=" + v.subscribed + " confirmed=" + sjU64Text(v.confirmed) + " doors="
+        let mut i = 0
+        loop i < len(ls):
+            if i > 0:
+                out = out + ","
+            out = out + ls[i].id
+            i = i + 1
+        return out
+
+    proc fcLeaseSteps() -> text:
+        let mut lines = []
+        let mut ls = []
+        lines = append(lines, fcLeases(ls))
+        ls = doorLeasesConfirm(ls, "b", 9, 1000, 500)
+        ls = doorLeasesConfirm(ls, "a", 7, 1000, 500)
+        lines = append(lines, fcLeases(ls))
+        ls = doorLeasesConfirm(ls, "a", 12, 1100, 500)
+        lines = append(lines, fcLeases(ls))
+        # b last heard at 1000: live until 1000 + 2000 + 500.
+        lines = append(lines, fcLeases(doorLeasesLive(ls, 3500, 2000)))
+        lines = append(lines, fcLeases(doorLeasesLive(ls, 3501, 2000)))
+        lines = append(lines, fcLeases(doorLeasesLive(ls, 3601, 2000)))
+        # u64 confirmations order as u64s.
+        let big = doorLeasesConfirm(doorLeasesConfirm([], "x", u64Parse("18446744073709551615"), 0, 0), "y", 5, 0, 0)
+        lines = append(lines, fcLeases(big))
+        let mut es = []
+        lines = append(lines, "none in flight: " + doorInflightConfirmable(es, 10, 4))
+        es = doorInflightBegin(es, 1)
+        lines = append(lines, "registered, table not read: " + doorInflightConfirmable(es, 10, 4))
+        es = doorInflightRead(es, 1, 8)
+        lines = append(lines, "reading 8: " + doorInflightConfirmable(es, 10, 4))
+        es = doorInflightBegin(es, 2)
+        es = doorInflightRead(es, 2, 10)
+        lines = append(lines, "reading 8 and 10: " + doorInflightConfirmable(es, 10, 4))
+        es = doorInflightRead(es, 1, 10)
+        lines = append(lines, "a fence retry re-read 10: " + doorInflightConfirmable(es, 10, 4))
+        es = doorInflightEnd(es, 1)
+        es = doorInflightEnd(es, 2)
+        lines = append(lines, "answered: " + doorInflightConfirmable(es, 11, 10))
+        es = doorInflightBegin(doorInflightBegin(es, 3), 3)
+        lines = append(lines, "a keep-alive connection's next request: " + len(es))
+        return fcLines(lines)
+
+    # A relocation driven to its cutover (the runtime cases' db-a -> db-b
+    # move, with the copy verified), then the cutover polled with `subscribed`
+    # and `confirmed` set on the fabric.
+    proc fcCutover(subscribed: bool, confirmedDelta: int) -> text:
+        let target = do caseTarget()
+        let driven = do caseDriveToCutover([])
+        let verified = do placementFabricRecordVerification(driven.mechanism.fabric, target, "db-b", copyVerdictVerified(1, 4500))
+        let fenceAt = do fcFenceGeneration(verified, target)
+        let doors = do placementFabricWithDoors(verified, subscribed, fenceAt + confirmedDelta)
+        let m = do placementMechanismWithFabric(driven.mechanism, doors)
+        let polled = do mechanismPollPhase(m, driven.plan, "cutover", 5000)
+        let progress = do caseProgress(polled)
+        let key = do routingKeyNew(7, target.coordinate)
+        let w = do tableResolveWrite(polled.mechanism.fabric.routing, key.key)
+        let mut writes = "refused"
+        if w.ok:
+            writes = w.route.node
+        let migration = do placementFabricMigration(polled.mechanism.fabric, target)
+        return progress + " writes->" + writes + " phase=" + migration.val.phase
+
+    proc fcFenceGeneration(f: PlacementFabric, target: ActionTarget) -> int:
+        let mut g = -1
+        let mut i = 0
+        loop i < len(f.fences):
+            if f.fences[i].target.shardId == target.shardId && f.fences[i].target.coordinate.x == target.coordinate.x && f.fences[i].target.coordinate.y == target.coordinate.y:
+                g = f.fences[i].generation
+            i = i + 1
+        return g
+
+    proc fcGate() -> text:
+        let mut lines = []
+        let target = do caseTarget()
+        let driven = do caseDriveToCutover([])
+        let fenceAt = do fcFenceGeneration(driven.mechanism.fabric, target)
+        lines = append(lines, "fence recorded: " + (fenceAt >= 0) + " at the fenced table's generation: " + (fenceAt == driven.mechanism.fabric.routing.generation))
+        lines = append(lines, "no door: " + fcCutover(false, -1))
+        lines = append(lines, "a door behind the fence: " + fcCutover(true, -1))
+        lines = append(lines, "a door that confirmed the fence: " + fcCutover(true, 0))
+        lines = append(lines, "a door past the fence: " + fcCutover(true, 5))
+        return fcLines(lines)
+
+    action runFeedCodec():
+        let out = do fcCodec()
+        feedOut = out
+
+    action runFeedLeases():
+        let out = do fcLeaseSteps()
+        feedOut = out
+
+    action runFeedGate():
+        let out = do fcGate()
+        feedOut = out

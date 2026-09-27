@@ -32,6 +32,10 @@ app PagerSelfHost:
         pageCount: int
         capacity: int
         entries: [FqPgEntry]
+        # at: each resident page's position in entries, plus one (Pager's
+        # HashMap<page id, frame>): a lookup is one map read, not a scan
+        # of the cache per page read.
+        at: {int: int}
         tick: int
         key: [int]
         nonceBase: int
@@ -52,8 +56,13 @@ app PagerSelfHost:
         pager: FqPager
         id: int
 
+    # pgrWith: the pager with these entries at the same positions (the
+    # index is kept); pgrWithAt when positions changed.
     proc pgrWith(p: FqPager, pageCount: int, entries: [FqPgEntry], tick: int, nonceCounter: int) -> FqPager:
-        return FqPager{path: p.path, pageCount: pageCount, capacity: p.capacity, entries: entries, tick: tick, key: p.key, nonceBase: p.nonceBase, nonceCounter: nonceCounter}
+        return FqPager{path: p.path, pageCount: pageCount, capacity: p.capacity, entries: entries, at: p.at, tick: tick, key: p.key, nonceBase: p.nonceBase, nonceCounter: nonceCounter}
+
+    proc pgrWithAt(p: FqPager, entries: [FqPgEntry], at: {int: int}, tick: int) -> FqPager:
+        return FqPager{path: p.path, pageCount: p.pageCount, capacity: p.capacity, entries: entries, at: at, tick: tick, key: p.key, nonceBase: p.nonceBase, nonceCounter: p.nonceCounter}
 
     # pgrOpen: Pager::open — create the file when absent; a trailing
     # partial page (a torn extension) rounds the page count down.
@@ -65,7 +74,7 @@ app PagerSelfHost:
         let mut cap = capacity
         if cap <= 0:
             cap = 256
-        return FqPager{path: path, pageCount: size / 16384, capacity: cap, entries: [], tick: 0, key: key, nonceBase: nonceBase, nonceCounter: 0}
+        return FqPager{path: path, pageCount: size / 16384, capacity: cap, entries: [], at: {}, tick: 0, key: key, nonceBase: nonceBase, nonceCounter: 0}
 
     proc pgrPageCount(p: FqPager) -> int:
         return p.pageCount
@@ -82,13 +91,8 @@ app PagerSelfHost:
         return FqPageId{pager: q, id: id}
 
     proc pgrFind(p: FqPager, id: int) -> int:
-        let n = len(p.entries)
-        let mut i = 0
-        loop i < n:
-            if p.entries[i].id == id:
-                return i
-            i = i + 1
-        return -1
+        let i = p.at[id]
+        return i - 1
 
     # pgrNonce: the n-th nonce — nonceBase big-endian in the first four
     # bytes, the counter big-endian in the last eight; a negative base
@@ -134,12 +138,14 @@ app PagerSelfHost:
         let tick = p0.tick + 1
         let at = do pgrFind(p0, id)
         let mut entries = p0.entries
+        let mut index = p0.at
         let entry = FqPgEntry{id: id, body: body, dirty: dirty, tick: tick}
         if at >= 0:
             entries[at] = entry
         else:
             entries = append(entries, entry)
-        let mut p = do pgrWith(p0, p0.pageCount, entries, tick, p0.nonceCounter)
+            index[id] = len(entries)
+        let mut p = do pgrWithAt(p0, entries, index, tick)
         loop len(p.entries) > p.capacity:
             let n = len(p.entries)
             let mut victim = 0
@@ -156,12 +162,14 @@ app PagerSelfHost:
                     return w
                 p = w.pager
             let mut kept = []
+            let mut keptAt = {}
             let mut k = 0
             loop k < n:
                 if k != victim:
                     kept = append(kept, p.entries[k])
+                    keptAt[p.entries[k].id] = len(kept)
                 k = k + 1
-            let q = do pgrWith(p, p.pageCount, kept, p.tick, p.nonceCounter)
+            let q = do pgrWithAt(p, kept, keptAt, p.tick)
             p = q
         return FqPagerR{ok: true, err: "", pager: p}
 

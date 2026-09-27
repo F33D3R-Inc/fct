@@ -171,3 +171,57 @@ func TestBytesValueEncodesAsInts(t *testing.T) {
 		t.Error("append of a non-byte promotes")
 	}
 }
+
+// The byte-level primitives a binary format is read with.
+func TestByteLevelBuiltins(t *testing.T) {
+	cmp := func(a, b any) int {
+		v, err := bytesCmpBuiltin(a, b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v.(int)
+	}
+	if cmp(bytesVal{1, 2}, bytesVal{1, 2}) != 0 || cmp(bytesVal{1}, bytesVal{1, 0}) != -1 || cmp(bytesVal{2}, []any{1, 255}) != 1 || cmp([]any{}, bytesVal{}) != 0 {
+		t.Error("bytesCmp: lexicographic, shorter prefix first, either representation")
+	}
+	if _, err := bytesCmpBuiltin("x", bytesVal{}); err == nil {
+		t.Error("bytesCmp accepted text")
+	}
+	page := bytesVal{9, 9, 0, 3, 'a', 'b', 'c', 7}
+	r, err := bytesCmpRangeBuiltin(page, 4, 7, bytesVal("abc"), 0, 3)
+	if err != nil || r != 0 {
+		t.Errorf("bytesCmpRange equal ranges: %v %v", r, err)
+	}
+	if r, _ := bytesCmpRangeBuiltin(page, 4, 6, bytesVal("abc"), 0, 3); r != -1 {
+		t.Errorf("bytesCmpRange prefix: %v", r)
+	}
+	if _, err := bytesCmpRangeBuiltin(page, 4, 9, bytesVal("abc"), 0, 3); err == nil {
+		t.Error("bytesCmpRange accepted a range past the end")
+	}
+	if v, _ := uintLEBuiltin(bytesVal{0x34, 0x12, 0xff}, 0, 2); v != 0x1234 {
+		t.Errorf("uintLE 2: %v", v)
+	}
+	if v, _ := uintLEBuiltin([]any{1, 0, 0, 0, 0, 0, 0, 0x7f}, 0, 8); v != 0x7f00000000000001 {
+		t.Errorf("uintLE 8: %v", v)
+	}
+	if _, err := uintLEBuiltin(bytesVal{1}, 0, 2); err == nil {
+		t.Error("uintLE read past the end")
+	}
+	if _, err := uintLEBuiltin(bytesVal{1}, 0, 9); err == nil {
+		t.Error("uintLE accepted a 9-byte width")
+	}
+	h, _ := toHexBuiltin(bytesVal{0, 15, 255})
+	if h != "000fff" {
+		t.Errorf("toHex: %v", h)
+	}
+	b, _ := fromHexBuiltin("000FfF")
+	if !bytesEqualList(b.(bytesVal), bytesVal{0, 15, 255}) {
+		t.Errorf("fromHex: %v", b)
+	}
+	if b, _ := fromHexBuiltin("abc"); len(b.(bytesVal)) != 0 {
+		t.Error("fromHex of odd-length text is empty")
+	}
+	if b, _ := fromHexBuiltin("zz"); len(b.(bytesVal)) != 0 {
+		t.Error("fromHex of non-hex is empty")
+	}
+}

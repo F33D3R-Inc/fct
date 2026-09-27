@@ -555,6 +555,7 @@ app ProgramSelfHost:
         entity: EntityDecl
         action: ActionDecl
         state: StateDecl
+        policy: PolicyDeclFull
         route: text
         # eventName/eventType: `expect event <name>: <Type>` — an event the
         # module emits and expects a host stream to carry with that payload.
@@ -622,6 +623,7 @@ app ProgramSelfHost:
         entityLines: [int]
         stateLines: [int]
         actionLines: [int]
+        policyLines: [int]
 
     # ============================================================
     # STAGE 4: per-kind builders — thin composition over already-ported
@@ -645,11 +647,62 @@ app ProgramSelfHost:
             ex = parsed
         return DeriveDeclFull{name: name, typeCore: core, headerValid: hv, exprSrc: exprSrc, expr: ex, line: lineText, cont: ""}
 
+    # sigDiag: parser.go's parseSignature refusals over a header's
+    # signature (`name(params)`, the `-> Type`/`uses` tail already set
+    # aside): the name, the closing paren, each parameter's `name: type`,
+    # a list where none is allowed (a policy), and a type that is no type
+    # (`json` passes as a non-list). "" when the signature parses.
+    proc sigDiag(head0: text, allowList: bool) -> text:
+        let head = do headerSigCore(head0)
+        let open = do sigOpenParenIndex(head)
+        if open < 0:
+            let idOk = do isIdentToken(head)
+            if !idOk:
+                let hq = do goQuote(head)
+                return "invalid action name " + hq
+            return ""
+        let name = trim(slice(head, 0, open))
+        let nameOk = do isIdentToken(name)
+        if !nameOk:
+            let nq = do goQuote(name)
+            return "invalid action name " + nq
+        let close = do sigCloseParenIndex(head)
+        if close < open:
+            return "missing `)` in action signature"
+        let inner = trim(slice(head, open + 1, close))
+        if inner == "":
+            return ""
+        let pieces = split(inner, ",")
+        let n = len(pieces)
+        let mut i = 0
+        loop i < n:
+            let p = pieces[i]
+            let pq = do goQuote(trim(p))
+            let hasColon = do paramHasColon(p)
+            if !hasColon:
+                return "parameter " + pq + " needs a type"
+            let pn = do paramNameOf(p)
+            let pnOk = do isIdentToken(pn)
+            if !pnOk:
+                return "invalid parameter " + pq
+            let pt = do paramTypeRawOf(p)
+            let core = do typeCore(pt)
+            let isList = do hasPrefixText(pt, "[")
+            if isList && !allowList:
+                let pnq = do goQuote(pn)
+                return "parameter " + pnq + " cannot be a list"
+            let typeOk = do isTypeNameToken(core)
+            if !typeOk && !(core == "json" && !isList):
+                return "invalid parameter " + pq
+            i = i + 1
+        return ""
+
     proc emptyExpectDecl() -> ExpectDecl:
         let e = do buildEntityDecl("entity _:", [])
         let a = do buildActionDecl("action _()", "")
         let st = do buildStateDecl("state _: int")
-        return ExpectDecl{kind: "", entity: e, action: a, state: st, route: "", eventName: "", eventType: "", line: 0, source: ""}
+        let po = do buildPolicyDeclFull("policy _", ["true"])
+        return ExpectDecl{kind: "", entity: e, action: a, state: st, policy: po, route: "", eventName: "", eventType: "", line: 0, source: ""}
 
     # buildExpectDecl: parser.go's parseExpect — the inner declaration is
     # built by the same builder the real one uses; what the form forbids
@@ -671,6 +724,11 @@ app ProgramSelfHost:
         if isAction:
             if len(bodyLines) > 0:
                 return ExpectBuilt{decl: d, err: "an expected action has no body — `expect action name(params)` names the signature the host implements"}
+            let ah0 = do actionHeadOf(inner)
+            let ah = do actionHeadStripOptimistic(ah0)
+            let asd = do sigDiag(ah, true)
+            if asd != "":
+                return ExpectBuilt{decl: d, err: asd}
             let ad = do buildActionDecl(inner, "")
             d.kind = "action"
             d.action = ad
@@ -682,6 +740,20 @@ app ProgramSelfHost:
             let sd = do buildStateDecl(inner)
             d.kind = "state"
             d.state = sd
+            return ExpectBuilt{decl: d, err: ""}
+        let isPolicy = do hasPrefixText(inner, "policy ")
+        if isPolicy:
+            if len(bodyLines) > 0:
+                return ExpectBuilt{decl: d, err: "an expected policy has no predicate — `expect policy name(params)` names the guard the host declares"}
+            # Who passes is the host's rule; standalone the guard admits
+            # everyone (compile/expect.go: a `true` predicate).
+            let ph = do policyHeadOf(inner)
+            let psd = do sigDiag(ph, false)
+            if psd != "":
+                return ExpectBuilt{decl: d, err: psd}
+            let pd = do buildPolicyDeclFull(inner, ["true"])
+            d.kind = "policy"
+            d.policy = pd
             return ExpectBuilt{decl: d, err: ""}
         let isEvent = do hasPrefixText(inner, "event ")
         if isEvent:
@@ -714,7 +786,7 @@ app ProgramSelfHost:
             d.route = slice(route, 1, n - 1)
             return ExpectBuilt{decl: d, err: ""}
         let fw = do nodeFirstWordOf(inner)
-        return ExpectBuilt{decl: d, err: "unexpected `expect " + fw + "`; expect takes entity <Name>: (fields), action <name>(params), state <name>: <type>, event <name>: <Type>, or view at \"/route\""}
+        return ExpectBuilt{decl: d, err: "unexpected `expect " + fw + "`; expect takes entity <Name>: (fields), action <name>(params), state <name>: <type>, policy <name>(params), event <name>: <Type>, or view at \"/route\""}
 
     proc buildStateDecl(lineText: text) -> StateDecl:
         let name = do stateNameOf(lineText)
@@ -1371,6 +1443,7 @@ app ProgramSelfHost:
         let mut entityLines = []
         let mut stateLines = []
         let mut actionLines = []
+        let mut policyLines = []
 
         if appHeaderIndex >= 0:
             let nm = do progFacetName(rawLines[appHeaderIndex])
@@ -1480,20 +1553,36 @@ app ProgramSelfHost:
                     let dv = DeriveDeclFull{name: dv0.name, typeCore: dv0.typeCore, headerValid: dv0.headerValid, exprSrc: dv0.exprSrc, expr: dv0.expr, line: header, cont: bodySrc}
                     derives = append(derives, dv)
                 if kw == "policy":
+                    let dph = do policyHeadOf(header)
+                    let dpsd = do sigDiag(dph, false)
+                    if dpsd != "":
+                        parseErrors = append(parseErrors, "line " + lineNos[headerIndex] + ": " + dpsd)
                     let pd = do buildPolicyDeclFull(header, bodyLines)
                     policies = append(policies, pd)
+                    policyLines = append(policyLines, lineNos[headerIndex])
                 let mut bodyNos0 = []
                 let mut bn0 = bodyStart
                 loop bn0 < bodyEnd:
                     bodyNos0 = append(bodyNos0, lineNos[bn0])
                     bn0 = bn0 + 1
                 if kw == "proc":
+                    let dprh0 = do trimPrefixText(header, "proc")
+                    let dprh1 = trim(dprh0)
+                    let dprh2 = do trimSuffixText(dprh1, ":")
+                    let dprsd = do sigDiag(trim(dprh2), true)
+                    if dprsd != "":
+                        parseErrors = append(parseErrors, "line " + lineNos[headerIndex] + ": " + dprsd)
                     let mut pcd = do parseProcDecl(header, bodySrc)
                     pcd.bodyLineNos = bodyNos0
                     procs = append(procs, pcd)
                     if isPrivate:
                         privateProcs = append(privateProcs, pcd.name)
                 if kw == "action":
+                    let dah0 = do actionHeadOf(header)
+                    let dah = do actionHeadStripOptimistic(dah0)
+                    let dasd = do sigDiag(dah, true)
+                    if dasd != "":
+                        parseErrors = append(parseErrors, "line " + lineNos[headerIndex] + ": " + dasd)
                     let ad = do buildActionDecl(header, bodySrc)
                     actions = append(actions, ad)
                     actionLines = append(actionLines, lineNos[headerIndex])
@@ -1659,7 +1748,7 @@ app ProgramSelfHost:
 
                 k = k + 1
 
-        return Program{name: name, hasAuth: hasAuth, entities: entities, records: records, structs: structs, enums: enums, states: states, derives: derives, policies: policies, procs: procs, actions: actions, webhooks: webhooks, jobs: jobs, services: services, components: components, triggers: triggers, views: views, themes: themes, css: css, daemons: daemons, privateProcs: privateProcs, parseErrors: parseErrors, layouts: layouts, rawDecls: rawDecls, kind: kind, into: into, mounts: mounts, sockets: sockets, hasFrame: hasFrame, frameSrc: frameSrc, hasContent: hasContent, contentSrc: contentSrc, unknownKeywords: unknownKeywords, shareds: shareds, expects: expects, expectedRoutes: [], expectedEventNames: [], expectedEventTypes: [], entityLines: entityLines, stateLines: stateLines, actionLines: actionLines}
+        return Program{name: name, hasAuth: hasAuth, entities: entities, records: records, structs: structs, enums: enums, states: states, derives: derives, policies: policies, procs: procs, actions: actions, webhooks: webhooks, jobs: jobs, services: services, components: components, triggers: triggers, views: views, themes: themes, css: css, daemons: daemons, privateProcs: privateProcs, parseErrors: parseErrors, layouts: layouts, rawDecls: rawDecls, kind: kind, into: into, mounts: mounts, sockets: sockets, hasFrame: hasFrame, frameSrc: frameSrc, hasContent: hasContent, contentSrc: contentSrc, unknownKeywords: unknownKeywords, shareds: shareds, expects: expects, expectedRoutes: [], expectedEventNames: [], expectedEventTypes: [], entityLines: entityLines, stateLines: stateLines, actionLines: actionLines, policyLines: policyLines}
 
     # ============================================================
     # STAGE 7: the live, HTTP-exercisable driver — proof `parseProgramSrc`

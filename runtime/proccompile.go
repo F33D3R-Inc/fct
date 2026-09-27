@@ -78,6 +78,14 @@ type procCode struct {
 	nslots   int
 	params   []int
 	intParam []bool // intParam[i]: parameter i is an int, bound into fr.ints
+	// borrow[i]: parameter i is only ever inspected — indexed, measured,
+	// its fields read into scalars and operators — never retained or
+	// written in place (the body cannot write it in place anyway: the
+	// slot does not own what a caller shares). A caller hands such an
+	// argument over without giving up its own ownership, so passing a
+	// value to a reader does not make the caller's next in-place write
+	// a copy (Rust's shared borrow, inferred).
+	borrow []bool
 	body     []cstmt
 	frames   sync.Pool // idle *pfr of this code's size, reused across calls
 }
@@ -105,6 +113,11 @@ type procCompiler struct {
 	declPos map[int]int
 	loops   [][2]int
 	moves   []moveCand
+	// escaped: slots whose value (or a field of it) may be retained past
+	// the statement that reads it — bound elsewhere, returned, stored,
+	// passed on. A parameter that never escapes is borrowed (procCode.
+	// borrow): its caller keeps its ownership across the call.
+	escaped map[int]bool
 }
 
 // moveCand is a bare-local argument at position pos: it moves when no
@@ -187,12 +200,28 @@ func (c *procCompiler) resolve(name string) (int, bool) {
 // when this slot did, and the slot is emptied. Otherwise the value is
 // shared as any retained read is.
 func (c *procCompiler) moveArg(e *ir.Expr, target int) func(*pfr) (any, bool, error) {
+	return c.moveArgTo(e, target, nil, 0)
+}
+
+// moveArgTo is moveArg for argument i of a call to site: when the callee
+// borrows that parameter (procSite.borrows), a shared argument keeps this
+// slot's ownership — the callee only reads it, and this frame is paused
+// until it returns. (A moved argument is handed over either way.)
+func (c *procCompiler) moveArgTo(e *ir.Expr, target int, site *procSite, i int) func(*pfr) (any, bool, error) {
 	if e != nil && e.Kind == "ref" {
 		if slot, ok := c.lookup(e.Name); ok && c.ints[slot] {
 			return func(fr *pfr) (any, bool, error) { return boxInt(fr.ints[slot]), false, nil }
 		} else if ok {
 			move := new(bool)
 			c.moves = append(c.moves, moveCand{slot: slot, pos: c.pos, ok: move, self: slot == target})
+			if site == nil {
+				c.escaped[slot] = true
+			} else {
+				// passed to a callee: an escape unless the callee borrows,
+				// which is known only once it is compiled — conservatively
+				// an escape for this body's own borrow inference
+				c.escaped[slot] = true
+			}
 			return func(fr *pfr) (any, bool, error) {
 				v := fr.slots[slot]
 				if *move {
@@ -200,7 +229,9 @@ func (c *procCompiler) moveArg(e *ir.Expr, target int) func(*pfr) (any, bool, er
 					fr.slots[slot], fr.own[slot] = nil, false
 					return v, owned, nil
 				}
-				fr.own[slot] = false
+				if site == nil || !site.borrows(i) {
+					fr.own[slot] = false
+				}
 				return v, false, nil
 			}
 		}
@@ -252,12 +283,12 @@ func (c *procCompiler) target(name string) int {
 // its body in the same block (a parameter and a top-level local share one
 // scope, as they shared one frame).
 func (s *Server) compileProc(params []ir.Param, body []ir.Stmt) *procCode {
-	c := &procCompiler{s: s, ints: map[int]bool{}, intLists: map[int]bool{}, lastPos: map[int]int{}, declPos: map[int]int{}}
+	c := &procCompiler{s: s, ints: map[int]bool{}, intLists: map[int]bool{}, lastPos: map[int]int{}, declPos: map[int]int{}, escaped: map[int]bool{}}
 	c.push()
 	pc := &procCode{}
 	for _, p := range params {
 		slot := c.declare(p.Name)
-		if p.Type == "int" {
+		if p.Type == "int" && !p.Map {
 			if p.List {
 				c.intLists[slot] = true
 			} else {
@@ -270,6 +301,10 @@ func (s *Server) compileProc(params []ir.Param, body []ir.Stmt) *procCode {
 	pc.body = c.stmts(body)
 	c.pop()
 	c.decideMoves()
+	pc.borrow = make([]bool, len(pc.params))
+	for i, slot := range pc.params {
+		pc.borrow[i] = !pc.intParam[i] && !c.escaped[slot]
+	}
 	pc.nslots = c.next
 	return pc
 }
@@ -291,6 +326,17 @@ type procSite struct {
 	s    *Server
 	p    *ir.Proc
 	code atomic.Pointer[procCode]
+}
+
+// borrows reports whether the callee borrows its parameter i (procCode.
+// borrow), compiling it first if no call has yet.
+func (ps *procSite) borrows(i int) bool {
+	pc := ps.code.Load()
+	if pc == nil {
+		pc = ps.s.codeFor(ps.p, ps.p.Params, ps.p.Body)
+		ps.code.Store(pc)
+	}
+	return i < len(pc.borrow) && pc.borrow[i]
 }
 
 func (c *procCompiler) site(name string) *procSite {
@@ -450,6 +496,38 @@ func (c *procCompiler) stmt(st *ir.Stmt) cstmt {
 				return ctlSignal{}, nil
 			}
 		}
+		if st.Value != nil && st.Value.Kind == "get" && strings.HasPrefix(st.Target, "__w") && st.Value.Obj != nil && st.Value.Obj.Kind == "ref" {
+			// The compiler's own temporary for a nested write (`s.f[k] = v`
+			// is `let mut __w = s.f; __w[k] = v; s.f = __w`, see the
+			// parser's desugarNestedWrite): the field is taken with its
+			// ownership when the slot owns the struct and the struct owns
+			// the field, so the write is in place rather than a copy of the
+			// whole field. Nothing reads s.f between here and the write-back
+			// but the written value's own expression, which the write
+			// evaluates first.
+			objSlot, objOK := c.lookup(st.Value.Obj.Name)
+			field := st.Value.Field
+			get := c.expr(st.Value)
+			slot := c.declare(st.Target)
+			return func(fr *pfr) (ctlSignal, error) {
+				if objOK && !c.ints[objSlot] && fr.own[objSlot] {
+					if sv, ok := fr.slots[objSlot].(structVal); ok {
+						if i, has := sv.lay.index[field]; has && i < 64 && sv.own&(1<<uint(i)) != 0 {
+							sv.own &^= 1 << uint(i)
+							fr.slots[objSlot] = sv
+							fr.set(slot, sv.vals[i], true)
+							return ctlSignal{}, nil
+						}
+					}
+				}
+				v, err := get(fr)
+				if err != nil {
+					return ctlSignal{}, err
+				}
+				fr.set(slot, v, false)
+				return ctlSignal{}, nil
+			}
+		}
 		if st.Value != nil && st.Value.Kind == "ref" {
 			// `let b = b0` where b0 is not used again hands the value
 			// (and its ownership) over rather than sharing it.
@@ -534,6 +612,14 @@ func (c *procCompiler) stmt(st *ir.Stmt) cstmt {
 					ev, err := elem(fr)
 					if err != nil {
 						return ctlSignal{}, err
+					}
+					// Room to grow, and the slot still the list's only
+					// holder once the element is evaluated (the element may
+					// have read it): the box the slot holds is written in
+					// place (growOwnedList) instead of boxing a new header.
+					if len(arr) < cap(arr) && fr.own[slot] {
+						growOwnedList(&fr.slots[slot], ev)
+						return ctlSignal{}, nil
 					}
 					fr.slots[slot] = append(arr, ev)
 					return ctlSignal{}, nil
@@ -681,6 +767,8 @@ func (c *procCompiler) stmt(st *ir.Stmt) cstmt {
 		}
 	case "do":
 		proc, ret, retList := st.Service, st.Ret, st.RetList
+		// a `{K: V}` result is a map, whatever V is — never a native int slot
+		retMap := st.RetMap
 		self := -1
 		if st.Bind == "" && st.Target != "" {
 			if slot, ok := c.resolve(st.Target); ok {
@@ -689,15 +777,16 @@ func (c *procCompiler) stmt(st *ir.Stmt) cstmt {
 		}
 		from := len(c.moves)
 		args := make([]argFn, len(st.Args))
+		doSite := c.site(proc)
 		for i, a := range st.Args {
-			args[i] = c.moveArg(a, self)
+			args[i] = c.moveArgTo(a, self, doSite, i)
 		}
 		c.selfMoves(from)
 		bind, into := -1, -1
 		if st.Bind != "" {
 			bind = c.declare(st.Bind)
-			c.ints[bind] = ret == "int" && !retList
-			c.intLists[bind] = ret == "int" && retList
+			c.ints[bind] = ret == "int" && !retList && !retMap
+			c.intLists[bind] = ret == "int" && retList && !retMap
 		} else if st.Target != "" {
 			into = c.target(st.Target)
 		}
@@ -784,8 +873,19 @@ func (c *procCompiler) stmt(st *ir.Stmt) cstmt {
 				return ctlSignal{}, nil
 			}
 		}
-		val := c.expr(v)
-		fresh := c.fresh(v)
+		// A bare local stored into the field hands its value (and, when it
+		// is dead after this store, its ownership) over, as a `let` of it
+		// does; anything else is owned exactly when it is fresh.
+		var val func(*pfr) (any, bool, error)
+		if v != nil && v.Kind == "ref" {
+			val = c.moveArg(v, -1)
+		} else {
+			x, fresh := c.expr(v), c.fresh(v)
+			val = func(fr *pfr) (any, bool, error) {
+				nv, err := x(fr)
+				return nv, fresh, err
+			}
+		}
 		// The field's position, cached against the layout last written
 		// here as a read's is (the "get" case).
 		var cache atomic.Pointer[fieldPos]
@@ -805,14 +905,14 @@ func (c *procCompiler) stmt(st *ir.Stmt) cstmt {
 				}
 				cache.Store(&fieldPos{lay: sv.lay, i: i})
 			}
-			nv, err := val(fr)
+			nv, fresh, err := val(fr)
 			if err != nil {
 				return ctlSignal{}, err
 			}
 			sv = fr.mutable(slot).(structVal)
 			sv.vals[i] = nv
-			// The struct owns the field's value exactly when it was created
-			// for this store (structVal.own).
+			// The struct owns the field's value exactly when nothing else
+			// references it (structVal.own).
 			if i < 64 {
 				bit := uint64(1) << uint(i)
 				if (sv.own&bit != 0) != fresh {
@@ -945,6 +1045,7 @@ func (c *procCompiler) stmt(st *ir.Stmt) cstmt {
 					return ctlSignal{kind: ctlReturn, val: boxInt(fr.ints[slot])}, nil
 				}
 			} else if ok {
+				c.escaped[slot] = true
 				return func(fr *pfr) (ctlSignal, error) {
 					v, owned := fr.slots[slot], fr.own[slot]
 					fr.own[slot] = false
@@ -1097,9 +1198,41 @@ func (s *Server) procArgValue(typ string, list bool, v any) any {
 	vals := make([]any, len(fields))
 	for i, f := range fields {
 		names[i] = f.Name
-		vals[i] = s.procArgValue(f.Type, f.List, m[f.Name])
+		if f.Map {
+			vals[i] = s.procArgMap(f.Key, f.Type, m[f.Name])
+		} else {
+			vals[i] = s.procArgValue(f.Type, f.List, m[f.Name])
+		}
 	}
-	return structVal{lay: s.structLayout(typ, names), vals: vals}
+	out := newStructVal(s.structLayout(typ, names), len(vals))
+	copy(out.vals, vals)
+	return out
+}
+
+// procArgMap is procArgValue for a `{key: typ}` parameter or field: a map
+// the proc engine already holds (map[any]any) passes through; a decoded
+// JSON object (map[string]any, or an action's record) becomes one, its keys
+// read as the declared key type (an int key arrives as its decimal text) and
+// its values converted as procArgValue converts a parameter of typ.
+func (s *Server) procArgMap(key, typ string, v any) any {
+	var obj map[string]any
+	switch t := v.(type) {
+	case nil, map[any]any:
+		return v
+	case map[string]any:
+		obj = t
+	default:
+		return v
+	}
+	out := make(map[any]any, len(obj))
+	for k, val := range obj {
+		var mk any = k
+		if key == "int" {
+			mk = toInt(k)
+		}
+		out[mk] = s.procArgValue(typ, false, val)
+	}
+	return out
 }
 
 // plainValue is procArgValue's inverse for a value leaving the proc engine
@@ -1124,6 +1257,14 @@ func plainValue(v any) any {
 		return out
 	case bytesVal:
 		return promoteBytes(t)
+	case map[any]any:
+		// A map's keys are int or text; as JSON they are the object's
+		// (text) keys, so a wire reply reads them back as procArgMap does.
+		out := make(map[string]any, len(t))
+		for k, x := range t {
+			out[toStr(k)] = plainValue(x)
+		}
+		return out
 	}
 	return v
 }
@@ -1176,6 +1317,7 @@ var inspectOnly = map[string]bool{
 	"charAt": true, "writeFileAt": true, "writeBytes": true, "writeFile": true,
 	"aesGcmSeal": true, "aesGcmOpen": true, "aesGcmAuthentic": true,
 	"appendFile": true, "sha256Hex": true, "canonicalJson": true, "awaitAny": true, "crc32": true,
+	"bytesCmp": true, "bytesCmpRange": true, "uintLE": true, "toHex": true,
 }
 
 // fresh reports whether e always evaluates to a composite value created by
@@ -1195,7 +1337,7 @@ func (c *procCompiler) fresh(e *ir.Expr) bool {
 			return false
 		}
 		switch e.Name {
-		case "append", "bytes", "textToBytes", "split", "readFileAt", "aesGcmSeal", "aesGcmOpen":
+		case "append", "bytes", "textToBytes", "split", "readFileAt", "aesGcmSeal", "aesGcmOpen", "fromHex":
 			return true
 		}
 	}
@@ -1248,6 +1390,13 @@ func (c *procCompiler) compileExpr(e *ir.Expr, escapes bool) cexpr {
 				// is unobservable.
 				return constExpr(cv)
 			}
+		}
+		if len(e.Args) == 0 {
+			// `[]`: one shared empty list. It has no capacity, so nothing
+			// can write into it in place — an index write is out of bounds
+			// and an append allocates — and every binding of it stays its
+			// own value.
+			return constExpr(emptyList)
 		}
 		elems := c.exprs(e.Args)
 		return func(fr *pfr) (any, error) {
@@ -1318,15 +1467,16 @@ func (c *procCompiler) compileExpr(e *ir.Expr, escapes bool) cexpr {
 			}
 		}
 		return func(fr *pfr) (any, error) {
-			out := make([]any, width)
+			out := newStructVal(lay, width)
 			for i, val := range vals {
 				v, err := val(fr)
 				if err != nil {
 					return nil, err
 				}
-				out[pos[i]] = v
+				out.vals[pos[i]] = v
 			}
-			return structVal{lay: lay, vals: out, own: ownMask}, nil
+			out.own = ownMask
+			return out, nil
 		}
 	case "get":
 		obj := c.use(e.Obj)
@@ -1337,6 +1487,19 @@ func (c *procCompiler) compileExpr(e *ir.Expr, escapes bool) cexpr {
 		if escapes && e.Obj != nil && e.Obj.Kind == "ref" {
 			if slot, ok := c.resolve(e.Obj.Name); ok && !c.ints[slot] {
 				disown = slot
+			}
+		}
+		if escapes {
+			// a retained field — of a local, or of a field of it — may
+			// alias that local's value: the local escapes
+			root := e.Obj
+			for root != nil && root.Kind == "get" {
+				root = root.Obj
+			}
+			if root != nil && root.Kind == "ref" {
+				if slot, ok := c.resolve(root.Name); ok && !c.ints[slot] {
+					c.escaped[slot] = true
+				}
 			}
 		}
 		// The field's position is cached against the layout last read here
@@ -1379,6 +1542,7 @@ func (c *procCompiler) compileExpr(e *ir.Expr, escapes bool) cexpr {
 			return func(fr *pfr) (any, error) { return boxInt(fr.ints[slot]), nil }
 		}
 		if escapes {
+			c.escaped[slot] = true
 			return func(fr *pfr) (any, error) {
 				fr.own[slot] = false
 				return fr.slots[slot], nil
@@ -1459,7 +1623,7 @@ func (c *procCompiler) compileExpr(e *ir.Expr, escapes bool) cexpr {
 		if site := c.site(e.Name); site != nil {
 			args := make([]argFn, len(e.Args))
 			for i, a := range e.Args {
-				args[i] = c.moveArg(a, -1)
+				args[i] = c.moveArgTo(a, -1, site, i)
 			}
 			return func(fr *pfr) (any, error) {
 				var buf [6]any
@@ -1486,10 +1650,13 @@ func (c *procCompiler) compileExpr(e *ir.Expr, escapes bool) cexpr {
 				if err != nil {
 					return nil, err
 				}
-				if i < 0 {
-					return "", nil
+				if t, ok := sv.(string); ok {
+					if i < 0 {
+						return "", nil
+					}
+					return boxStr(runeSlice(t, i, i+1)), nil
 				}
-				return boxStr(runeSlice(toStr(sv), i, i+1)), nil
+				return callBuiltin("charAt", []any{sv, boxInt(i)}), nil
 			}
 		}
 		if e.Name == "slice" && len(e.Args) == 3 && c.isInt(e.Args[1]) && c.isInt(e.Args[2]) {
@@ -1507,16 +1674,15 @@ func (c *procCompiler) compileExpr(e *ir.Expr, escapes bool) cexpr {
 				if err != nil {
 					return nil, err
 				}
-				if xs, ok := sv.([]any); ok {
-					return listSlice(xs, a, b), nil
+				switch t := sv.(type) {
+				case []any:
+					return listSlice(t, a, b), nil
+				case string:
+					return boxStr(runeSlice(t, a, b)), nil
 				}
-				if bs, ok := sv.(bytesVal); ok {
-					lo, hi := listBounds(len(bs), a, b)
-					out := make(bytesVal, hi-lo)
-					copy(out, bs[lo:hi])
-					return out, nil
-				}
-				return boxStr(runeSlice(toStr(sv), a, b)), nil
+				// A byte buffer, or any other representation: the builtin's
+				// own case.
+				return callBuiltin("slice", []any{sv, boxInt(a), boxInt(b)}), nil
 			}
 		}
 		var args []cexpr
@@ -1722,7 +1888,7 @@ func (c *procCompiler) isIntList(e *ir.Expr) bool {
 			return false
 		}
 		switch e.Name {
-		case "bytes", "textToBytes", "aesGcmSeal", "aesGcmOpen":
+		case "bytes", "textToBytes", "aesGcmSeal", "aesGcmOpen", "fromHex":
 			return true
 		case "append":
 			return len(e.Args) == 2 && c.isIntList(e.Args[0]) && c.isInt(e.Args[1])
@@ -2044,9 +2210,11 @@ func (c *procCompiler) textConcat(e *ir.Expr) cexpr {
 		return nil
 	}
 	head := toStr(litValue(n))
+	// Compiled leftmost first: lookup numbers each occurrence of a local
+	// in compile order for the move analysis, which must be source order.
 	parts := make([]cexpr, len(leaves))
-	for i, l := range leaves {
-		parts[len(leaves)-1-i] = c.use(l)
+	for i := range leaves {
+		parts[i] = c.use(leaves[len(leaves)-1-i])
 	}
 	return func(fr *pfr) (any, error) {
 		var buf [8]string
@@ -2097,6 +2265,33 @@ func strOp(op string) (func(a, b string) any, bool) {
 	}
 	return nil, false
 }
+
+// growOwnedList appends v to the []any held in *slot, whose spare capacity
+// has room for it, by rewriting the slice header inside the interface's own
+// box rather than boxing a new header: a loop of `out = append(out, x)`
+// allocates only when the backing array grows. Sound exactly when the slot
+// owns the list (fr.own): an owned value — and so the box it arrived in —
+// is referenced from nowhere else, so no other holder can observe the
+// header change; it is the same exclusivity that already lets append write
+// into the backing array's spare capacity.
+func growOwnedList(slot *any, v any) {
+	e := (*[2]unsafe.Pointer)(unsafe.Pointer(slot))
+	if e[0] != listTypeWord {
+		*slot = append((*slot).([]any), v)
+		return
+	}
+	hdr := (*[]any)(e[1])
+	*hdr = append(*hdr, v)
+}
+
+// listTypeWord is the type word of an interface holding a []any.
+var listTypeWord = func() unsafe.Pointer {
+	var probe any = []any{}
+	return (*[2]unsafe.Pointer)(unsafe.Pointer(&probe))[0]
+}()
+
+// emptyList is the value of every `[]` literal (see compileExpr's "list").
+var emptyList any = []any{}
 
 // constList is e's value when e is a list literal whose elements are all
 // literals (or such lists themselves), built once at compile time.

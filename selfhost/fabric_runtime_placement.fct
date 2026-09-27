@@ -122,6 +122,58 @@ app FabricRuntimePlacementSelfHost:
         nextMigration: int
         rule: ReplRule
         thresholds: LagThresholds
+        # Front doors outside this process (fabric_routing_feed.fct): whether
+        # any is subscribed to the routing this fabric publishes, and the
+        # newest routing generation every one of them has confirmed adopting
+        # with nothing still in flight under an older table. Set by the daemon
+        # before each advance (placementFabricWithDoors); with none subscribed
+        # the cutover is the crate's, unchanged. See mechPollCutover.
+        doorsSubscribed: bool
+        doorsConfirmed: int
+        # The routing generation at which each target's fence went up
+        # (recorded by placementFabricStepMigration): a door that confirmed
+        # any table from then on, while the move is not complete, routes by
+        # the fence. The generation itself moves every cycle (liveness bumps
+        # it, as the crate's set_availability does), so the fence's own
+        # generation is what a cutover waits on, not the current one.
+        fences: [TargetFence]
+
+    struct TargetFence:
+        target: ActionTarget
+        generation: int
+
+    # placementFabricWithDoors: what the subscribed doors have confirmed.
+    proc placementFabricWithDoors(f: PlacementFabric, subscribed: bool, confirmed: int) -> PlacementFabric:
+        let mut out = f
+        out.doorsSubscribed = subscribed
+        out.doorsConfirmed = confirmed
+        return out
+
+    # placementFabricDoorsHaveSeenFence: every subscribed door has confirmed
+    # a table in which `target` is fenced (or none is subscribed). A fence
+    # with no recorded generation is measured against the current table.
+    proc placementFabricDoorsHaveSeenFence(f: PlacementFabric, target: ActionTarget) -> bool:
+        if !f.doorsSubscribed:
+            return true
+        let mut needed = f.routing.generation
+        let mut i = 0
+        loop i < len(f.fences):
+            if f.fences[i].target.shardId == target.shardId && f.fences[i].target.coordinate.x == target.coordinate.x && f.fences[i].target.coordinate.y == target.coordinate.y:
+                needed = f.fences[i].generation
+            i = i + 1
+        return !sjU64Gt(needed, f.doorsConfirmed)
+
+    proc placementFabricWithFence(f: PlacementFabric, target: ActionTarget, generation: int) -> PlacementFabric:
+        let mut fences = []
+        let mut i = 0
+        loop i < len(f.fences):
+            let same = f.fences[i].target.shardId == target.shardId && f.fences[i].target.coordinate.x == target.coordinate.x && f.fences[i].target.coordinate.y == target.coordinate.y
+            if !same:
+                fences = append(fences, f.fences[i])
+            i = i + 1
+        let mut out = f
+        out.fences = append(fences, TargetFence{target: target, generation: generation})
+        return out
 
     proc placementFabricNew() -> PlacementFabric:
         let rule = do replRuleDefault()
@@ -132,7 +184,7 @@ app FabricRuntimePlacementSelfHost:
         let routing = do tableNew()
         let topology = do topologyRegistryNew()
         let thresholds = do lagThresholdsDefault()
-        return PlacementFabric{routing: routing, topology: topology, sets: [], migrations: [], transfers: [], verifications: [], sizes: [], generation: 1, nextMigration: 1, rule: rule, thresholds: thresholds}
+        return PlacementFabric{routing: routing, topology: topology, sets: [], migrations: [], transfers: [], verifications: [], sizes: [], generation: 1, nextMigration: 1, rule: rule, thresholds: thresholds, doorsSubscribed: false, doorsConfirmed: 0, fences: []}
 
     # ------------------------------------------------------ keyed lookups
 
@@ -274,16 +326,16 @@ app FabricRuntimePlacementSelfHost:
         return out
 
     private proc withRouting(f: PlacementFabric, routing: TableRoutingTable) -> PlacementFabric:
-        return PlacementFabric{routing: routing, topology: f.topology, sets: f.sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: f.generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds}
+        return PlacementFabric{routing: routing, topology: f.topology, sets: f.sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: f.generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds, doorsSubscribed: f.doorsSubscribed, doorsConfirmed: f.doorsConfirmed, fences: f.fences}
 
     private proc withSets(f: PlacementFabric, sets: [TargetSet]) -> PlacementFabric:
-        return PlacementFabric{routing: f.routing, topology: f.topology, sets: sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: f.generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds}
+        return PlacementFabric{routing: f.routing, topology: f.topology, sets: sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: f.generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds, doorsSubscribed: f.doorsSubscribed, doorsConfirmed: f.doorsConfirmed, fences: f.fences}
 
     private proc withMigrations(f: PlacementFabric, migrations: [TargetMigration]) -> PlacementFabric:
-        return PlacementFabric{routing: f.routing, topology: f.topology, sets: f.sets, migrations: migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: f.generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds}
+        return PlacementFabric{routing: f.routing, topology: f.topology, sets: f.sets, migrations: migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: f.generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds, doorsSubscribed: f.doorsSubscribed, doorsConfirmed: f.doorsConfirmed, fences: f.fences}
 
     private proc withTransfers(f: PlacementFabric, transfers: [TargetTransfer], verifications: [TargetVerdict]) -> PlacementFabric:
-        return PlacementFabric{routing: f.routing, topology: f.topology, sets: f.sets, migrations: f.migrations, transfers: transfers, verifications: verifications, sizes: f.sizes, generation: f.generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds}
+        return PlacementFabric{routing: f.routing, topology: f.topology, sets: f.sets, migrations: f.migrations, transfers: transfers, verifications: verifications, sizes: f.sizes, generation: f.generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds, doorsSubscribed: f.doorsSubscribed, doorsConfirmed: f.doorsConfirmed, fences: f.fences}
 
     # ---------------------------------------------------------- accessors
 
@@ -382,7 +434,7 @@ app FabricRuntimePlacementSelfHost:
         let mut generation = f.generation
         if !same:
             generation = generation + 1
-        return PlacementFabric{routing: applied, topology: topology, sets: f.sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds}
+        return PlacementFabric{routing: applied, topology: topology, sets: f.sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds, doorsSubscribed: f.doorsSubscribed, doorsConfirmed: f.doorsConfirmed, fences: f.fences}
 
     # placement_map equality: same keys, same holder for each key.
     proc placementMapsEqual(a: TopologyRegistry, b: TopologyRegistry) -> bool:
@@ -428,7 +480,7 @@ app FabricRuntimePlacementSelfHost:
             sizes = inserted
         else:
             sizes[idx] = TargetSize{target: target, bytes: bytes}
-        return PlacementFabric{routing: f.routing, topology: f.topology, sets: f.sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: sizes, generation: f.generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds}
+        return PlacementFabric{routing: f.routing, topology: f.topology, sets: f.sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: sizes, generation: f.generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds, doorsSubscribed: f.doorsSubscribed, doorsConfirmed: f.doorsConfirmed, fences: f.fences}
 
     # recordTransfer: cumulative, each field only ever grows.
     proc placementFabricRecordTransfer(f: PlacementFabric, target: ActionTarget, node: text, atomsCopied: int, bytesCopied: int, atMs: int) -> PlacementFabric:
@@ -651,7 +703,7 @@ app FabricRuntimePlacementSelfHost:
     # swallowed. The migration id is consumed even when planning fails.
     proc placementFabricStartMigration(f: PlacementFabric, target: ActionTarget, source: text, sourceRegion: text, destination: text, reason: MigrationReason, atMs: int) -> PlacementFabricResult:
         let id = MigrationId{value: f.nextMigration}
-        let bumped = PlacementFabric{routing: f.routing, topology: f.topology, sets: f.sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: f.generation, nextMigration: f.nextMigration + 1, rule: f.rule, thresholds: f.thresholds}
+        let bumped = PlacementFabric{routing: f.routing, topology: f.topology, sets: f.sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: f.generation, nextMigration: f.nextMigration + 1, rule: f.rule, thresholds: f.thresholds, doorsSubscribed: f.doorsSubscribed, doorsConfirmed: f.doorsConfirmed, fences: f.fences}
         let shard = do shardNew(target.shardId, sourceRegion)
         let planned = do migrationPlanNew(id, shard, source, destination, reason, atMs)
         if !planned.ok:
@@ -741,10 +793,12 @@ app FabricRuntimePlacementSelfHost:
         if observed.ok:
             routing = observed.table
         let updated = do withMigrations(f, migrations)
-        let out = do withRouting(updated, routing)
+        let mut out = do withRouting(updated, routing)
         if !stepped.ok:
             let e2 = do fabricErrorFromMigration(stepped.err)
             return PlacementFabricResult{ok: false, err: e2, fabric: out}
+        if step.op == "beginCutover":
+            out = placementFabricWithFence(out, target, routing.generation)
         let none = do fabricErrorNone()
         return PlacementFabricResult{ok: true, err: none, fabric: out}
 
@@ -757,7 +811,7 @@ app FabricRuntimePlacementSelfHost:
             generation = generation + 1
         let registered = do tableRegisterNode(f.routing, destination, region)
         let applied = do tableApplyPlacements(registered, moved.registry)
-        return PlacementFabric{routing: applied, topology: moved.registry, sets: f.sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds}
+        return PlacementFabric{routing: applied, topology: moved.registry, sets: f.sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds, doorsSubscribed: f.doorsSubscribed, doorsConfirmed: f.doorsConfirmed, fences: f.fences}
 
     # clearTransfer: forget the copy's progress AND its verdict, so a later
     # attempt on the same target starts from nothing.

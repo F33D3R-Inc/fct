@@ -1,0 +1,365 @@
+import "fabric_table.fct"
+import "fabric_json.fct"
+
+app FabricRoutingFeed:
+    # fabric_routing_feed.fct — the routing a control plane publishes, carried
+    # to front doors in other processes.
+    #
+    # fabric-daemon hands its front door each new routing table in-process
+    # (control.rs `publish_routing` -> FrontDoor::publish_routing, a clone
+    # under a lock), and the crate has no other door: fabric-facetql's
+    # FrontDoor is a library, served by fabricd alone. A door run as its own
+    # process (fabric_frontdoor_main.fct) must learn the same tables, and the
+    # crate's reason for giving RoutingTable no Serialize — derived state
+    # that must never disagree with its sources — is kept by what this feed
+    # is: never stored, only the published table at its generation, fetched
+    # by a door that stops routing (fails closed) the moment its lease on
+    # that answer runs out.
+    #
+    # The in-process door is also safe at a cutover in a way a remote one is
+    # not by itself: `publish_routing` returns before the loop moves on, so
+    # the door holds the fenced table before authority moves. A remote door
+    # holds whatever it last fetched. So the feed is acknowledged: each poll
+    # says which generation the door has adopted and which it CONFIRMS — no
+    # request still in flight under an older table (DoorInflight below) —
+    # and the daemon, while any door is subscribed, lets authority move only
+    # once every live door has confirmed a table at least as new as the
+    # current one (PlacementFabric.doorsConfirmed, fabric_runtime_mechanism
+    # .fct's cutover). A door that stops polling is forgotten once its lease
+    # and its longest possible in-flight request have both run out, by which
+    # time it has itself stopped routing.
+    #
+    # Here: the table codec (JSON, fixed field order, u64 as unsigned), the
+    # daemon's lease registry, and the door's in-flight accounting — all
+    # pure. The wire (`GET /routing/feed` on the operator port) is
+    # fabricd_lib.fct's; the poller is fabric_frontdoor_main.fct's. Names
+    # are prefixed `rtf` / `Door`.
+
+    # ── the table, as JSON ──────────────────────────────────────────────
+    proc rtfU(n: int) -> text:
+        return sjU64Text(n)
+
+    proc rtfList(items: [text]) -> text:
+        let mut out = "["
+        let mut i = 0
+        loop i < len(items):
+            if i > 0:
+                out = out + ","
+            out = out + items[i]
+            i = i + 1
+        return out + "]"
+
+    proc rtfOptU(has: bool, n: int) -> text:
+        if has:
+            return sjU64Text(n)
+        return "null"
+
+    proc rtfGroup(g: ReplGroup) -> text:
+        let mut rs = []
+        let mut i = 0
+        loop i < len(g.replicas):
+            let r = g.replicas[i]
+            rs = append(rs, "{\"shard_id\":" + rtfU(r.shardId) + ",\"node\":" + sjQuote(r.node) + ",\"region\":" + sjQuote(r.region) + ",\"primary\":" + sjBoolText(r.isPrimary) + ",\"state\":" + sjQuote(r.state) + ",\"pending_writes\":" + rtfU(r.pendingWrites) + ",\"apply_lag_ms\":" + rtfU(r.applyLagMs) + ",\"last_report_ms\":" + rtfOptU(r.hasLastReport, r.lastReportMs) + ",\"unreachable_since_ms\":" + rtfOptU(r.hasUnreachableSince, r.unreachableSinceMs) + "}")
+            i = i + 1
+        return "{\"shard_id\":" + rtfU(g.shardId) + ",\"desired_factor\":" + rtfU(g.desiredFactor) + ",\"replicas\":" + rtfList(rs) + "}"
+
+    proc rtfMigration(m: TableShardMigration) -> text:
+        let mut owner = "null"
+        if m.hasWriteOwner:
+            owner = sjQuote(m.writeOwner)
+        return "{\"shard_id\":" + rtfU(m.shardId) + ",\"source\":" + sjQuote(m.source) + ",\"destination\":" + sjQuote(m.destination) + ",\"cut_over\":" + sjBoolText(m.hasCutOver) + ",\"write_owner\":" + owner + "}"
+
+    proc rtfShard(e: TableShardEntry) -> text:
+        let mut extra = []
+        let mut i = 0
+        loop i < len(e.extraOwners):
+            extra = append(extra, sjQuote(e.extraOwners[i]))
+            i = i + 1
+        let mut overrides = []
+        let mut j = 0
+        loop j < len(e.overrides):
+            let o = e.overrides[j]
+            overrides = append(overrides, "{\"x\":" + o.coordinate.x + ",\"y\":" + o.coordinate.y + ",\"node\":" + sjQuote(o.dbmsId) + "}")
+            j = j + 1
+        let mut replicas = "null"
+        if e.hasReplicas:
+            replicas = rtfGroup(e.replicas)
+        let mut migration = "null"
+        if e.hasMigration:
+            migration = rtfMigration(e.migration)
+        let mut cells = []
+        let mut k = 0
+        loop k < len(e.cellReplicas):
+            let c = e.cellReplicas[k]
+            cells = append(cells, "{\"x\":" + c.coordinate.x + ",\"y\":" + c.coordinate.y + ",\"group\":" + rtfGroup(c.group) + "}")
+            k = k + 1
+        let mut moves = []
+        let mut m = 0
+        loop m < len(e.cellMigrations):
+            let c = e.cellMigrations[m]
+            moves = append(moves, "{\"x\":" + c.coordinate.x + ",\"y\":" + c.coordinate.y + ",\"migration\":" + rtfMigration(c.migration) + "}")
+            m = m + 1
+        return "{\"shard_id\":" + rtfU(e.shardId) + ",\"owner\":" + sjQuote(e.owner) + ",\"extra_owners\":" + rtfList(extra) + ",\"overrides\":" + rtfList(overrides) + ",\"replicas\":" + replicas + ",\"migration\":" + migration + ",\"cell_replicas\":" + rtfList(cells) + ",\"cell_migrations\":" + rtfList(moves) + "}"
+
+    # rtfEncode: the whole table.
+    proc rtfEncode(t: TableRoutingTable) -> text:
+        let mut nodes = []
+        let mut i = 0
+        loop i < len(t.nodes):
+            let n = t.nodes[i]
+            nodes = append(nodes, "{\"id\":" + sjQuote(n.id) + ",\"region\":" + sjQuote(n.region) + ",\"availability\":" + sjQuote(n.availability) + "}")
+            i = i + 1
+        let mut shards = []
+        let mut j = 0
+        loop j < len(t.shards):
+            shards = append(shards, rtfShard(t.shards[j]))
+            j = j + 1
+        return "{\"generation\":" + rtfU(t.generation) + ",\"require_proven_health\":" + sjBoolText(t.requireProvenHealth) + ",\"nodes\":" + rtfList(nodes) + ",\"shards\":" + rtfList(shards) + "}"
+
+    # ── reading it back ─────────────────────────────────────────────────
+    proc rtfGet(v: SjV, name: text) -> SjV:
+        let mut k = 0
+        loop k < len(v.keys):
+            if v.keys[k] == name:
+                return v.items[k]
+            k = k + 1
+        return sjNull()
+
+    proc rtfInt(v: SjV, name: text) -> int:
+        let f = do rtfGet(v, name)
+        return f.u
+
+    proc rtfText(v: SjV, name: text) -> text:
+        let f = do rtfGet(v, name)
+        return f.s
+
+    proc rtfBool(v: SjV, name: text) -> bool:
+        let f = do rtfGet(v, name)
+        return f.b
+
+    proc rtfIsNull(v: SjV, name: text) -> bool:
+        let f = do rtfGet(v, name)
+        return f.kind == "null"
+
+    proc rtfCoord(v: SjV) -> Coordinate:
+        return Coordinate{x: rtfInt(v, "x"), y: rtfInt(v, "y")}
+
+    proc rtfGroupFrom(v: SjV) -> ReplGroup:
+        let rv = do rtfGet(v, "replicas")
+        let mut rs = []
+        let mut i = 0
+        loop i < len(rv.items):
+            let r = rv.items[i]
+            let hasLast = !rtfIsNull(r, "last_report_ms")
+            let hasUnreachable = !rtfIsNull(r, "unreachable_since_ms")
+            rs = append(rs, ReplRecord{shardId: rtfInt(r, "shard_id"), node: rtfText(r, "node"), region: rtfText(r, "region"), isPrimary: rtfBool(r, "primary"), state: rtfText(r, "state"), pendingWrites: rtfInt(r, "pending_writes"), applyLagMs: rtfInt(r, "apply_lag_ms"), hasLastReport: hasLast, lastReportMs: rtfInt(r, "last_report_ms"), hasUnreachableSince: hasUnreachable, unreachableSinceMs: rtfInt(r, "unreachable_since_ms")})
+            i = i + 1
+        return ReplGroup{shardId: rtfInt(v, "shard_id"), desiredFactor: rtfInt(v, "desired_factor"), replicas: rs}
+
+    proc rtfNoMigration() -> TableShardMigration:
+        return TableShardMigration{shardId: 0, source: "", destination: "", hasCutOver: false, hasWriteOwner: false, writeOwner: ""}
+
+    proc rtfMigrationFrom(v: SjV) -> TableShardMigration:
+        let hasOwner = !rtfIsNull(v, "write_owner")
+        return TableShardMigration{shardId: rtfInt(v, "shard_id"), source: rtfText(v, "source"), destination: rtfText(v, "destination"), hasCutOver: rtfBool(v, "cut_over"), hasWriteOwner: hasOwner, writeOwner: rtfText(v, "write_owner")}
+
+    proc rtfShardFrom(v: SjV) -> TableShardEntry:
+        let ev = do rtfGet(v, "extra_owners")
+        let mut extra = []
+        let mut i = 0
+        loop i < len(ev.items):
+            extra = append(extra, ev.items[i].s)
+            i = i + 1
+        let ov = do rtfGet(v, "overrides")
+        let mut overrides = []
+        let mut j = 0
+        loop j < len(ov.items):
+            overrides = append(overrides, TableOverride{coordinate: rtfCoord(ov.items[j]), dbmsId: rtfText(ov.items[j], "node")})
+            j = j + 1
+        let hasReplicas = !rtfIsNull(v, "replicas")
+        let mut replicas = replGroupNew(0, 0)
+        if hasReplicas:
+            replicas = rtfGroupFrom(rtfGet(v, "replicas"))
+        let hasMigration = !rtfIsNull(v, "migration")
+        let mut migration = rtfNoMigration()
+        if hasMigration:
+            migration = rtfMigrationFrom(rtfGet(v, "migration"))
+        let cv = do rtfGet(v, "cell_replicas")
+        let mut cells = []
+        let mut k = 0
+        loop k < len(cv.items):
+            cells = append(cells, TableCellReplica{coordinate: rtfCoord(cv.items[k]), group: rtfGroupFrom(rtfGet(cv.items[k], "group"))})
+            k = k + 1
+        let mv = do rtfGet(v, "cell_migrations")
+        let mut moves = []
+        let mut m = 0
+        loop m < len(mv.items):
+            moves = append(moves, TableCellMigration{coordinate: rtfCoord(mv.items[m]), migration: rtfMigrationFrom(rtfGet(mv.items[m], "migration"))})
+            m = m + 1
+        return TableShardEntry{shardId: rtfInt(v, "shard_id"), owner: rtfText(v, "owner"), extraOwners: extra, overrides: overrides, hasReplicas: hasReplicas, replicas: replicas, hasMigration: hasMigration, migration: migration, cellReplicas: cells, cellMigrations: moves}
+
+    proc rtfTableFrom(v: SjV) -> TableRoutingTable:
+        let nv = do rtfGet(v, "nodes")
+        let mut nodes = []
+        let mut i = 0
+        loop i < len(nv.items):
+            nodes = append(nodes, TableNodeEntry{id: rtfText(nv.items[i], "id"), region: rtfText(nv.items[i], "region"), availability: rtfText(nv.items[i], "availability")})
+            i = i + 1
+        let sv = do rtfGet(v, "shards")
+        let mut shards = []
+        let mut j = 0
+        loop j < len(sv.items):
+            shards = append(shards, rtfShardFrom(sv.items[j]))
+            j = j + 1
+        return TableRoutingTable{nodes: nodes, shards: shards, generation: rtfInt(v, "generation"), requireProvenHealth: rtfBool(v, "require_proven_health")}
+
+    struct RtfDecoded:
+        ok: bool
+        err: text
+        table: TableRoutingTable
+
+    # rtfDecode: a table rtfEncode wrote, or why the text is not one.
+    proc rtfDecode(src: text) -> RtfDecoded:
+        let parsed = do sjDecode([sjVecType("Vec<Value>", "value")], src, "value")
+        if !parsed.ok:
+            return RtfDecoded{ok: false, err: parsed.err, table: tableNew()}
+        if parsed.v.kind != "obj":
+            return RtfDecoded{ok: false, err: "a routing table is a JSON object", table: tableNew()}
+        let t = do rtfTableFrom(parsed.v)
+        return RtfDecoded{ok: true, err: "", table: t}
+
+    # ── the feed's answer ───────────────────────────────────────────────
+    # `{"generation":G,"lease_ms":L,"table":T|null}`: the table is sent only
+    # when the door has not adopted this generation.
+    proc rtfAnswer(t: TableRoutingTable, adopted: int, leaseMs: int) -> text:
+        let mut table = "null"
+        if t.generation != adopted:
+            table = rtfEncode(t)
+        return "{\"generation\":" + rtfU(t.generation) + ",\"lease_ms\":" + leaseMs + ",\"table\":" + table + "}"
+
+    struct RtfFeedAnswer:
+        ok: bool
+        err: text
+        generation: int
+        leaseMs: int
+        hasTable: bool
+        table: TableRoutingTable
+
+    proc rtfReadAnswer(src: text) -> RtfFeedAnswer:
+        let parsed = do sjDecode([sjVecType("Vec<Value>", "value")], src, "value")
+        if !parsed.ok || parsed.v.kind != "obj":
+            return RtfFeedAnswer{ok: false, err: "the routing feed answered something that is not its JSON: " + parsed.err, generation: 0, leaseMs: 0, hasTable: false, table: tableNew()}
+        let v = parsed.v
+        let lease = do rtfInt(v, "lease_ms")
+        if lease <= 0:
+            return RtfFeedAnswer{ok: false, err: "the routing feed named no lease", generation: 0, leaseMs: 0, hasTable: false, table: tableNew()}
+        let hasTable = !rtfIsNull(v, "table")
+        let mut table = tableNew()
+        if hasTable:
+            table = rtfTableFrom(rtfGet(v, "table"))
+        return RtfFeedAnswer{ok: true, err: "", generation: rtfInt(v, "generation"), leaseMs: lease, hasTable: hasTable, table: table}
+
+    # ── the daemon's leases ─────────────────────────────────────────────
+    # One per door: what it confirmed, when the daemon last heard from it,
+    # and the longest a request it forwarded may still be in flight (its
+    # upstream timeout), which the daemon waits out before forgetting it.
+    struct DoorLease:
+        id: text
+        confirmed: int
+        lastMs: int
+        boundMs: int
+
+    # doorLeasesConfirm: a door's poll — its lease renewed, its confirmation
+    # recorded; in id order.
+    proc doorLeasesConfirm(ls: [DoorLease], id: text, confirmed: int, nowMs: int, boundMs: int) -> [DoorLease]:
+        let entry = DoorLease{id: id, confirmed: confirmed, lastMs: nowMs, boundMs: boundMs}
+        let mut out = []
+        let mut placed = false
+        let mut i = 0
+        loop i < len(ls):
+            if ls[i].id == id:
+                out = append(out, entry)
+                placed = true
+            else:
+                if !placed && id < ls[i].id:
+                    out = append(out, entry)
+                    placed = true
+                out = append(out, ls[i])
+            i = i + 1
+        if !placed:
+            out = append(out, entry)
+        return out
+
+    # doorLeasesLive: the doors that may still be routing — polled within the
+    # lease, or with a request that may still be in flight since.
+    proc doorLeasesLive(ls: [DoorLease], nowMs: int, leaseMs: int) -> [DoorLease]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(ls):
+            if nowMs - ls[i].lastMs <= leaseMs + ls[i].boundMs:
+                out = append(out, ls[i])
+            i = i + 1
+        return out
+
+    struct DoorView:
+        subscribed: bool
+        confirmed: int
+
+    # doorLeasesView: whether any door is subscribed, and the newest
+    # generation all of them have confirmed (the least of their confirmations).
+    proc doorLeasesView(ls: [DoorLease]) -> DoorView:
+        if len(ls) == 0:
+            return DoorView{subscribed: false, confirmed: 0}
+        let mut least = ls[0].confirmed
+        let mut i = 1
+        loop i < len(ls):
+            if sjU64Gt(least, ls[i].confirmed):
+                least = ls[i].confirmed
+            i = i + 1
+        return DoorView{subscribed: true, confirmed: least}
+
+    # ── the door's in-flight requests ───────────────────────────────────
+    # One entry per connection with a request being answered: registered
+    # before the request reads the door's table (`set` false), then the
+    # generation it read, removed when answered. A door confirms generation
+    # G only when nothing in flight read an older table; a registration that
+    # has not said which table it read counts as older.
+    struct DoorInflight:
+        conn: int
+        set: bool
+        generation: int
+
+    proc doorInflightBegin(es: [DoorInflight], conn: int) -> [DoorInflight]:
+        let out = do doorInflightEnd(es, conn)
+        return append(out, DoorInflight{conn: conn, set: false, generation: 0})
+
+    proc doorInflightRead(es: [DoorInflight], conn: int, generation: int) -> [DoorInflight]:
+        let mut out = es
+        let mut i = 0
+        loop i < len(out):
+            if out[i].conn == conn:
+                out[i] = DoorInflight{conn: conn, set: true, generation: generation}
+            i = i + 1
+        return out
+
+    proc doorInflightEnd(es: [DoorInflight], conn: int) -> [DoorInflight]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(es):
+            if es[i].conn != conn:
+                out = append(out, es[i])
+            i = i + 1
+        return out
+
+    # doorInflightConfirmable: the newest generation the door can confirm,
+    # having adopted `adopted` and last confirmed `last`.
+    proc doorInflightConfirmable(es: [DoorInflight], adopted: int, last: int) -> int:
+        let mut confirmed = adopted
+        let mut i = 0
+        loop i < len(es):
+            if !es[i].set:
+                return last
+            if sjU64Gt(confirmed, es[i].generation):
+                confirmed = es[i].generation
+            i = i + 1
+        return confirmed

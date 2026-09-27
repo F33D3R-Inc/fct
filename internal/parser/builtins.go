@@ -50,6 +50,11 @@ var builtinSites = map[string]BuiltinSite{
 	"given": SiteAuthority, // which optional parameters the caller sent
 	// IEEE-754 bit casts: the 64-bit pattern does not fit a browser number
 	"floatBits": SiteAuthority, "floatFromBits": SiteAuthority,
+	// The transcendental functions a scoring model is written in (a cosine,
+	// a Gaussian, a sigmoid, an exponential decay): Go's math.Exp/Log/Sqrt,
+	// so an answer is predictable from Go's documentation. The authority's
+	// only, since the browser's evaluator would have to agree bit for bit.
+	"exp": SiteAuthority, "ln": SiteAuthority, "sqrt": SiteAuthority,
 	// authentication secrets, stored files, signatures and content ids
 	"verifyPassword": SiteAuthority, "totpSecret": SiteAuthority, "totpValid": SiteAuthority, "randomToken": SiteAuthority,
 	"fileDigest": SiteAuthority, "ed25519Verify": SiteAuthority, "ecdsaP256Verify": SiteAuthority,
@@ -75,7 +80,7 @@ var builtinSites = map[string]BuiltinSite{
 	// self-hosted runtime signs its cookies and stores its credentials with
 	"sha256Bytes": SiteProc, "hmacSha256": SiteProc, "base64UrlRaw": SiteProc, "bcryptHash": SiteProc, "bcryptMatches": SiteProc,
 	"readFile": SiteProc, "writeFile": SiteProc, "appendFile": SiteProc, "fileExists": SiteProc, "truncateFile": SiteProc,
-	"fileSize": SiteProc, "fileModTime": SiteProc, "readFileAt": SiteProc, "writeFileAt": SiteProc, "syncFile": SiteProc, "renameFile": SiteProc, "removeFile": SiteProc, "lockFile": SiteProc, "crc32": SiteProc,
+	"fileSize": SiteProc, "fileModTime": SiteProc, "readFileAt": SiteProc, "writeFileAt": SiteProc, "syncFile": SiteProc, "renameFile": SiteProc, "removeFile": SiteProc, "lockFile": SiteProc, "crc32": SiteProc, "bytesCmp": SiteProc, "bytesCmpRange": SiteProc, "uintLE": SiteProc, "toHex": SiteProc, "fromHex": SiteProc,
 	"httpGet": SiteProc, "httpPost": SiteProc,
 	"listen": SiteProc, "listenOn": SiteProc, "accept": SiteProc, "connect": SiteProc,
 	"readBytes": SiteProc, "writeBytes": SiteProc, "closeConn": SiteProc, "setTimeoutMs": SiteProc, "connError": SiteProc,

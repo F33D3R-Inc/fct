@@ -230,7 +230,7 @@ var checkCases = []checkCase{
 	{"send(count)", "derive", "int", "send(ch, value) takes exactly two arguments"},
 
 	// ---- rejected: aggregate rules ----
-	{"count(draft)", "derive", "int", `count(...) needs an entity collection; "draft" is not an entity`},
+	{"count(draft)", "derive", "int", "count(...) needs a collection to range over; \"draft\" is neither an entity nor a `[T]` list state"},
 	{"sum(Post.nope)", "derive", "int", `entity "Post" has no field "nope" to sum`},
 	{"exists(Post)", "derive", "bool", "exists needs a filtered form: exists(x in Post where <cond>)"},
 	{"Post(1).nope", "derive", "int", `entity "Post" has no field "nope" (in ` + "`Post(…).nope`" + ")"},

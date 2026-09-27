@@ -35,7 +35,17 @@ type record = map[string]any
 // order, laid out by the struct type's structLayout (shared by every value of
 // the type), so building one is one small allocation and reading a field an
 // index — not a hash map per value.
-type structVal struct {
+//
+// A struct value is a pointer (structVal is an alias for *structObj): it
+// sits in an interface with no box of its own, and newStructVal lays the
+// header and the fields out in one allocation. Sharing the header between
+// holders is the same sharing the fields already had — copy-on-write
+// (cloneStructValue, under fr.mutable) gives a writer its own before any
+// write, and the own bits are written only through a slot that owns the
+// struct, so no other holder is reading them.
+type structVal = *structObj
+
+type structObj struct {
 	lay  *structLayout
 	vals []any
 	// own: bit i set means vals[i]'s composite value is referenced from
@@ -208,6 +218,18 @@ func runeIndexOf(s, sub string, from int) int {
 	return sort.Search(len(offs), func(i int) bool { return offs[i] >= bpos })
 }
 
+// sameText is a text builtin's result s as a value: the argument orig
+// itself when s is that very text unchanged (a replace that matched
+// nothing, a trim with nothing to trim), so the result reuses orig's box
+// rather than boxing the identical text again — jsonQuote's eight replaces
+// per string are almost always no-ops.
+func sameText(orig any, s string) any {
+	if o, ok := orig.(string); ok && len(o) == len(s) && unsafe.StringData(o) == unsafe.StringData(s) {
+		return orig
+	}
+	return s
+}
+
 // runeLen is len(s) in runes.
 func runeLen(s string) int {
 	ascii, offs := textIndex(s)
@@ -327,9 +349,96 @@ func cloneStructValue(v any) any {
 	if !ok {
 		return v
 	}
-	out := make([]any, len(sv.vals))
-	copy(out, sv.vals)
-	return structVal{lay: sv.lay, vals: out}
+	out := newStructVal(sv.lay, len(sv.vals))
+	copy(out.vals, sv.vals)
+	return out
+}
+
+// newStructVal is a zero struct value of the given width: for up to 32
+// fields the header and the field slots are one allocation (a struct and
+// an array beside it, the slice pointing into the array), in size classes
+// close enough that a struct wastes at most a few slots.
+func newStructVal(lay *structLayout, width int) structVal {
+	switch {
+	case width <= 2:
+		o := &struct {
+			h structObj
+			a [2]any
+		}{}
+		o.h.lay, o.h.vals = lay, o.a[:width:width]
+		return &o.h
+	case width <= 3:
+		o := &struct {
+			h structObj
+			a [3]any
+		}{}
+		o.h.lay, o.h.vals = lay, o.a[:width:width]
+		return &o.h
+	case width <= 4:
+		o := &struct {
+			h structObj
+			a [4]any
+		}{}
+		o.h.lay, o.h.vals = lay, o.a[:width:width]
+		return &o.h
+	case width <= 6:
+		o := &struct {
+			h structObj
+			a [6]any
+		}{}
+		o.h.lay, o.h.vals = lay, o.a[:width:width]
+		return &o.h
+	case width <= 8:
+		o := &struct {
+			h structObj
+			a [8]any
+		}{}
+		o.h.lay, o.h.vals = lay, o.a[:width:width]
+		return &o.h
+	case width <= 10:
+		o := &struct {
+			h structObj
+			a [10]any
+		}{}
+		o.h.lay, o.h.vals = lay, o.a[:width:width]
+		return &o.h
+	case width <= 12:
+		o := &struct {
+			h structObj
+			a [12]any
+		}{}
+		o.h.lay, o.h.vals = lay, o.a[:width:width]
+		return &o.h
+	case width <= 16:
+		o := &struct {
+			h structObj
+			a [16]any
+		}{}
+		o.h.lay, o.h.vals = lay, o.a[:width:width]
+		return &o.h
+	case width <= 20:
+		o := &struct {
+			h structObj
+			a [20]any
+		}{}
+		o.h.lay, o.h.vals = lay, o.a[:width:width]
+		return &o.h
+	case width <= 24:
+		o := &struct {
+			h structObj
+			a [24]any
+		}{}
+		o.h.lay, o.h.vals = lay, o.a[:width:width]
+		return &o.h
+	case width <= 32:
+		o := &struct {
+			h structObj
+			a [32]any
+		}{}
+		o.h.lay, o.h.vals = lay, o.a[:width:width]
+		return &o.h
+	}
+	return &structObj{lay: lay, vals: make([]any, width)}
 }
 
 func mapKey(v any) (any, error) {
@@ -460,11 +569,11 @@ func evalColl(e *ir.Expr, scope map[string]any) any {
 			prev, had := scope[e.Var]
 			kept := make([]any, 0, len(rows))
 			for _, r := range rows {
-				if m, ok := r.(record); ok {
-					scope[e.Var] = m
-					if evalRowPredicate(e.Where, scope) {
-						kept = append(kept, r)
-					}
+				// An entity's rows are records; a `[T]` list cell's elements are
+				// its values. The item variable is bound to each as it is.
+				scope[e.Var] = r
+				if evalRowPredicate(e.Where, scope) {
+					kept = append(kept, r)
 				}
 			}
 			if had {
@@ -502,10 +611,8 @@ func evalColl(e *ir.Expr, scope map[string]any) any {
 			out := make([]any, 0, len(rows))
 			prev, had := scope[e.Var]
 			for _, r := range rows {
-				if m, ok := r.(record); ok {
-					scope[e.Var] = m
-					out = append(out, eval(e.Sel, scope))
-				}
+				scope[e.Var] = r // a row, or a list cell's element
+				out = append(out, eval(e.Sel, scope))
 			}
 			if had {
 				scope[e.Var] = prev
@@ -1208,6 +1315,16 @@ func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
 		return s.ioLockFile(toStr(arg(0)))
 	case "crc32":
 		return crc32Range(arg(0), toInt(arg(1)), toInt(arg(2)))
+	case "bytesCmp":
+		return bytesCmpBuiltin(arg(0), arg(1))
+	case "bytesCmpRange":
+		return bytesCmpRangeBuiltin(arg(0), toInt(arg(1)), toInt(arg(2)), arg(3), toInt(arg(4)), toInt(arg(5)))
+	case "uintLE":
+		return uintLEBuiltin(arg(0), toInt(arg(1)), toInt(arg(2)))
+	case "toHex":
+		return toHexBuiltin(arg(0))
+	case "fromHex":
+		return fromHexBuiltin(toStr(arg(0)))
 	case "httpGet":
 		return s.ioHTTPGet(toStr(arg(0)))
 	case "httpPost":
@@ -1448,6 +1565,14 @@ func callBuiltin(name string, argVals []any) any {
 		return toInt(arg(0))
 	case "u64Cmp", "u64Min", "u64Max", "u64SatSub", "u64Div", "u64Rem", "u64Text", "u64Parse", "u64ParseError", "u64ToFloat":
 		return u64Builtin(name, argVals)
+	case "exp":
+		return math.Exp(toFloat(arg(0)))
+	case "ln":
+		// The natural logarithm; ln(0) is -Inf and a negative argument NaN,
+		// exactly math.Log — a scoring formula clamps before it takes one.
+		return math.Log(toFloat(arg(0)))
+	case "sqrt":
+		return math.Sqrt(toFloat(arg(0)))
 	case "floatBits":
 		// The raw IEEE-754 bit pattern of a float, reinterpreted as a signed
 		// 64-bit int — a bit-cast, not a numeric conversion (contrast
@@ -1573,7 +1698,7 @@ func callBuiltin(name string, argVals []any) any {
 	case "lower":
 		return strings.ToLower(toStr(arg(0)))
 	case "trim":
-		return strings.TrimSpace(toStr(arg(0)))
+		return sameText(arg(0), strings.TrimSpace(toStr(arg(0))))
 	case "contains":
 		return strings.Contains(toStr(arg(0)), toStr(arg(1)))
 	case "replace":
@@ -1581,7 +1706,7 @@ func callBuiltin(name string, argVals []any) any {
 		// strings.ReplaceAll — including its empty-`old` case, which inserts
 		// `new` at every rune boundary ("abc" → "-a-b-c-"); the client's
 		// String.prototype.replaceAll with a string pattern does the same.
-		return strings.ReplaceAll(toStr(arg(0)), toStr(arg(1)), toStr(arg(2)))
+		return sameText(arg(0), strings.ReplaceAll(toStr(arg(0)), toStr(arg(1)), toStr(arg(2))))
 	case "slug":
 		return slug(toStr(arg(0)))
 	case "ago":

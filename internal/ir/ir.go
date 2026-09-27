@@ -123,6 +123,10 @@ type RecordField struct {
 	Type     string `json:"type"`
 	List     bool   `json:"list,omitempty"`
 	Optional bool   `json:"optional,omitempty"`
+	// Map / Key: the field is a map from Key (int or text) to Type values
+	// (a struct field only; see ast.StructField).
+	Map bool   `json:"map,omitempty"`
+	Key string `json:"key,omitempty"`
 }
 
 // Struct is a proc-local named-field composite type declaration (see
@@ -442,6 +446,8 @@ type Proc struct {
 	Params  []Param `json:"params"`
 	Ret     string  `json:"ret,omitempty"`     // return type core ("" = no return)
 	RetList bool    `json:"retList,omitempty"` // the return is a list of Ret
+	RetMap  bool    `json:"retMap,omitempty"`  // the return is a map of Ret values
+	RetKey  string  `json:"retKey,omitempty"`  // the map return's key type (int or text)
 	Body    []Stmt  `json:"body"`
 }
 
@@ -578,6 +584,10 @@ type Param struct {
 	Type     string `json:"type"`
 	Optional bool   `json:"optional,omitempty"`
 	List     bool   `json:"list,omitempty"`
+	// Map / Key: a map from Key (int or text) to Type values (a proc
+	// parameter only; see ast.Param).
+	Map bool   `json:"map,omitempty"`
+	Key string `json:"key,omitempty"`
 }
 
 // Job is a scheduled server action: the runtime invokes Action on a timer
@@ -742,6 +752,7 @@ type Stmt struct {
 	Bind    string      `json:"bind,omitempty"`    // call/do (request→response): local the result binds to; add: local the new row's id binds to
 	Ret     string      `json:"ret,omitempty"`     // call/do (request→response): result type core, for decode/coerce
 	RetList bool        `json:"retList,omitempty"` // call/do (request→response): result is a list of Ret
+	RetMap  bool        `json:"retMap,omitempty"`  // do: the proc's result is a {K: Ret} map
 	Role    *Expr       `json:"role,omitempty"`    // establish: optional new session role (Value holds the new actor)
 	Msg     string      `json:"msg,omitempty"`     // check: the message returned when the condition (Value) is false
 	Status  int         `json:"status,omitempty"`  // check: the HTTP status a declared api answers with on failure (0 = 422); return: the reply's own 2xx (0 = the route's)

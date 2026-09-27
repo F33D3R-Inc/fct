@@ -1,5 +1,6 @@
 import "runtime_eval_ir.fct"
 import "render_markdown.fct"
+import "fabric_facetql_client.fct"
 
 app RenderHTML:
     # render_html.fct — runtime/server.go's renderer: the server-side first
@@ -37,6 +38,16 @@ app RenderHTML:
         compBases: [int]
         compUsed: [bool]
         bindBase: int
+        # the store a table's rows are read from during a render (listRows'
+        # store path): none when the working set is the only copy
+        storeOn: bool
+        fqlBase: text
+        fqlToken: text
+        # the at-rest key a @secret column is opened with (secret.go)
+        encKey: [int]
+        # signed media: FACET_MEDIA_TTL and the signing key (media.go)
+        mediaTTL: int
+        signKey: [int]
 
     proc rtChildPath(path: text, i: int) -> text:
         return path + "/" + i
@@ -205,7 +216,7 @@ app RenderHTML:
                 let cc = do rtNodesCount(g.components[j].view)
                 b = b + cc
             j = j + 1
-        return RtPage{g: g, page: page, compBases: bases, compUsed: used, bindBase: bindBase}
+        return RtPage{g: g, page: page, compBases: bases, compUsed: used, bindBase: bindBase, storeOn: false, fqlBase: "", fqlToken: "", encKey: [], mediaTTL: 0, signKey: []}
 
     proc rtRenderNew(sc: RtScope) -> RtRender:
         return RtRender{sc: sc, html: "", regKeys: [], regVals: [], moreKeys: [], moreVals: []}
@@ -547,14 +558,39 @@ app RenderHTML:
         return false
 
     # ── media ───────────────────────────────────────────────────────────
-    # rtMediaSrc: mediaSrc with signing off — a durable /uploads/ reference
-    # normalized (query and fragment dropped), anything else untouched.
-    proc rtMediaSrc(v: text) -> text:
-        let t = trim(v)
-        let pre = do rtHasPrefixFold(t, "/uploads/")
-        if !pre || slice(t, 0, 9) != "/uploads/":
-            return v
-        let mut name = slice(t, 9, len(t))
+    # rtMediaSig: mediaSig — the hex HMAC-SHA256 of "name:exp" under the
+    # signing key.
+    proc rtMediaSig(key: [int], name: text, exp: int) -> text:
+        let mac = hmacSha256(key, textToBytes(name + ":" + exp))
+        let h = do rtHex(mac)
+        return h
+
+    proc rtHex(bs: [int]) -> text:
+        let digits = "0123456789abcdef"
+        let mut out = ""
+        let mut i = 0
+        loop i < len(bs):
+            out = out + charAt(digits, bs[i] / 16) + charAt(digits, bs[i] % 16)
+            i = i + 1
+        return out
+
+    # rtMediaURL: mediaURL — the bare path, or with signing on (ttl > 0) the
+    # path with an expiry `ttl` seconds out and its signature.
+    proc rtMediaURL(ttl: int, key: [int], name: text) -> text:
+        if ttl <= 0:
+            return "/uploads/" + name
+        let exp = nowMs() / 1000 + ttl
+        let sig = do rtMediaSig(key, name, exp)
+        return "/uploads/" + name + "?exp=" + exp + "&sig=" + sig
+
+    # rtMediaDurableRef: mediaDurableRef — "/uploads/<name>" normalised (a
+    # query or fragment dropped), "" for anything that is not one.
+    proc rtMediaDurableRef(v0: text) -> text:
+        let v = trim(v0)
+        let pre = do rtHasPrefix(v, "/uploads/")
+        if !pre:
+            return ""
+        let mut name = slice(v, 9, len(v))
         let q = do rtIndexOfText(name, "?")
         let h = do rtIndexOfText(name, "#")
         let mut cut = len(name)
@@ -567,8 +603,56 @@ app RenderHTML:
         let bsl = do rtIndexOfText(name, "\\")
         let dd = do rtIndexOfText(name, "..")
         if name == "" || sl >= 0 || bsl >= 0 || dd >= 0:
-            return v
+            return ""
         return "/uploads/" + name
+
+    # rtMediaSrcFor: mediaSrc — the URL to render a stored media value by:
+    # not ours untouched; ours normalised, and signed when signing is on.
+    proc rtMediaSrcFor(ttl: int, key: [int], v: text) -> text:
+        let ref = do rtMediaDurableRef(v)
+        if ref == "":
+            return v
+        if ttl <= 0:
+            return ref
+        let u = do rtMediaURL(ttl, key, slice(ref, 9, len(ref)))
+        return u
+
+    proc rtMediaSrc(v: text) -> text:
+        let u = do rtMediaSrcFor(0, [], v)
+        return u
+
+    # rtMediaGrants: mediaGrants — every media value in a client-bound
+    # payload mapped to the URL to render it by; a record (encoded with its
+    # keys sorted, as Go's map), empty when signing is off.
+    proc rtMediaGrants(ttl: int, key: [int], payload: Val) -> Val:
+        let mut out = do recordVal([], [])
+        if ttl <= 0:
+            return out
+        out = do rtCollectGrants(ttl, key, payload, out)
+        return out
+
+    proc rtCollectGrants(ttl: int, key: [int], v: Val, acc: Val) -> Val:
+        let mut out = acc
+        if v.kind == "text":
+            let ref = do rtMediaDurableRef(v.t)
+            if ref != "":
+                let src = do rtMediaSrcFor(ttl, key, v.t)
+                if src != v.t:
+                    out = do valSet(out, v.t, textVal(src))
+            return out
+        if v.kind == "list" || v.kind == "record":
+            let mut i = 0
+            loop i < len(v.items):
+                out = do rtCollectGrants(ttl, key, v.items[i], out)
+                i = i + 1
+        return out
+
+    proc rtMediaGrantsJSON(ttl: int, key: [int], payload: Val) -> text:
+        let g = do rtMediaGrants(ttl, key, payload)
+        if len(g.keys) == 0:
+            return "null"
+        let j = do rtValJSON(g)
+        return j
 
     # ── rows ────────────────────────────────────────────────────────────
     # rtSelectRows: selectRows — filter by `where` per row (the
@@ -644,7 +728,7 @@ app RenderHTML:
         more: bool
         sc: RtScope
 
-    proc rtListRowsMore(pg: RtPage, sc0: RtScope, n: IRNode, bases: [int]) -> RtRows:
+    proc rtListRowsMore(pg: RtPage, sc0: RtScope, n: IRNode, bases: [int]) -> RtRows uses io.net:
         let mut sc = sc0
         let coll = do rtGet(sc, n.coll)
         let ei = do rtEntityIndex(pg.g, n.coll)
@@ -683,6 +767,9 @@ app RenderHTML:
                 let lim0 = do valToInt(lr0.v)
                 if lim0 <= 0:
                     return RtRows{rows: [], more: false, sc: lr0.sc}
+            if store && pg.storeOn:
+                let er = do rtEngineListRows(pg, coll.items, probe0, sc, bases)
+                return RtRows{rows: er.v.items, more: false, sc: er.sc}
             let r = do rtSelectRows(coll.items, probe0, sc, bases, store)
             return RtRows{rows: r.v.items, more: false, sc: r.sc}
         let lr = do rtEval(n.limit[0], sc, bases[10])
@@ -692,14 +779,153 @@ app RenderHTML:
             return RtRows{rows: [], more: false, sc: sc}
         let mut probe = probe0
         probe.limit = [irLit("" + (limit + 1), "int")]
+        if store && pg.storeOn:
+            let er2 = do rtEngineListRows(pg, coll.items, probe, sc, bases)
+            if len(er2.v.items) > limit:
+                return RtRows{rows: slice(er2.v.items, 0, limit), more: true, sc: er2.sc}
+            return RtRows{rows: er2.v.items, more: false, sc: er2.sc}
         let r2 = do rtSelectRows(coll.items, probe, sc, bases, store)
         if len(r2.v.items) > limit:
             return RtRows{rows: slice(r2.v.items, 0, limit), more: true, sc: r2.sc}
         return RtRows{rows: r2.v.items, more: false, sc: r2.sc}
 
+    # rtEngineListRows: listRows' store path — the table's rows come from
+    # the engine, in its own (field, then id) order, paged by listPageSize
+    # (2000) with the predicate applied to each page as it arrives (the
+    # residual Go applies when the store cannot answer the whole predicate;
+    # applying all of it this way yields the same rows), until the limit is
+    # met or the rows run out. What comes back carries the store's own
+    # normalisation (a money or date column as text), exactly as Go's does.
+    proc rtEngineListRows(pg: RtPage, mirror: [Val], n: IRNode, sc0: RtScope, bases: [int]) -> RtOut uses io.net:
+        let mut sc = sc0
+        let mut limit = 0
+        if len(n.limit) > 0:
+            let lr = do rtEval(n.limit[0], sc, bases[10])
+            sc = lr.sc
+            limit = do valToInt(lr.v)
+        let c = FqlClient{endpoint: FqlEndpoint{dbmsId: "facet", baseUrl: pg.fqlBase, token: pg.fqlToken}, timeoutMs: 15000, trustFile: ""}
+        let mut out = []
+        let mut after = ""
+        let mut going = true
+        loop going:
+            let mut parts = ["\"kind\":" + jsonQuote(n.coll), "\"item_var\":" + jsonQuote(n.itemVar), "\"order\":" + jsonQuote(n.order), "\"desc\":" + rtBoolWordR(n.desc), "\"limit\":2000"]
+            if after != "":
+                parts = append(parts, "\"after\":" + jsonQuote(after))
+            let body = "{" + rtJoinTexts(parts, ",") + "}"
+            let sent = do fqlPostJson(c, "/nodes/query", body, "POST /nodes/query")
+            if !sent.ok:
+                # listFallback: the working set answers when the store cannot
+                let fb = do rtSelectRows(mirror, n, sc, bases, true)
+                return fb
+            let page = do fqlDecodeQueryPage(sent.body)
+            if !page.ok:
+                let fb2 = do rtSelectRows(mirror, n, sc, bases, true)
+                return fb2
+            let ei = do rtEntityIndex(pg.g, n.coll)
+            let mut rows = []
+            let mut k = 0
+            loop k < len(page.v.nodes):
+                let rec = do rtEngineRecord(pg, pg.g.entities[ei], page.v.nodes[k].data)
+                rows = append(rows, rec)
+                k = k + 1
+            let mut kept = rows
+            if len(n.where) > 0:
+                let fr = do rtFilterRows(rows, n.itemVar, n.where[0], sc, bases[9])
+                sc = fr.sc
+                kept = fr.v.items
+            out = out + kept
+            if limit > 0 && len(out) >= limit:
+                out = slice(out, 0, limit)
+                going = false
+            else:
+                if page.v.next == "" || len(page.v.nodes) == 0:
+                    going = false
+                else:
+                    after = page.v.next
+        let lv = do listVal(out)
+        return RtOut{v: lv, sc: sc}
+
+    proc rtBoolWordR(b: bool) -> text:
+        if b:
+            return "true"
+        return "false"
+
+    # rtOpenSealed: decryptSecret — a value this runtime sealed at rest
+    # (`fctenc:` + base64url(nonce || ciphertext), AES-256-GCM) opened; any
+    # other value, or one that does not open, is returned as it is.
+    proc rtOpenSealed(key: [int], stored: text) -> text:
+        let pre = do rtHasPrefix(stored, "fctenc:")
+        if !pre || len(key) == 0:
+            return stored
+        let raw = do rtBase64UrlDecode(slice(stored, 7, len(stored)))
+        if len(raw) < 12:
+            return stored
+        let nonce = slice(raw, 0, 12)
+        let ct = slice(raw, 12, len(raw))
+        let ok = aesGcmAuthentic(key, nonce, ct)
+        if !ok:
+            return stored
+        let pt = aesGcmOpen(key, nonce, ct)
+        return bytesToText(pt)
+
+    # rtEngineRecord: nodeRecord — a node's data as a row, normalised as the
+    # store normalises it: a number column int or float by type, a missing
+    # column its zero, text as text, and a @secret column opened
+    # (decryptIf) — the owner a gate admits reads the plaintext, exactly as
+    # from Go's store; the gate itself strips it for everyone else.
+    proc rtEngineRecord(pg: RtPage, e: IREntity, data: text) -> Val:
+        let mut raw = do jNone()
+        if data != "":
+            raw = do jsonParse(data)
+        let mut keys = ["id"]
+        let mut vals = []
+        let idv = do jGet(raw, "id")
+        vals = append(vals, rtEngineField(IRField{name: "id", type: "int", ref: "", enumName: "", index: false, secret: false, e2e: false, password: false, readPolicy: "", optional: false, unique: false, required: false, hasMin: false, min: 0, hasMax: false, max: 0, matches: "", onDelete: ""}, idv))
+        let mut i = 0
+        loop i < len(e.fields):
+            let f = e.fields[i]
+            if f.name != "id":
+                let jv = do jGet(raw, f.name)
+                keys = append(keys, f.name)
+                let mut fv = do rtEngineField(f, jv)
+                if f.secret && fv.kind == "text":
+                    fv = do textVal(rtOpenSealed(pg.encKey, fv.t))
+                vals = append(vals, fv)
+            i = i + 1
+        let r = do recordVal(keys, vals)
+        return r
+
+    proc rtEngineField(f: IRField, v: JVal) -> Val:
+        if v.kind == "none" || v.kind == "null":
+            if f.ref != "" || f.type == "int":
+                let z = do intVal(0)
+                return z
+            if f.type == "float":
+                let fz = do floatVal(0.0)
+                return fz
+            if f.type == "bool":
+                let bz = do boolVal(false)
+                return bz
+            let tz = do textVal("")
+            return tz
+        if v.kind == "num":
+            if f.type == "float":
+                let fv = do floatVal(toFloat(v.s))
+                return fv
+            let iv = do intVal(toInt(v.s))
+            return iv
+        if v.kind == "bool":
+            let bv = do boolVal(v.s == "true")
+            return bv
+        if v.kind == "str":
+            let tv = do textVal(v.s)
+            return tv
+        let rv = do rtJValToVal(v)
+        return rv
+
     # rtRows: renderer.rows — the rows a repeating node renders, recorded
     # under its render path when they are a table's.
-    proc rtRows(pg: RtPage, rd0: RtRender, n: IRNode, path: text, bases: [int]) -> RtRender:
+    proc rtRows(pg: RtPage, rd0: RtRender, n: IRNode, path: text, bases: [int]) -> RtRender uses io.net:
         let mut rd = rd0
         let rr = do rtListRowsMore(pg, rd.sc, n, bases)
         rd.sc = rr.sc
@@ -785,7 +1011,7 @@ app RenderHTML:
         labels: [text]
         rd: RtRender
 
-    proc rtEachOption(pg: RtPage, rd0: RtRender, n: IRNode, path: text, bases: [int]) -> RtOptions:
+    proc rtEachOption(pg: RtPage, rd0: RtRender, n: IRNode, path: text, bases: [int]) -> RtOptions uses io.net:
         let mut rd = rd0
         let mut values = []
         let mut labels = []
@@ -849,7 +1075,7 @@ app RenderHTML:
         return RtOut{v: tv2, sc: sc0}
 
     # ── the walk ────────────────────────────────────────────────────────
-    proc rtChildren(pg: RtPage, rd0: RtRender, nodes: [IRNode], path: text, base: int) -> RtRender:
+    proc rtChildren(pg: RtPage, rd0: RtRender, nodes: [IRNode], path: text, base: int) -> RtRender uses io.net:
         let mut rd = rd0
         let mut b = base
         let mut i = 0
@@ -862,7 +1088,7 @@ app RenderHTML:
             i = i + 1
         return rd
 
-    proc rtMatch(pg: RtPage, rd0: RtRender, n: IRNode, path: text, bases: [int]) -> RtRender:
+    proc rtMatch(pg: RtPage, rd0: RtRender, n: IRNode, path: text, bases: [int]) -> RtRender uses io.net:
         let mut rd = rd0
         let cr = do rtEvalOpt(n.cond, rd.sc, bases[8])
         rd.sc = cr.sc
@@ -896,7 +1122,7 @@ app RenderHTML:
         return rd
 
     # rtNode: renderer.node — one IR node to HTML.
-    proc rtNode(pg: RtPage, rd0: RtRender, n0: IRNode, path: text, base: int) -> RtRender:
+    proc rtNode(pg: RtPage, rd0: RtRender, n0: IRNode, path: text, base: int) -> RtRender uses io.net:
         let mut rd = rd0
         let mut n = n0
         let mut entered = rd.sc
@@ -936,7 +1162,7 @@ app RenderHTML:
             let sr = do rtSegsToString(pg, rd.sc, n.segs, bases[0])
             let ar = do rtAttrText(pg, sr.sc, n.alt, bases[5])
             rd.sc = ar.sc
-            rd.html = rd.html + "<img" + rtNodeAttrs("fa-image", n.class, n) + " src=\"" + rtEsc(rtMediaSrc(sr.v.t)) + "\" alt=\"" + ar.v.t + "\">"
+            rd.html = rd.html + "<img" + rtNodeAttrs("fa-image", n.class, n) + " src=\"" + rtEsc(rtMediaSrcFor(pg.mediaTTL, pg.signKey, sr.v.t)) + "\" alt=\"" + ar.v.t + "\">"
             return rd
         if kind == "icon":
             let ir = do rtAttrText(pg, rd.sc, n.segs, bases[0])
@@ -954,7 +1180,7 @@ app RenderHTML:
                 let pr = do rtSegsToString(pg, rd.sc, n.poster, bases[6])
                 rd.sc = pr.sc
                 if pr.v.t != "":
-                    extra = extra + " poster=\"" + rtEsc(rtMediaSrc(pr.v.t)) + "\""
+                    extra = extra + " poster=\"" + rtEsc(rtMediaSrcFor(pg.mediaTTL, pg.signKey, pr.v.t)) + "\""
             if n.autoplay:
                 extra = extra + " autoplay playsinline"
             if n.loopFlag:
@@ -963,7 +1189,7 @@ app RenderHTML:
                 extra = extra + " muted"
             let vsr = do rtSegsToString(pg, rd.sc, n.segs, bases[0])
             rd.sc = vsr.sc
-            rd.html = rd.html + "<video" + rtNodeAttrs("fa-video", n.class, n) + " controls src=\"" + rtEsc(rtMediaSrc(vsr.v.t)) + "\"" + extra + aria + "></video>"
+            rd.html = rd.html + "<video" + rtNodeAttrs("fa-video", n.class, n) + " controls src=\"" + rtEsc(rtMediaSrcFor(pg.mediaTTL, pg.signKey, vsr.v.t)) + "\"" + extra + aria + "></video>"
             return rd
         if kind == "richtext":
             let rsr = do rtSegsToString(pg, rd.sc, n.segs, bases[0])

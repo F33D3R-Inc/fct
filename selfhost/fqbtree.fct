@@ -106,99 +106,67 @@ app FqBTreeSelfHost:
 
     # ── byte helpers ────────────────────────────────────────────────────
     proc btCmp(a: [int], b: [int]) -> int:
-        let na = len(a)
-        let nb = len(b)
-        let mut i = 0
-        loop i < na && i < nb:
-            if a[i] < b[i]:
-                return -1
-            if a[i] > b[i]:
-                return 1
-            i = i + 1
-        if na < nb:
-            return -1
-        if na > nb:
-            return 1
-        return 0
+        return bytesCmp(a, b)
 
     proc btRange(bs: [int], from: int, to: int) -> [int]:
-        let mut out = bytes(to - from)
-        let mut i = from
-        loop i < to:
-            out[i - from] = bs[i]
-            i = i + 1
-        return out
+        return slice(bs, from, to)
 
     proc btConcat(a: [int], b: [int]) -> [int]:
-        let na = len(a)
-        let nb = len(b)
-        let mut out = bytes(na + nb)
-        let mut i = 0
-        loop i < na:
-            out[i] = a[i]
-            i = i + 1
-        let mut j = 0
-        loop j < nb:
-            out[na + j] = b[j]
-            j = j + 1
-        return out
+        return a + b
 
     proc btHasPrefix(key: [int], prefix: [int]) -> bool:
         let n = len(prefix)
         if len(key) < n:
             return false
-        let mut i = 0
-        loop i < n:
-            if key[i] != prefix[i]:
-                return false
-            i = i + 1
-        return true
+        return bytesCmpRange(key, 0, n, prefix, 0, n) == 0
 
     # ── cells ───────────────────────────────────────────────────────────
     proc btLeafCell(key: [int], value: [int]) -> [int]:
         let nk = len(key)
-        let head = [nk % 256, (nk / 256) % 256]
-        let a = do btConcat(head, key)
-        let b = do btConcat(a, value)
-        return b
+        let mut head = bytes(2)
+        head[0] = nk % 256
+        head[1] = (nk / 256) % 256
+        return head + key + value
 
     proc btLeafKey(cell: [int]) -> [int]:
         if len(cell) < 2:
             return []
-        let n = cell[0] + cell[1] * 256
+        let n = uintLE(cell, 0, 2)
         if len(cell) < 2 + n:
             return []
-        let r = do btRange(cell, 2, 2 + n)
-        return r
+        return slice(cell, 2, 2 + n)
 
     proc btLeafValue(cell: [int]) -> [int]:
         if len(cell) < 2:
             return []
-        let n = cell[0] + cell[1] * 256
+        let n = uintLE(cell, 0, 2)
         if len(cell) < 2 + n:
             return []
-        let r = do btRange(cell, 2 + n, len(cell))
-        return r
+        return slice(cell, 2 + n, len(cell))
 
     proc btBranchCell(key: [int], child: int) -> [int]:
         let nk = len(key)
-        let head = [nk % 256, (nk / 256) % 256, child % 256, (child / 256) % 256, (child / 65536) % 256, (child / 16777216) % 256]
-        let r = do btConcat(head, key)
-        return r
+        let mut head = bytes(6)
+        head[0] = nk % 256
+        head[1] = (nk / 256) % 256
+        head[2] = child % 256
+        head[3] = (child / 256) % 256
+        head[4] = (child / 65536) % 256
+        head[5] = (child / 16777216) % 256
+        return head + key
 
     proc btBranchKey(cell: [int]) -> [int]:
         if len(cell) < 6:
             return []
-        let n = cell[0] + cell[1] * 256
+        let n = uintLE(cell, 0, 2)
         if len(cell) < 6 + n:
             return []
-        let r = do btRange(cell, 6, 6 + n)
-        return r
+        return slice(cell, 6, 6 + n)
 
     proc btBranchChild(cell: [int]) -> int:
         if len(cell) < 6:
             return 0
-        return cell[2] + cell[3] * 256 + cell[4] * 65536 + cell[5] * 16777216
+        return uintLE(cell, 2, 4)
 
     struct FqSlot:
         slot: int
@@ -216,13 +184,16 @@ app FqBTreeSelfHost:
         return c
 
     proc btBranchChildFor(page: [int], key: [int]) -> FqSlot:
+        # each separator compared in place: the cell's key sits at
+        # offset+6 (a 2-byte key length, a 4-byte child) for its length
         let mut slot = 0
-        let n = do pgSlotCount(page)
+        let n = uintLE(page, 6, 2)
+        let nk = len(key)
         let mut i = 0
         loop i < n:
-            let cell = do pgCell(page, i)
-            let bk = do btBranchKey(cell)
-            let c = do btCmp(bk, key)
+            let off = uintLE(page, 24 + i * 4, 2)
+            let kl = uintLE(page, off, 2)
+            let c = bytesCmpRange(page, off + 6, off + 6 + kl, key, 0, nk)
             if c <= 0:
                 slot = i + 1
             else:
@@ -249,13 +220,16 @@ app FqBTreeSelfHost:
         found: bool
 
     proc btLeafSearch(page: [int], key: [int]) -> FqSearch:
+        # each probed key compared in place: the cell's key sits at
+        # offset+2 (a 2-byte key length) for its length
         let mut low = 0
-        let mut high = do pgSlotCount(page)
+        let mut high = uintLE(page, 6, 2)
+        let nk = len(key)
         loop low < high:
             let mid = (low + high) / 2
-            let cell = do pgCell(page, mid)
-            let lk = do btLeafKey(cell)
-            let c = do btCmp(lk, key)
+            let off = uintLE(page, 24 + mid * 4, 2)
+            let kl = uintLE(page, off, 2)
+            let c = bytesCmpRange(page, off + 2, off + 2 + kl, key, 0, nk)
             if c < 0:
                 low = mid + 1
             else:
@@ -267,60 +241,65 @@ app FqBTreeSelfHost:
 
     # btCells: page_cells — every cell, flattened: the cell bytes of each
     # in turn with their lengths alongside (a list of lists is not a type).
+    # (offs: where each cell starts in data, so a cell is one slice — a
+    # split reads every cell, and summing lengths per cell made it
+    # quadratic in the page's cell count.)
     struct FqCells:
         lens: [int]
+        offs: [int]
         data: [int]
 
     proc btPageCells(page: [int]) -> FqCells:
         let n = do pgSlotCount(page)
         let mut lens = []
-        let mut data = []
+        let mut offs = []
+        let mut data = bytes(0)
         let mut i = 0
         loop i < n:
             let cell = do pgCell(page, i)
+            offs = append(offs, len(data))
             lens = append(lens, len(cell))
-            let nc = len(cell)
-            let mut j = 0
-            loop j < nc:
-                data = append(data, cell[j])
-                j = j + 1
+            data = data + cell
             i = i + 1
-        return FqCells{lens: lens, data: data}
+        return FqCells{lens: lens, offs: offs, data: data}
 
     proc btCellAt(cs: FqCells, index: int) -> [int]:
-        let mut off = 0
-        let mut i = 0
-        loop i < index:
-            off = off + cs.lens[i]
-            i = i + 1
-        let r = do btRange(cs.data, off, off + cs.lens[index])
-        return r
+        let off = cs.offs[index]
+        return slice(cs.data, off, off + cs.lens[index])
 
     # btCellsEdit: cells with `index` replaced (replace) or `cell` inserted
     # before it.
     proc btCellsEdit(cs: FqCells, index: int, cell: [int], replace: bool) -> FqCells:
+        # the cells before `index`, the new cell, the cells from `index`
+        # (or after it, replacing) — three slices, one concatenation
         let n = len(cs.lens)
+        let cut = do btCellsStart(cs, index)
+        let mut resume = cut
+        if replace && index < n:
+            resume = cut + cs.lens[index]
+        let data = slice(cs.data, 0, cut) + cell + slice(cs.data, resume, len(cs.data))
         let mut lens = []
-        let mut data = []
+        let mut offs = []
+        let mut off = 0
         let mut i = 0
         loop i <= n:
             if i == index:
+                offs = append(offs, off)
                 lens = append(lens, len(cell))
-                let nc = len(cell)
-                let mut k = 0
-                loop k < nc:
-                    data = append(data, cell[k])
-                    k = k + 1
-            if i < n && !(replace && i == index):
-                let c = do btCellAt(cs, i)
-                lens = append(lens, len(c))
-                let nc2 = len(c)
-                let mut k2 = 0
-                loop k2 < nc2:
-                    data = append(data, c[k2])
-                    k2 = k2 + 1
+                off = off + len(cell)
+            if i < n:
+                if !(replace && i == index):
+                    offs = append(offs, off)
+                    lens = append(lens, cs.lens[i])
+                    off = off + cs.lens[i]
             i = i + 1
-        return FqCells{lens: lens, data: data}
+        return FqCells{lens: lens, offs: offs, data: data}
+
+    # btCellsStart: where cell `index` starts in data (its end, at n).
+    proc btCellsStart(cs: FqCells, index: int) -> int:
+        if index < len(cs.offs):
+            return cs.offs[index]
+        return len(cs.data)
 
     proc btFits(cs: FqCells, from: int, to: int) -> bool:
         let mut used = 0
@@ -422,12 +401,7 @@ app FqBTreeSelfHost:
         return o
 
     proc btGetN(b: [int], at: int, n: int) -> int:
-        let mut v = 0
-        let mut i = n - 1
-        loop i >= 0:
-            v = v * 256 + b[at + i]
-            i = i - 1
-        return v
+        return uintLE(b, at, n)
 
     proc btMetaEncode(m: FqMeta) -> [int]:
         let mut count = len(m.free)
@@ -908,6 +882,17 @@ app FqBTreeSelfHost:
         let e2 = do btInsErr(r.tree, "tree insert reached a " + kn + " page")
         return e2
 
+    # btRoom: whether `need` bytes fit on the page, compacting allowed —
+    # reclaimable_space >= need, answered from the contiguous free space
+    # (never more than the reclaimable space) whenever that already does,
+    # so the per-slot sum runs only for a page with holes that matter.
+    proc btRoom(page: [int], need: int) -> bool:
+        let fs = do pgFreeSpace(page)
+        if fs >= need:
+            return true
+        let r = do pgReclaimableSpace(page)
+        return r >= need
+
     proc btKept(t: FqBTree, id: int) -> FqIns:
         return FqIns{ok: true, err: "", tree: t, split: false, left: id, separator: [], right: 0}
 
@@ -920,10 +905,10 @@ app FqBTreeSelfHost:
         let page = cw.body
         let cell = do btLeafCell(key, value)
         let s = do btLeafSearch(page, key)
-        let reclaim = do pgReclaimableSpace(page)
         if s.found:
             let oldLen = do pgSlotLength(page, s.index)
-            if reclaim + oldLen >= len(cell):
+            let fitsR = do btRoom(page, len(cell) - oldLen)
+            if fitsR:
                 let rp = do pgReplaceCell(page, s.index, cell)
                 let w = do btWrite(cw.tree, id, rp.body)
                 if !w.ok:
@@ -932,7 +917,8 @@ app FqBTreeSelfHost:
                 let kr = do btKept(w.tree, id)
                 return kr
         else:
-            if reclaim >= len(cell) + 4:
+            let fitsI = do btRoom(page, len(cell) + 4)
+            if fitsI:
                 let ip = do pgInsertCell(page, s.index, cell)
                 let w2 = do btWrite(cw.tree, id, ip.body)
                 if !w2.ok:
@@ -996,8 +982,8 @@ app FqBTreeSelfHost:
             return e3
         let page = do btSetBranchChild(cw2.body, sc.slot, sub.left)
         let cell = do btBranchCell(sub.separator, sub.right)
-        let reclaim = do pgReclaimableSpace(page)
-        if reclaim >= len(cell) + 4:
+        let fitsB = do btRoom(page, len(cell) + 4)
+        if fitsB:
             let ip = do pgInsertCell(page, sc.slot, cell)
             let w2 = do btWrite(cw2.tree, cw2.id, ip.body)
             if !w2.ok:

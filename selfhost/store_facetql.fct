@@ -1,0 +1,525 @@
+import "session_store.fct"
+import "fabric_facetql_client.fct"
+
+app StoreFacetQL:
+    # store_facetql.fct — runtime/fqstore.go: the runtime's durable store, a
+    # FacetQL engine reached over HTTP (FACET_DATABASE_URL =
+    # facetql://[token@]host:port), through the client the fabric port
+    # already speaks (fabric_facetql_client.fct / fabric_facetql_wire.fct).
+    # A row is one node: kind = the entity, address = "Entity:<id zero-
+    # padded to 19>", data = the row's columns as JSON (int and relation
+    # columns as numbers, bool as bool, everything else as text; a @secret
+    # column sealed with AES-256-GCM under the key derived from
+    # FACET_SECRET, spelled `fctenc:` + base64url(nonce || ciphertext)).
+    # At boot (Init) the app's indexes and references are declared through
+    # the admin endpoints — a token without admin rights is warned about
+    # and the rows still load — and every entity's rows are paged in by id.
+    # An action's writes commit as one /transaction (insert_node /
+    # delete_node / clear_kind; a later save of the same address supersedes
+    # the earlier one in place); a refused commit fails the request.
+    struct RtStoreOpen:
+        ok: bool
+        err: text
+        base: text
+        token: text
+
+    # rtParseFacetQLURL: parseFacetQLURL — the host, the token (the password
+    # when one is given, else the user), http unless ?tls=1.
+    proc rtParseFacetQLURL(raw: text) -> RtStoreOpen:
+        let isFql = do rtHasPrefix(raw, "facetql://")
+        if !isFql:
+            return RtStoreOpen{ok: false, err: "FACET_DATABASE_URL \"" + raw + "\" is not a FacetQL (facetql://…) URL", base: "", token: ""}
+        let mut rest = slice(raw, 10, len(raw))
+        let mut query = ""
+        let q = do rtIndexOfText(rest, "?")
+        if q >= 0:
+            query = slice(rest, q + 1, len(rest))
+            rest = slice(rest, 0, q)
+        let sl = do rtIndexOfText(rest, "/")
+        if sl >= 0:
+            rest = slice(rest, 0, sl)
+        let mut token = ""
+        let at = do rtLastIndexOf(rest, "@")
+        if at >= 0:
+            let user = slice(rest, 0, at)
+            rest = slice(rest, at + 1, len(rest))
+            let colon = do rtIndexOfText(user, ":")
+            if colon >= 0:
+                token = slice(user, colon + 1, len(user))
+                if token == "":
+                    token = slice(user, 0, colon)
+            else:
+                token = user
+        if rest == "":
+            return RtStoreOpen{ok: false, err: "FACET_DATABASE_URL \"" + raw + "\" has no host (expected facetql://[token@]host:port)", base: "", token: ""}
+        let mut scheme = "http"
+        let tls = do rtQueryValue(query, "tls")
+        if tls == "1":
+            scheme = "https"
+        return RtStoreOpen{ok: true, err: "", base: scheme + "://" + rest, token: token}
+
+    proc rtLastIndexOf(s: text, sub: text) -> int:
+        let mut i = len(s) - len(sub)
+        loop i >= 0:
+            if slice(s, i, i + len(sub)) == sub:
+                return i
+            i = i - 1
+        return -1
+
+    proc rtFqlClient(w: RtWorld) -> FqlClient:
+        return FqlClient{endpoint: FqlEndpoint{dbmsId: "facet", baseUrl: w.fqlBase, token: w.fqlToken}, timeoutMs: 15000, trustFile: ""}
+
+    # ── addresses and rows ──────────────────────────────────────────────
+    proc rtFqAddress(entity: text, id: int) -> text:
+        let mut digits = "" + id
+        loop len(digits) < 19:
+            digits = "0" + digits
+        return entity + ":" + digits
+
+    proc rtColumns(e: IREntity) -> [text]:
+        let mut cols = ["id"]
+        let mut i = 0
+        loop i < len(e.fields):
+            if e.fields[i].name != "id":
+                cols = append(cols, e.fields[i].name)
+            i = i + 1
+        return cols
+
+    proc rtFieldOfEntity(e: IREntity, name: text) -> IRField:
+        let mut i = 0
+        loop i < len(e.fields):
+            if e.fields[i].name == name:
+                return e.fields[i]
+            i = i + 1
+        return IRField{name: "id", type: "int", ref: "", enumName: "", index: false, secret: false, e2e: false, password: false, readPolicy: "", optional: false, unique: false, required: false, hasMin: false, min: 0, hasMax: false, max: 0, matches: "", onDelete: ""}
+
+    # rtEncryptSecret / rtDecryptSecret: secret.go's at-rest sealing.
+    proc rtEncryptSecret(w: RtWorld, plain: text) -> text:
+        if plain == "":
+            return ""
+        let nonce = randomBytes(12)
+        let sealed = aesGcmSeal(w.encKey, nonce, textToBytes(plain))
+        return "fctenc:" + base64UrlRaw(nonce + sealed)
+
+    proc rtDecryptSecret(w: RtWorld, stored: text) -> text:
+        let pt = do rtOpenSealed(w.encKey, stored)
+        return pt
+
+    # rtColValue: colValue — what a column stores for a value.
+    proc rtColValue(w: RtWorld, f: IRField, v: Val) -> Val:
+        if f.ref != "" || f.type == "int":
+            let iv = do intVal(valToInt(v))
+            return iv
+        if f.type == "bool":
+            let bv = do boolVal(valTruthy(v))
+            return bv
+        let mut s = do valToStr(v)
+        if f.secret:
+            s = do rtEncryptSecret(w, s)
+        let tv = do textVal(s)
+        return tv
+
+    # rtRowData: rowNode's data — the row's columns as JSON.
+    proc rtRowData(w: RtWorld, e: IREntity, row: Val) -> text:
+        let cols = do rtColumns(e)
+        let mut keys = []
+        let mut vals = []
+        let mut i = 0
+        loop i < len(cols):
+            let f = do rtFieldOfEntity(e, cols[i])
+            let v = do valGet(row, cols[i])
+            keys = append(keys, cols[i])
+            vals = append(vals, rtColValue(w, f, v))
+            i = i + 1
+        let j = do rtValJSON(recordVal(keys, vals))
+        return j
+
+    # rtNormalize: normalize — a stored value back into a row.
+    proc rtNormalize(w: RtWorld, f: IRField, v: JVal) -> Val:
+        if v.kind == "none" || v.kind == "null":
+            if f.ref != "" || f.type == "int":
+                let z = do intVal(0)
+                return z
+            if f.type == "float":
+                let fz = do floatVal(0.0)
+                return fz
+            if f.type == "bool":
+                let bz = do boolVal(false)
+                return bz
+            let tz = do textVal("")
+            return tz
+        if v.kind == "num":
+            if f.type == "float":
+                let fv = do floatVal(toFloat(v.s))
+                return fv
+            let iv = do intVal(toInt(v.s))
+            return iv
+        if v.kind == "bool":
+            let bv = do boolVal(v.s == "true")
+            return bv
+        if v.kind == "str":
+            let mut s = v.s
+            if f.secret:
+                s = do rtDecryptSecret(w, s)
+            let tv = do textVal(s)
+            return tv
+        let rv = do rtJValToVal(v)
+        return rv
+
+    proc rtNodeRecord(w: RtWorld, e: IREntity, data: text) -> Val:
+        let mut raw = do jNone()
+        if data != "":
+            raw = do jsonParse(data)
+        let cols = do rtColumns(e)
+        let mut keys = []
+        let mut vals = []
+        let mut i = 0
+        loop i < len(cols):
+            let f = do rtFieldOfEntity(e, cols[i])
+            let jv = do jGet(raw, cols[i])
+            keys = append(keys, cols[i])
+            vals = append(vals, rtNormalize(w, f, jv))
+            i = i + 1
+        let r = do recordVal(keys, vals)
+        return r
+
+    # ── opening, migrating and loading ──────────────────────────────────
+    struct RtStoreResult:
+        ok: bool
+        err: text
+        w: RtWorld
+
+    proc rtStoreOpen(w0: RtWorld, dsn: text) -> RtStoreResult uses io.net, io.console:
+        let mut w = w0
+        let p = do rtParseFacetQLURL(dsn)
+        if !p.ok:
+            return RtStoreResult{ok: false, err: p.err, w: w}
+        w.fqlBase = p.base
+        w.fqlToken = p.token
+        w.storeOn = true
+        let c = do rtFqlClient(w)
+        let ping = do fqlSend(c, "GET", fqlEndpointUrl(c.endpoint, "/"), false, "", "GET /")
+        if !ping.ok:
+            return RtStoreResult{ok: false, err: "connect to FacetQL at " + p.base + ": " + fqlErrorDisplay(ping.err), w: w}
+        let mig = do rtStoreMigrate(w)
+        if !mig.ok:
+            return RtStoreResult{ok: false, err: mig.err, w: w}
+        let loaded = do rtStoreLoad(w)
+        return loaded
+
+    struct RtAdminList:
+        ok: bool
+        forbidden: bool
+        missing: bool
+        err: text
+        items: JVal
+
+    proc rtAdminList(w: RtWorld, path: text) -> RtAdminList uses io.net:
+        let c = do rtFqlClient(w)
+        let r = do fqlSend(c, "GET", fqlEndpointUrl(c.endpoint, path), false, "", "GET " + path)
+        let none = do jNone()
+        if !r.ok:
+            if r.err.kind == "Unauthorized" && r.err.status == 403:
+                return RtAdminList{ok: false, forbidden: true, missing: false, err: fqlErrorDisplay(r.err), items: none}
+            if r.err.kind == "NotFound":
+                return RtAdminList{ok: false, forbidden: false, missing: true, err: fqlErrorDisplay(r.err), items: none}
+            return RtAdminList{ok: false, forbidden: false, missing: false, err: fqlErrorDisplay(r.err), items: none}
+        let items = do jsonParse(r.body)
+        return RtAdminList{ok: true, forbidden: false, missing: false, err: "", items: items}
+
+    proc rtHasIndexDef(items: JVal, kind: text, field: text) -> int:
+        let mut i = 0
+        loop i < len(items.vals):
+            let k = do jStr(items.vals[i], "kind")
+            let f = do jStr(items.vals[i], "field")
+            if k == kind && f == field:
+                return i
+            i = i + 1
+        return -1
+
+    # rtStoreMigrate: Migrate(apply) — every index the app needs (a `index`
+    # field, the reserved job indexes, a unique index on every referenced
+    # entity's id) and every reference, declared unless already present.
+    proc rtStoreMigrate(w: RtWorld) -> RtStoreResult uses io.net, io.console:
+        let g = w.g
+        let have = do rtAdminList(w, "/admin/indexes")
+        if !have.ok:
+            if have.forbidden:
+                let warn = writeStderr("facet: declaring FacetQL indexes and references needs an admin identity, and this token is not one (FACETQL_TOKEN, or the token in FACET_DATABASE_URL): /admin/indexes and /admin/references are admin-only\n")
+                return RtStoreResult{ok: true, err: "", w: w}
+            return RtStoreResult{ok: false, err: "list FacetQL indexes: " + have.err, w: w}
+        let mut wantKinds = []
+        let mut wantFields = []
+        let mut wantUnique = []
+        let mut e = 0
+        loop e < len(g.entities):
+            let ent = g.entities[e]
+            if !ent.ephemeral:
+                let mut f = 0
+                loop f < len(ent.fields):
+                    if ent.fields[f].index:
+                        let at = do rtWantIndex(wantKinds, wantFields, ent.name, ent.fields[f].name)
+                        if at < 0:
+                            wantKinds = append(wantKinds, ent.name)
+                            wantFields = append(wantFields, ent.fields[f].name)
+                            wantUnique = append(wantUnique, false)
+                    f = f + 1
+            e = e + 1
+        let reservedKinds = ["__job", "__job"]
+        let reservedFields = ["status", "run_at_unix"]
+        let mut r = 0
+        loop r < 2:
+            let at2 = do rtWantIndex(wantKinds, wantFields, reservedKinds[r], reservedFields[r])
+            if at2 < 0:
+                wantKinds = append(wantKinds, reservedKinds[r])
+                wantFields = append(wantFields, reservedFields[r])
+                wantUnique = append(wantUnique, false)
+            r = r + 1
+        let mut e2 = 0
+        loop e2 < len(g.entities):
+            let ent2 = g.entities[e2]
+            if !ent2.ephemeral:
+                let mut f2 = 0
+                loop f2 < len(ent2.fields):
+                    if ent2.fields[f2].ref != "":
+                        let at3 = do rtWantIndex(wantKinds, wantFields, ent2.fields[f2].ref, "id")
+                        if at3 < 0:
+                            wantKinds = append(wantKinds, ent2.fields[f2].ref)
+                            wantFields = append(wantFields, "id")
+                            wantUnique = append(wantUnique, true)
+                        else:
+                            wantUnique[at3] = true
+                    f2 = f2 + 1
+            e2 = e2 + 1
+        let c = do rtFqlClient(w)
+        let mut i = 0
+        loop i < len(wantKinds):
+            let existing = do rtHasIndexDef(have.items, wantKinds[i], wantFields[i])
+            if existing >= 0:
+                let isUnique = do jBool(have.items.vals[existing], "unique")
+                if wantUnique[i] && !isUnique:
+                    let dname = do jStr(have.items.vals[existing], "name")
+                    return RtStoreResult{ok: false, err: "unique index on " + wantKinds[i] + "." + wantFields[i] + ": index \"" + dname + "\" already covers " + wantKinds[i] + "." + wantFields[i] + " but does not make it unique, and a reference to " + wantKinds[i] + " needs it to (a value two rows can hold names neither of them). Drop it (`facetql index drop " + dname + "`) and re-run migrate", w: w}
+            else:
+                let name = do rtSafeName("idx_" + wantKinds[i] + "_" + wantFields[i], wantKinds[i], wantFields[i])
+                let body = "{\"name\":" + jsonQuote(name) + ",\"kind\":" + jsonQuote(wantKinds[i]) + ",\"field\":" + jsonQuote(wantFields[i]) + ",\"unique\":" + rtBoolWord(wantUnique[i]) + "}"
+                let made = do fqlPostJson(c, "/admin/indexes", body, "POST /admin/indexes")
+                if !made.ok:
+                    if made.err.kind == "Unauthorized" && made.err.status == 403:
+                        let warn2 = writeStderr("facet: declaring FacetQL indexes and references needs an admin identity, and this token is not one (FACETQL_TOKEN, or the token in FACET_DATABASE_URL): /admin/indexes and /admin/references are admin-only\n")
+                        return RtStoreResult{ok: true, err: "", w: w}
+                    return RtStoreResult{ok: false, err: "create index on " + wantKinds[i] + "." + wantFields[i] + ": " + fqlErrorDisplay(made.err), w: w}
+            i = i + 1
+        # references
+        let mut refEnts = []
+        let mut refFields = []
+        let mut refParents = []
+        let mut refOnDelete = []
+        let mut e3 = 0
+        loop e3 < len(g.entities):
+            let ent3 = g.entities[e3]
+            let mut f3 = 0
+            # the store is handed the durable entities only (attachStore): an
+            # @ephemeral one has no rows there, so no reference either
+            loop f3 < len(ent3.fields) && !ent3.ephemeral:
+                if ent3.fields[f3].ref != "":
+                    refEnts = append(refEnts, ent3.name)
+                    refFields = append(refFields, ent3.fields[f3].name)
+                    refParents = append(refParents, ent3.fields[f3].ref)
+                    refOnDelete = append(refOnDelete, rtOnDeleteWord(ent3.fields[f3].onDelete))
+                f3 = f3 + 1
+            e3 = e3 + 1
+        let haveRefs = do rtAdminList(w, "/admin/references")
+        if !haveRefs.ok:
+            if haveRefs.missing:
+                if len(refEnts) == 0:
+                    return RtStoreResult{ok: true, err: "", w: w}
+                return RtStoreResult{ok: false, err: "this FacetQL has no /admin/references: it predates referential integrity, so it cannot cascade a delete to the rows that referenced it and this app has " + len(refEnts) + " relation(s) that depend on that. Upgrade the engine (" + haveRefs.err + ")", w: w}
+            if haveRefs.forbidden:
+                let warn3 = writeStderr("facet: declaring FacetQL indexes and references needs an admin identity, and this token is not one (FACETQL_TOKEN, or the token in FACET_DATABASE_URL): /admin/indexes and /admin/references are admin-only\n")
+                return RtStoreResult{ok: true, err: "", w: w}
+            return RtStoreResult{ok: false, err: "list FacetQL references: " + haveRefs.err, w: w}
+        let mut k = 0
+        loop k < len(refEnts):
+            let existingRef = do rtHasIndexDef(haveRefs.items, refEnts[k], refFields[k])
+            if existingRef >= 0:
+                let d = haveRefs.items.vals[existingRef]
+                let pk = do jStr(d, "parent_kind")
+                let pf = do jStr(d, "parent_field")
+                let od = do jStr(d, "on_delete")
+                if pk != refParents[k] || pf != "id" || od != refOnDelete[k]:
+                    let dn = do jStr(d, "name")
+                    return RtStoreResult{ok: false, err: "declare reference " + refEnts[k] + "." + refFields[k] + " -> " + refParents[k] + ".id on delete " + refOnDelete[k] + ": reference \"" + dn + "\" already governs " + refEnts[k] + "." + refFields[k] + ", but as " + pk + "." + pf + " on delete " + od + " — one field cannot have two deletion rules. Drop it (`facetql reference drop " + dn + "`) and re-run migrate", w: w}
+            else:
+                let rname = do rtSafeName("fk_" + refEnts[k] + "_" + refFields[k], refEnts[k], refFields[k])
+                let rbody = "{\"name\":" + jsonQuote(rname) + ",\"kind\":" + jsonQuote(refEnts[k]) + ",\"field\":" + jsonQuote(refFields[k]) + ",\"parent_kind\":" + jsonQuote(refParents[k]) + ",\"parent_field\":\"id\",\"on_delete\":" + jsonQuote(refOnDelete[k]) + "}"
+                let madeRef = do fqlPostJson(c, "/admin/references", rbody, "POST /admin/references")
+                if !madeRef.ok:
+                    if madeRef.err.kind == "Unauthorized" && madeRef.err.status == 403:
+                        let warn4 = writeStderr("facet: declaring FacetQL indexes and references needs an admin identity, and this token is not one (FACETQL_TOKEN, or the token in FACET_DATABASE_URL): /admin/indexes and /admin/references are admin-only\n")
+                        return RtStoreResult{ok: true, err: "", w: w}
+                    return RtStoreResult{ok: false, err: "declare reference " + refEnts[k] + "." + refFields[k] + ": " + fqlErrorDisplay(madeRef.err), w: w}
+            k = k + 1
+        return RtStoreResult{ok: true, err: "", w: w}
+
+    proc rtWantIndex(kinds: [text], fields: [text], kind: text, field: text) -> int:
+        let mut i = 0
+        loop i < len(kinds):
+            if kinds[i] == kind && fields[i] == field:
+                return i
+            i = i + 1
+        return -1
+
+    proc rtBoolWord(b: bool) -> text:
+        if b:
+            return "true"
+        return "false"
+
+    proc rtOnDeleteWord(mode: text) -> text:
+        if mode == "restrict":
+            return "restrict"
+        if mode == "setNull":
+            return "set_null"
+        return "cascade"
+
+    # rtSafeName: fqSafeName — [A-Za-z0-9_-] only and at most 64 characters,
+    # else a hashed suffix.
+    proc rtSafeName(raw: text, entity: text, field: text) -> text:
+        let bs = textToBytes(raw)
+        let mut safe = []
+        let mut clean = true
+        let mut i = 0
+        loop i < len(bs):
+            let b = bs[i]
+            if (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 95 || b == 45:
+                safe = append(safe, b)
+            else:
+                safe = append(safe, 95)
+                clean = false
+            i = i + 1
+        if clean && len(safe) <= 64:
+            return raw
+        let suffix = "-" + slice(sha256Hex(entity + "\x00" + field), 0, 8)
+        let mut keep = safe
+        if len(keep) > 64 - len(suffix):
+            keep = slice(keep, 0, 64 - len(suffix))
+        return bytesToText(keep) + suffix
+
+    # rtStoreLoad: Init's load — every durable entity's rows, by id.
+    proc rtStoreLoad(w0: RtWorld) -> RtStoreResult uses io.net:
+        let mut w = w0
+        let c = do rtFqlClient(w)
+        let mut e = 0
+        loop e < len(w.g.entities):
+            let ent = w.g.entities[e]
+            if !ent.ephemeral:
+                let n = do sjNull()
+                let req = FqlQueryRequest{hasKind: true, kind: ent.name, hasOwner: false, owner: "", hasWhere: false, whereValue: n, hasItemVar: true, itemVar: "item", hasOrder: true, order: "id", desc: false, hasAfter: false, after: "", hasLimit: true, limit: 500}
+                let all = do fqlQueryAll(c, req)
+                if !all.ok:
+                    return RtStoreResult{ok: false, err: "load " + ent.name + ": " + fqlErrorDisplay(all.err), w: w}
+                let mut rows = []
+                let mut max = 0
+                let mut i = 0
+                loop i < len(all.v):
+                    let row = do rtNodeRecord(w, ent, all.v[i].data)
+                    let idv = do valGet(row, "id")
+                    let id = do valToInt(idv)
+                    if id > max:
+                        max = id
+                    rows = append(rows, row)
+                    i = i + 1
+                let mut live = rows
+                if ent.softDelete:
+                    live = []
+                    let mut k = 0
+                    loop k < len(rows):
+                        let av = do valGet(rows[k], "archived")
+                        let arch = do valTruthy(av)
+                        if !arch:
+                            live = append(live, rows[k])
+                        k = k + 1
+                w = do rtSetEntRows(w, ent.name, live)
+                let ei = do rtEntIndex(w, ent.name)
+                if ei >= 0:
+                    w.nextIds[ei] = max
+            e = e + 1
+        return RtStoreResult{ok: true, err: "", w: w}
+
+    # ── committing ──────────────────────────────────────────────────────
+    # rtStoreCommit: commit — the pending writes as one transaction (a
+    # later save of an address supersedes the earlier one in place; a
+    # delete or a clear stands between them), then cleared. Without a
+    # store the writes are simply dropped (the in-memory store).
+    proc rtStoreCommit(w0: RtWorld) -> RtStoreResult uses io.net:
+        let mut w = w0
+        let ops = w.pendingOps
+        w.pendingOps = []
+        if !w.storeOn || len(ops) == 0:
+            return RtStoreResult{ok: true, err: "", w: w}
+        let mut txOps = []
+        let mut liveAddrs = []
+        let mut liveAt = []
+        let mut i = 0
+        loop i < len(ops):
+            let op = ops[i]
+            if op.kind == "save":
+                let ei = do rtEntityIndex(w.g, op.entity)
+                let idv = do valGet(op.row, "id")
+                let addr = do rtFqAddress(op.entity, valToInt(idv))
+                let data = do rtRowData(w, w.g.entities[ei], op.row)
+                let tx = do fqlTxInsertNode(addr, op.entity, 0, 0, 0, 0, data, false)
+                let at = do rtIndexIn(liveAddrs, addr)
+                if at >= 0:
+                    txOps[liveAt[at]] = tx
+                else:
+                    liveAddrs = append(liveAddrs, addr)
+                    liveAt = append(liveAt, len(txOps))
+                    txOps = append(txOps, tx)
+            if op.kind == "delete":
+                let addr2 = do rtFqAddress(op.entity, op.id)
+                let dropped = do rtDropLive(liveAddrs, liveAt, addr2)
+                liveAddrs = dropped.addrs
+                liveAt = dropped.ats
+                txOps = append(txOps, fqlTxDeleteNode(addr2))
+            if op.kind == "clear":
+                let mut keepA = []
+                let mut keepAt = []
+                let mut k = 0
+                loop k < len(liveAddrs):
+                    if txOps[liveAt[k]].kind != op.entity:
+                        keepA = append(keepA, liveAddrs[k])
+                        keepAt = append(keepAt, liveAt[k])
+                    k = k + 1
+                liveAddrs = keepA
+                liveAt = keepAt
+                txOps = append(txOps, fqlTxClearKind(op.entity))
+            i = i + 1
+        let c = do rtFqlClient(w)
+        let r = do fqlTransaction(c, txOps)
+        if !r.ok:
+            return RtStoreResult{ok: false, err: "commit failed: " + fqlErrorDisplay(r.err), w: w}
+        return RtStoreResult{ok: true, err: "", w: w}
+
+    struct RtLiveOps:
+        addrs: [text]
+        ats: [int]
+
+    proc rtDropLive(addrs: [text], ats: [int], addr: text) -> RtLiveOps:
+        let mut a = []
+        let mut t = []
+        let mut i = 0
+        loop i < len(addrs):
+            if addrs[i] != addr:
+                a = append(a, addrs[i])
+                t = append(t, ats[i])
+            i = i + 1
+        return RtLiveOps{addrs: a, ats: t}
+
+    proc rtIndexIn(xs: [text], s: text) -> int:
+        let mut i = 0
+        loop i < len(xs):
+            if xs[i] == s:
+                return i
+            i = i + 1
+        return -1

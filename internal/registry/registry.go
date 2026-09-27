@@ -137,7 +137,17 @@ import (
 // listenOn and listenTls now accept — can say which ephemeral port the
 // operating system gave it: the one way to start a server with no window
 // in which another process can take its port first.
-var ToolchainVersion = "1.42.0"
+//
+// Bumped 1.42.0 → 1.43.0 for the byte-level primitives a binary format is
+// read with — `bytesCmp(a, b)`, `bytesCmpRange(a, aFrom, aTo, b, bFrom,
+// bTo)`, `uintLE(b, at, n)`, `toHex(b)`, `fromHex(s)` — each a per-byte
+// loop the interpreter could not make cheap and the self-hosted FacetQL
+// engine's B+tree runs on every probe.
+//
+// Bumped 1.43.0 → 1.44.0 for `exp(x)`, `ln(x)` and `sqrt(x)` (authority
+// only): the ranking model a feed is scored with is written in a cosine, a
+// Gaussian, a sigmoid and an exponential decay, none expressible before.
+var ToolchainVersion = "1.44.0"
 
 // CheckToolchainRange reports whether the running ToolchainVersion satisfies a
 // `facet` manifest range, returning a clear "upgrade the toolchain" error when

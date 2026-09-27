@@ -1155,6 +1155,11 @@ func (s *Server) callServiceSync(sv ir.Service, op string, body map[string]any, 
 // coerceRet coerces a decoded service result to its declared return type — a
 // scalar via coerce, or each element of a list.
 func (s *Server) coerceRet(v any, ret string, list bool) any {
+	if _, isMap := v.(map[any]any); isMap {
+		// A proc's map return (`-> {K: V}`): its values were converted when
+		// they were stored, so it is handed on as it is (ret names V).
+		return v
+	}
 	if !list {
 		return s.coerceOne(v, ret)
 	}
@@ -1928,6 +1933,9 @@ type actionRun struct {
 	// response headers the HTTP reply carries once the action commits.
 	headers [][2]string
 	emits   []emitted // `emit` statements, delivered after the commit
+	// runDepth counts nested `run`s (ast.RunAction). The compiler refuses a
+	// cycle of runs; this is the backstop that keeps a deep chain bounded.
+	runDepth int
 }
 
 // execActionBlock runs one statement list of an action body — the body itself,
@@ -2249,6 +2257,14 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 					s.callService(*sv, st.Field, body) // fire-and-forget
 				}
 			}
+		case "run":
+			// Another action inside this one's transaction (ast.RunAction): its
+			// gates and checks apply as they would to a request; its writes,
+			// emits and session effects join this run's, so any later failure
+			// undoes them with the caller's; its `return` ends only itself.
+			if status, msg := s.runNested(st, ar); status != http.StatusOK {
+				return status, msg
+			}
 		case "do":
 			// A proc call: same-process, synchronous, in-binary — not a network
 			// round-trip like "call" above, so there is no URL to post to and
@@ -2503,7 +2519,11 @@ func (s *Server) runCodeOwned(pc *procCode, p *ir.Proc, args []any, owned uint64
 		// declared parameter type is the contract both sides agreed to, so the
 		// boundary converts to it here — once, recursively — rather than every
 		// field read guessing at the representation it was handed.
-		v = s.procArgValue(prm.Type, prm.List, v)
+		if prm.Map {
+			v = s.procArgMap(prm.Key, prm.Type, v)
+		} else {
+			v = s.procArgValue(prm.Type, prm.List, v)
+		}
 		// Shared, not copied: unless the caller handed the value over, the
 		// parameter's slot does not own it, so the proc's first in-place
 		// write to it copies (proccompile.go).
@@ -4781,3 +4801,65 @@ const guardedPage = `<!doctype html>
 <style>body{font:16px/1.5 system-ui,sans-serif;margin:4rem auto;max-width:30rem;color:#111;padding:0 1rem}</style>
 </head><body><h1>Not available</h1><p>You don't have access to this page.</p><p><a href="/">Home</a></p></body></html>
 `
+
+// maxRunDepth bounds a chain of nested `run`s (the compiler refuses cycles).
+const maxRunDepth = 16
+
+// runNested executes `run name(args)` for the running action ar.
+func (s *Server) runNested(st ir.Stmt, ar *actionRun) (int, string) {
+	callee := s.byAction[st.Service]
+	if callee == nil {
+		return http.StatusInternalServerError, "run: unknown action " + st.Service
+	}
+	if ar.runDepth >= maxRunDepth {
+		return http.StatusInternalServerError, fmt.Sprintf("run: %s nests deeper than %d actions", st.Service, maxRunDepth)
+	}
+	// The callee sees the world, not the caller's locals: a fresh scope over
+	// the current working set and session, with the caller's identity (which
+	// an `establish` earlier in the caller may have changed).
+	scope := s.scope(ar.sid)
+	scope["actor"], scope["role"], scope["verified"] = ar.scope["actor"], ar.scope["role"], ar.scope["verified"]
+	for ent := range s.entities {
+		if !isReservedEntity(ent) {
+			scope[ent] = s.entities[ent]
+		}
+	}
+	if pr, ok := ar.scope[procRunnerKey]; ok {
+		scope[procRunnerKey] = pr
+	}
+	for i, p := range callee.Params {
+		var v any
+		if i < len(st.Args) {
+			var ok bool
+			if v, ok = paramArg(eval(st.Args[i], ar.scope), p); !ok {
+				return http.StatusBadRequest, fmt.Sprintf("%s: parameter %q expects %s", callee.Name, p.Name, paramTypeName(p))
+			}
+		} else {
+			v = paramZero(p)
+		}
+		scope[p.Name] = v
+	}
+	for _, req := range callee.Requires {
+		if !s.policyPasses(req, scope) {
+			return http.StatusForbidden, "forbidden: " + req.Name
+		}
+	}
+	child := *ar
+	child.act = callee
+	child.scope = scope
+	child.retVal, child.retStatus, child.returned = nil, 0, false
+	child.runDepth = ar.runDepth + 1
+	status, msg := s.execActionBlock(callee.Body, &child)
+	// What the callee accumulated belongs to the caller's transaction.
+	ar.ops, ar.emits, ar.headers = child.ops, child.emits, child.headers
+	ar.revokes, ar.restates, ar.rekey = child.revokes, child.restates, child.rekey
+	if status != http.StatusOK {
+		ar.errCode = child.errCode
+		return status, msg
+	}
+	if st.Bind != "" {
+		v, _ := unwrapReply(child.retVal)
+		ar.scope[st.Bind] = v
+	}
+	return http.StatusOK, ""
+}

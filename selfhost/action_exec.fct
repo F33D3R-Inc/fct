@@ -242,8 +242,9 @@ app ActionExec:
         loop rs < len(ex.restateActors):
             w = do rtRestateActor(w, ex.restateActors[rs], ex.restateRoles[rs])
             rs = rs + 1
-        if len(ex.changed) > 0:
-            w = do rtBroadcast(w, ex.changed)
+        # The entity changes fan out once the writes are durable: the loop
+        # commits pendingOps and then broadcasts pendingChanged.
+        w.pendingChanged = w.pendingChanged + ex.changed
         # replyValue: an entity-typed reply carries only what the caller may
         # receive (visibleRows).
         let mut reply = ex.retVal
@@ -505,11 +506,30 @@ app ActionExec:
             ex.restateRoles = append(ex.restateRoles, valToStr(rr0.v))
             return ex
         if op == "emit":
-            # Stream events (streams.go's fanoutEvents): the event streams
-            # are not served yet, so nothing subscribes; the payload is still
-            # evaluated for its effect on evaluation order.
+            # `emit [name] Dto{…} [to actor] [on key…]`: recorded, and fanned
+            # out to the declared streams once the action is durable
+            # (fanoutEvents after commit); a failed action emits nothing.
             let er0 = do rtEvalOpt(st.value, ex.sc, -1)
             ex.sc = er0.sc
+            let payload = do rtValJSON(er0.v)
+            let mut key = ""
+            if len(st.args) > 0:
+                let kr = do rtEvalList(st.args, ex.sc, -1)
+                ex.sc = kr.sc
+                let mut parts = []
+                let mut ki = 0
+                loop ki < len(kr.v.items):
+                    parts = append(parts, valToStr(kr.v.items[ki]))
+                    ki = ki + 1
+                key = do rtJoinTexts(parts, "\x00")
+            let mut to = ""
+            let mut targeted = false
+            if len(st.key) > 0:
+                let tr = do rtEvalOpt(st.key, ex.sc, -1)
+                ex.sc = tr.sc
+                to = do valToStr(tr.v)
+                targeted = true
+            ex.w.pendingEvents = append(ex.w.pendingEvents, RtEmitted{typ: st.field, name: st.target, payload: payload, to: to, targeted: targeted, key: key})
             return ex
         if op == "assign":
             let vr = do rtEvalOpt(st.value, ex.sc, -1)
@@ -571,6 +591,7 @@ app ActionExec:
                 row = do valSet(row, "id", intVal(id))
                 let rows = do rtEntRows(ex.w, st.entity)
                 ex.w = do rtSetEntRows(ex.w, st.entity, append(rows, row))
+                ex.w = do rtDurSave(ex.w, st.entity, row)
                 ex = do rtMarkChanged(ex, st.entity)
                 if st.bind != "":
                     ex.sc = do rtSet(ex.sc, st.bind, intVal(id))
@@ -584,6 +605,7 @@ app ActionExec:
             return rmr
         if op == "clear":
             ex.w = do rtSetEntRows(ex.w, st.entity, [])
+            ex.w = do rtDurClear(ex.w, st.entity)
             ex = do rtMarkChanged(ex, st.entity)
             ex = do rtCascade(ex, st.entity, [])
             return ex
@@ -727,6 +749,7 @@ app ActionExec:
                         cand = do rtStoreRow(ex.w.g, st.entity, cand)
                         keep = cand
                         matched = true
+                        ex.w = do rtDurSave(ex.w, st.entity, cand)
                 out = append(out, keep)
                 i = i + 1
             ex.sc = do rtRestore(ex.sc, st.itemVar, had, prev)
@@ -756,6 +779,7 @@ app ActionExec:
                     cand2 = do rtStoreRow(ex.w.g, st.entity, cand2)
                     keep2 = cand2
                     done = true
+                    ex.w = do rtDurSave(ex.w, st.entity, cand2)
             out2 = append(out2, keep2)
             j = j + 1
         if done:
@@ -792,7 +816,11 @@ app ActionExec:
                         let mid = do valGet(m, "id")
                         removed = append(removed, valToInt(mid))
                         if soft:
-                            kept = append(kept, valSet(m, "archived", boolVal(true)))
+                            let archived = do valSet(m, "archived", boolVal(true))
+                            kept = append(kept, archived)
+                            ex.w = do rtDurSave(ex.w, st.entity, archived)
+                        else:
+                            ex.w = do rtDurDelete(ex.w, st.entity, valToInt(mid))
                     else:
                         kept = append(kept, m)
                 i = i + 1
@@ -812,6 +840,12 @@ app ActionExec:
                         drop = true
                         done = true
                         removed = append(removed, valToInt(id2))
+                        if soft:
+                            let archived2 = do valSet(m2, "archived", boolVal(true))
+                            kept = append(kept, archived2)
+                            ex.w = do rtDurSave(ex.w, st.entity, archived2)
+                        else:
+                            ex.w = do rtDurDelete(ex.w, st.entity, valToInt(id2))
                 if !drop:
                     kept = append(kept, m2)
                 j = j + 1

@@ -1,5 +1,11 @@
 package runtime
 
+import (
+	"bytes"
+	"encoding/hex"
+	"fmt"
+)
+
 // bytesVal is a byte buffer as the proc engine holds it: a real []byte.
 //
 // To the language a byte buffer is an [int] whose elements are 0-255 —
@@ -110,4 +116,81 @@ func listElems(v any) ([]any, bool) {
 		return promoteBytes(t), true
 	}
 	return nil, false
+}
+
+// ── the byte-level primitives a binary format is read with ─────────────
+
+// bytesCmpBuiltin implements `bytesCmp(a, b) -> int`: the lexicographic
+// order of two buffers, -1/0/1, a shorter prefix first — what a B+tree key
+// comparison is.
+func bytesCmpBuiltin(a, b any) (any, error) {
+	x, ok := bytesOf(a)
+	if !ok {
+		return nil, fmt.Errorf("bytesCmp: the first argument is not a byte buffer")
+	}
+	y, ok := bytesOf(b)
+	if !ok {
+		return nil, fmt.Errorf("bytesCmp: the second argument is not a byte buffer")
+	}
+	return bytes.Compare(x, y), nil
+}
+
+// bytesCmpRangeBuiltin implements `bytesCmpRange(a, aFrom, aTo, b, bFrom,
+// bTo) -> int`: bytesCmp over a[aFrom..aTo) and b[bFrom..bTo), copying
+// neither — a key inside a page compared against a probe in place.
+func bytesCmpRangeBuiltin(a any, aFrom, aTo int, b any, bFrom, bTo int) (any, error) {
+	x, ok := bytesOf(a)
+	if !ok {
+		return nil, fmt.Errorf("bytesCmpRange: the first argument is not a byte buffer")
+	}
+	y, ok := bytesOf(b)
+	if !ok {
+		return nil, fmt.Errorf("bytesCmpRange: the second argument is not a byte buffer")
+	}
+	if aFrom < 0 || aTo > len(x) || aFrom > aTo {
+		return nil, fmt.Errorf("bytesCmpRange: range %d..%d is outside a buffer of %d bytes", aFrom, aTo, len(x))
+	}
+	if bFrom < 0 || bTo > len(y) || bFrom > bTo {
+		return nil, fmt.Errorf("bytesCmpRange: range %d..%d is outside a buffer of %d bytes", bFrom, bTo, len(y))
+	}
+	return bytes.Compare(x[aFrom:aTo], y[bFrom:bTo]), nil
+}
+
+// uintLEBuiltin implements `uintLE(b, at, n) -> int`: the little-endian
+// unsigned integer in b[at..at+n), n 1-8.
+func uintLEBuiltin(b any, at, n int) (any, error) {
+	x, ok := bytesOf(b)
+	if !ok {
+		return nil, fmt.Errorf("uintLE: not a byte buffer")
+	}
+	if n < 1 || n > 8 {
+		return nil, fmt.Errorf("uintLE: width %d is not 1-8 bytes", n)
+	}
+	if at < 0 || at+n > len(x) {
+		return nil, fmt.Errorf("uintLE: bytes %d..%d are outside a buffer of %d bytes", at, at+n, len(x))
+	}
+	var v uint64
+	for i := n - 1; i >= 0; i-- {
+		v = v<<8 | uint64(x[at+i])
+	}
+	return int(v), nil
+}
+
+// toHexBuiltin implements `toHex(b) -> text`: lowercase hex, two digits a byte.
+func toHexBuiltin(b any) (any, error) {
+	x, ok := bytesOf(b)
+	if !ok {
+		return nil, fmt.Errorf("toHex: not a byte buffer")
+	}
+	return hex.EncodeToString(x), nil
+}
+
+// fromHexBuiltin implements `fromHex(s) -> bytes`: toHex's inverse; text
+// that is not hex decodes to an empty buffer.
+func fromHexBuiltin(s string) (any, error) {
+	out, err := hex.DecodeString(s)
+	if err != nil {
+		return bytesVal{}, nil
+	}
+	return bytesVal(out), nil
 }

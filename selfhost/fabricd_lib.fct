@@ -2,6 +2,7 @@ import "fabric_daemon_control.fct"
 import "fabric_daemon_admin.fct"
 import "fabric_frontdoor.fct"
 import "http_server.fct"
+import "fabric_routing_feed.fct"
 
 app FabricdLib:
     # fabricd_lib.fct — the Fabric control plane as a running process: a
@@ -41,6 +42,13 @@ app FabricdLib:
     # What the two planes share, as in the crate: the front door's fleet
     # (fdPublishRouting) and the status snapshot (fabricdSnapshot, swapped
     # whole once per cycle). Nothing else.
+    #
+    # One addition the crate does not have: front doors in other processes
+    # (fabric_frontdoor_main.fct with FRONTDOOR_ROUTING_FEED) follow the
+    # routing this daemon publishes through `GET /routing/feed` on the
+    # operator port, and the loop keeps a lease per door. While any door is
+    # subscribed, a cutover moves authority only once every live door has
+    # confirmed the current table (fabric_routing_feed.fct explains why).
     #
     # The shutdown's data-port half is the crate's graceful one: the data
     # listener is closed (closeListener: a new connection is refused by the
@@ -312,16 +320,41 @@ app FabricdLib:
         fabricdSnapshot = c.status
         return report
 
+    # How long a door's poll keeps it routing (fabric_routing_feed.fct): the
+    # door stops routing this long after it asked, the daemon forgets it this
+    # long (plus its in-flight bound) after it heard.
+    proc fabricdFeedLeaseMs() -> int:
+        return 2000
+
+    # What the subscribed doors have confirmed, set on the placement fabric
+    # before anything is advanced.
+    proc fabricdWithDoors(c0: DaemonControl, doors: [DoorLease]) -> DaemonControl:
+        let mut c = c0
+        let view = do doorLeasesView(doors)
+        let fabric = do fabricRuntimePlacement(c.runtime)
+        c.runtime = fabricRuntimeWithPlacement(c.runtime, placementFabricWithDoors(fabric, view.subscribed, view.confirmed))
+        return c
+
     # The control loop: cadence ticks, operator questions and mover reports
-    # from one queue; `stop` drains and hands the report to main.
+    # from one queue; `stop` drains and hands the report to main. A door's
+    # poll ("door") renews its lease and is answered with the routing the
+    # loop last published.
     proc fabricdControlLoop(c0: DaemonControl, t0: DaemonTelemetry) -> bool uses io.net, io.file:
         let mut c = c0
         let mut t = t0
+        let mut doors = []
         let requests = fabricdRequests
         let sep = do fabricdSep()
         loop true:
             let msg = recv(requests)
             let fields = split(msg, sep)
+            let lease = do fabricdFeedLeaseMs()
+            doors = doorLeasesLive(doors, monoMs(), lease)
+            if fields[0] == "door":
+                doors = doorLeasesConfirm(doors, fields[1], u64Parse(fields[3]), monoMs(), toInt(fields[4]))
+                let published = fdFleet
+                let sentDoor = send(toInt(fields[5]), rtfAnswer(published.routing, u64Parse(fields[2]), lease))
+            c = fabricdWithDoors(c, doors)
             if fields[0] == "tick":
                 let cycled = do fabricdCycle(c, t)
                 c = cycled.control
@@ -329,7 +362,7 @@ app FabricdLib:
                 if cycled.published:
                     do fdPublishRouting(cycled.routing)
                 fabricdSnapshot = c.status
-            else:
+            if fields[0] != "tick" && fields[0] != "door":
                 if fields[0] == "stop":
                     let report = do fabricdDrain(c, t)
                     let lines = do daemonShutdownLines(report)
@@ -478,7 +511,8 @@ app FabricdLib:
     # Daemon::start, serving until a signal, then the shutdown and main.rs's
     # report; the exit status is sent on `exit`. Detached from main (so it
     # is a daemon-context body), which waits for it.
-    proc fabricdRun(settings: DaemonSettings, telemetry: DaemonTelemetry, exit: int) -> bool uses io.net, io.net.listen, io.console:
+    proc fabricdRun(declared: DaemonSettings, telemetry: DaemonTelemetry, exit: int) -> bool uses io.net, io.net.listen, io.console:
+        let mut settings = declared
         fabricdSettings = settings
         fabricdRequests = channel()
         fabricdDispatch = channel()
@@ -496,6 +530,13 @@ app FabricdLib:
             writeStderr("fabricd: could not bind " + daemonAddrText(settings.adminListen) + ": " + adminBind + "\n")
             let failedAdmin = send(exit, "78")
             return true
+        # daemon.rs: from here on the addresses are the ones the listeners
+        # hold — a declared port 0 is the kernel's to choose, and the banner,
+        # this snapshot and every status the loop publishes name the port
+        # actually served on.
+        settings.dataListen.port = listenerPort(dataListener)
+        settings.adminListen.port = listenerPort(adminListener)
+        fabricdSettings = settings
         fabricdSnapshot = daemonStartingStatus(settings, daemonAddrText(settings.dataListen), daemonAddrText(settings.adminListen), fabricdNowMs())
         let booted = do fabricdBoot(settings, telemetry)
         if booted.err != "":
@@ -584,6 +625,74 @@ app FabricdLib:
             headers = append(headers, HttpHeader{name: "allow", value: r.allow})
         return HttpServerResponse{status: r.status, reason: "", headers: headers, body: r.body}
 
+    # `GET /routing/feed?door=<id>&adopted=<g>&confirmed=<g>&bound=<ms>`: a
+    # front door's poll (fabric_routing_feed.fct), authenticated as the
+    # operator surface is. Answered by the loop.
+    proc fabricdIsFeed(target: text) -> bool:
+        return target == "/routing/feed" || slice(target, 0, min(len(target), 14)) == "/routing/feed?"
+
+    proc fabricdQueryParam(target: text, name: text) -> text:
+        let q = do indexOf(target, "?")
+        if q < 0:
+            return ""
+        let pairs = split(slice(target, q + 1, len(target)), "&")
+        let mut i = 0
+        loop i < len(pairs):
+            let eq = do indexOf(pairs[i], "=")
+            if eq > 0 && slice(pairs[i], 0, eq) == name:
+                return slice(pairs[i], eq + 1, len(pairs[i]))
+            i = i + 1
+        return ""
+
+    proc fabricdFeedIdOk(id: text) -> bool:
+        let bs = textToBytes(id)
+        if len(bs) == 0 || len(bs) > 64:
+            return false
+        let mut i = 0
+        loop i < len(bs):
+            let b = bs[i]
+            let ok = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 45 || b == 46 || b == 95
+            if !ok:
+                return false
+            i = i + 1
+        return true
+
+    proc fabricdFeedDigits(s: text) -> bool:
+        let bs = textToBytes(s)
+        if len(bs) == 0 || len(bs) > 20:
+            return false
+        let mut i = 0
+        loop i < len(bs):
+            if bs[i] < 48 || bs[i] > 57:
+                return false
+            i = i + 1
+        return true
+
+    proc fabricdServeFeed(req: HttpServerRequest, token: text) -> HttpServerResponse uses io.net:
+        let authorized = do daemonAuthorized(dadApiKey(req.headers), token)
+        if !authorized:
+            let denied = do fabricdAdminResponse(dadUnauthorized())
+            return denied
+        if req.method != "GET":
+            return HttpServerResponse{status: 405, reason: "", headers: [HttpHeader{name: "allow", value: "GET"}], body: ""}
+        let id = do fabricdQueryParam(req.target, "door")
+        let adopted = do fabricdQueryParam(req.target, "adopted")
+        let confirmed = do fabricdQueryParam(req.target, "confirmed")
+        let bound = do fabricdQueryParam(req.target, "bound")
+        let idOk = do fabricdFeedIdOk(id)
+        let numbers = fabricdFeedDigits(adopted) && fabricdFeedDigits(confirmed) && fabricdFeedDigits(bound)
+        if !idOk || !numbers:
+            return httpServerPlain(400, "fabricd: a routing feed poll names door=<id> ([A-Za-z0-9._-], at most 64), adopted=, confirmed= and bound= (decimal)\n")
+        let stopping = fabricdStopping
+        if stopping:
+            return httpServerPlain(503, "fabricd: shutting down; routing is no longer published\n")
+        let sep = do fabricdSep()
+        let reply = channel()
+        let sent = send(fabricdRequests, "door" + sep + id + sep + adopted + sep + confirmed + sep + bound + sep + reply)
+        let answer = recv(reply)
+        let freed = closeChannel(reply)
+        return HttpServerResponse{status: 200, reason: "", headers: [HttpHeader{name: "content-type", value: "application/json"}], body: answer}
+
     proc fabricdServeAdmin(c: int) uses io.net, io.net.listen:
         let mut pending = []
         let mut open = true
@@ -600,12 +709,18 @@ app FabricdLib:
                 let keep = do httpServerKeepAlive(req)
                 let settings = fabricdSettings
                 let token = settings.adminToken
-                let routed = do daemonAdminRoute(DaemonAdminRequest{method: req.method, target: req.target, headers: req.headers, body: req.body}, fabricdSnapshot, token)
-                let mut response = routed.response
-                if routed.ask:
-                    response = fabricdAsk(routed.request)
-                let wrote = do httpServerWriteResponse(c, req.method, fabricdAdminResponse(response), keep)
-                open = wrote && keep
+                let feed = do fabricdIsFeed(req.target)
+                if feed:
+                    let answered = do fabricdServeFeed(req, token)
+                    let wroteFeed = do httpServerWriteResponse(c, req.method, answered, keep)
+                    open = wroteFeed && keep
+                else:
+                    let routed = do daemonAdminRoute(DaemonAdminRequest{method: req.method, target: req.target, headers: req.headers, body: req.body}, fabricdSnapshot, token)
+                    let mut response = routed.response
+                    if routed.ask:
+                        response = fabricdAsk(routed.request)
+                    let wrote = do httpServerWriteResponse(c, req.method, fabricdAdminResponse(response), keep)
+                    open = wrote && keep
         let closed = closeConn(c)
 
     # ------------------------------------------------------------ the movers

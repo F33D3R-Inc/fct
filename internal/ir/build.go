@@ -33,6 +33,7 @@ type emittedEvent struct {
 }
 
 type env struct {
+	astActions       map[string]*ast.Action            // every declared action, for `run` (known before any is built)
 	wireTypes        map[string]bool                   // wire `type`/`message` names (SCHEMA_IDL_SCOPE Tier C) — an action may return one
 	emittedTypes     map[string]int                    // wire type -> line of an `emit` of it, checked against the streams that carry it
 	actLocalTypes    map[string]vtype                  // the action being built: its parameters' and lets' types
@@ -99,6 +100,8 @@ type procSig struct {
 	params  []ast.Param
 	ret     string
 	retList bool
+	retMap  bool
+	retKey  string
 }
 
 // deriveFn is a parameterized derive: what a call site is checked against (its
@@ -152,6 +155,9 @@ type recField struct {
 type structField struct {
 	typ  string
 	list bool
+	// mapped / key: the field is a `{key: typ}` map.
+	mapped bool
+	key    string
 }
 
 // recBind is what a record-typed local (`let v = call …`) is bound to: a record
@@ -313,8 +319,8 @@ func Build(app *ast.App) (*IR, error) {
 				return nil, &BuildError{f.Line, fmt.Sprintf(
 					"struct %q field %q has type %q — a struct field must be int/text/bool/float, another declared struct, or a list of those", sc.Name, f.Name, f.Type)}
 			}
-			fields[f.Name] = structField{typ: f.Type, list: f.List}
-			irFields = append(irFields, RecordField{Name: f.Name, Type: f.Type, List: f.List})
+			fields[f.Name] = structField{typ: f.Type, list: f.List, mapped: f.Map, key: f.Key}
+			irFields = append(irFields, RecordField{Name: f.Name, Type: f.Type, List: f.List, Map: f.Map, Key: f.Key})
 		}
 		out.Structs = append(out.Structs, Struct{Name: sc.Name, Fields: irFields})
 	}
@@ -1071,7 +1077,7 @@ func Build(app *ast.App) (*IR, error) {
 			}
 			seenUse[u] = true
 		}
-		e.procSigs[p.Name] = procSig{params: p.Params, ret: p.Ret, retList: p.RetList}
+		e.procSigs[p.Name] = procSig{params: p.Params, ret: p.Ret, retList: p.RetList, retMap: p.RetMap, retKey: p.RetKey}
 	}
 	// Shared cells (see ast.Shared) are known before any proc or daemon body
 	// is lowered: those are the only bodies that may name one.
@@ -1116,6 +1122,10 @@ func Build(app *ast.App) (*IR, error) {
 	}
 
 	// 4. Actions: placement (write set), read soundness, requires.
+	e.astActions = map[string]*ast.Action{}
+	for _, a := range app.Actions {
+		e.astActions[a.Name] = a
+	}
 	actSeen := map[string]int{}
 	for _, a := range app.Actions {
 		if prev, ok := actSeen[a.Name]; ok {
@@ -1142,6 +1152,11 @@ func Build(app *ast.App) (*IR, error) {
 	byActionName := map[string]*Action{}
 	for i := range out.Actions {
 		byActionName[out.Actions[i].Name] = &out.Actions[i]
+	}
+	// `run` edges: a callee must be server-placed (it joins the caller's
+	// authoritative transaction) and no chain of runs may come back round.
+	if err := checkRunGraph(out.Actions, byActionName); err != nil {
+		return nil, err
 	}
 	jobSeen := map[string]int{}
 	for _, j := range app.Jobs {
@@ -1228,6 +1243,16 @@ func Build(app *ast.App) (*IR, error) {
 			{Name: "mfaSecret", Type: "text", Secret: true}, {Name: "mfaEnabled", Type: "bool"},
 		}})
 		out.Actions = append(out.Actions, authActions()...)
+		// The append may have moved out.Actions to a new array: byActionName's
+		// pointers must follow, or every later write through them — an api
+		// route's or a stream hook's placement reason — lands in the old
+		// array and is lost from the graph. The set of names it resolves is
+		// unchanged (the auth actions stay the runtime's, not a route's).
+		for i := range out.Actions {
+			if _, ok := byActionName[out.Actions[i].Name]; ok {
+				byActionName[out.Actions[i].Name] = &out.Actions[i]
+			}
+		}
 	}
 
 	// 5. Views → pages. Each view compiles with its own viewCtx, so binding and
@@ -2694,11 +2719,48 @@ func (e *env) action(a *ast.Action) (Action, error) {
 					ds.Bind = st.Bind
 					ds.Ret = sig.ret
 					ds.RetList = sig.retList
+					ds.RetMap = sig.retMap
 					if _, isRec := e.records[sig.ret]; isRec {
 						e.locRecords[st.Bind] = recBind{rec: sig.ret, list: sig.retList}
 					}
 				}
 				body = append(body, ds)
+			case ast.RunAction:
+				// Another action, inside this one's transaction (ast.RunAction).
+				// It runs on the authority, so this action does too.
+				callee, ok := e.astActions[st.Action]
+				if !ok {
+					return nil, &BuildError{st.Line, fmt.Sprintf("run names unknown action %q", st.Action)}
+				}
+				if st.Action == a.Name {
+					return nil, &BuildError{st.Line, fmt.Sprintf("action %q runs itself — an action cannot run itself", a.Name)}
+				}
+				if len(st.Args) != len(callee.Params) {
+					return nil, &BuildError{st.Line, fmt.Sprintf("action %q expects %d argument(s), got %d", st.Action, len(callee.Params), len(st.Args))}
+				}
+				callsProc = true
+				rs := Stmt{Op: "run", Service: st.Action}
+				for _, arg := range st.Args {
+					if err := readExpr(arg, st.Line); err != nil {
+						return nil, err
+					}
+					rs.Args = append(rs.Args, e.low(arg))
+				}
+				if st.Bind != "" {
+					if callee.Ret == "" {
+						return nil, &BuildError{st.Line, fmt.Sprintf("action %q returns nothing — declare `-> Type` on it to bind its result", st.Action)}
+					}
+					if err := bindLocal(st.Bind, loc, "the bound result", st.Line); err != nil {
+						return nil, err
+					}
+					rs.Bind = st.Bind
+					rs.Ret = callee.Ret
+					rs.RetList = callee.RetList
+					if _, isRec := e.records[callee.Ret]; isRec {
+						e.locRecords[st.Bind] = recBind{rec: callee.Ret, list: callee.RetList}
+					}
+				}
+				body = append(body, rs)
 			case ast.Restate:
 				// Re-roling an account's live sessions is an identity change: the
 				// authority's job, applied after the commit (runtime).
@@ -2985,6 +3047,10 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				for _, arg := range st.Args {
 					collect(arg)
 				}
+			case ast.RunAction:
+				for _, arg := range st.Args {
+					collect(arg)
+				}
 			case ast.Establish:
 				collect(st.Actor)
 				collect(st.Role)
@@ -3160,7 +3226,7 @@ func isProcessEntry(p *ast.Proc) bool {
 func (e *env) procIn(p *ast.Proc, actionSigs map[string]actionSig) (Proc, error) {
 	e.inProc = true
 	defer func() { e.inProc = false }()
-	pr := Proc{Name: p.Name, Ret: p.Ret, RetList: p.RetList}
+	pr := Proc{Name: p.Name, Ret: p.Ret, RetList: p.RetList, RetMap: p.RetMap, RetKey: p.RetKey}
 	locals := map[string]bool{}  // every name in scope: params + `let`s seen so far
 	mutable := map[string]bool{} // the subset declared `let mut`, and so reassignable
 	types := map[string]string{} // each name's declared/inferred type — see checkBitwiseTypes
@@ -3176,12 +3242,17 @@ func (e *env) procIn(p *ast.Proc, actionSigs map[string]actionSig) (Proc, error)
 		// they already do for a `let mut xs = [1,2,3]` local. Only the element
 		// type (prm.Type) is real to the runtime/database/wire layers, so it is
 		// still what's recorded on the lowered Param below.
-		if prm.List {
+		switch {
+		case prm.Map:
+			// A map parameter is tagged as a typed map (mapTag): `p[k]` then
+			// has the value type, and `p[k].field` is checked against it.
+			types[prm.Name] = mapTag(prm.Key, prm.Type)
+		case prm.List:
 			types[prm.Name] = arrayType
-		} else {
+		default:
 			types[prm.Name] = prm.Type
 		}
-		pr.Params = append(pr.Params, Param{Name: prm.Name, Type: prm.Type, Optional: prm.Optional, List: prm.List})
+		pr.Params = append(pr.Params, Param{Name: prm.Name, Type: prm.Type, Optional: prm.Optional, List: prm.List, Map: prm.Map, Key: prm.Key})
 	}
 	for _, prm := range p.Params {
 		if err := e.checkNotShared(prm.Name, p.Line); err != nil {
@@ -3389,7 +3460,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if !mutable[st.Target] {
 				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not mutable — declare it `let mut %s = …` to index-assign into it", st.Target, st.Target)}
 			}
-			if ty := types[st.Target]; ty != "" && ty != arrayType && ty != bytesType && ty != mapType {
+			if ty := types[st.Target]; ty != "" && ty != arrayType && ty != bytesType && !isMapType(ty) {
 				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not an array or map (its type is %s) — index assignment (`%s[...] = …`) needs an array, map, or byte-buffer local", st.Target, ty, st.Target)}
 			}
 			if err := e.checkProcExpr(p, st.Index, locals, types, st.Line, actionSigs); err != nil {
@@ -3406,9 +3477,19 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			// explicitly. Silent ("") when the key's type can't be proven — the
 			// runtime backstop (runtime/eval.go's mapKey, reached via
 			// runtime/proccompile.go's "indexset" case) catches that case instead.
-			if types[st.Target] == mapType {
-				if kt := inferProcType(st.Index, types); !isMapKeyType(kt) {
+			if mt := types[st.Target]; isMapType(mt) {
+				kt := inferProcType(st.Index, types)
+				if !isMapKeyType(kt) {
 					return nil, &BuildError{st.Line, fmt.Sprintf("map key must be int or text, got %s", kt)}
+				}
+				// A typed map: its keys and values are what it declared.
+				if dk := mapKeyType(mt); dk != "" && kt != "" && kt != dk {
+					return nil, &BuildError{st.Line, fmt.Sprintf("%q is a {%s: %s} map — its key must be %s, got %s", st.Target, dk, mapValType(mt), dk, kt)}
+				}
+				if dv := mapValType(mt); dv != "" {
+					if vt := e.structExprType(st.Value, types); vt != "" && vt != dv && !(dv == "int" && vt == bytesType) {
+						return nil, &BuildError{st.Line, fmt.Sprintf("%q is a {%s: %s} map — its value must be %s, got %s", st.Target, mapKeyType(mt), dv, dv, vt)}
+					}
 				}
 			}
 			// Bytes: true tells the runtime (runtime/proccompile.go's "indexset" case) to
@@ -3445,7 +3526,12 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if err := e.checkProcExpr(p, st.Value, locals, types, st.Line, actionSigs); err != nil {
 				return nil, err
 			}
-			if vt := inferProcType(st.Value, types); vt != "" && !sf.list && vt != sf.typ && !(sf.typ == "float" && vt == "int") {
+			if sf.mapped {
+				// A `{K: V}` field takes a map — of those types, when known.
+				if vt := e.structExprType(st.Value, types); vt != "" && (!isMapType(vt) || (mapValType(vt) != "" && mapValType(vt) != sf.typ)) {
+					return nil, &BuildError{st.Line, fmt.Sprintf("cannot assign %s to field %q of struct %q, whose type is {%s: %s}", vt, st.Field, types[st.Target], sf.key, sf.typ)}
+				}
+			} else if vt := inferProcType(st.Value, types); vt != "" && !sf.list && vt != sf.typ && !(sf.typ == "float" && vt == "int") {
 				return nil, &BuildError{st.Line, fmt.Sprintf("cannot assign %s to field %q of struct %q, whose type is %s", vt, st.Field, types[st.Target], sf.typ)}
 			}
 			out = append(out, Stmt{Op: "fieldset", Target: st.Target, Field: st.Field, Value: e.low(st.Value)})
@@ -3458,9 +3544,24 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 				return nil, &BuildError{st.Line, fmt.Sprintf("proc %q expects %d argument(s), got %d", st.Proc, len(sig.params), len(st.Args))}
 			}
 			ds := Stmt{Op: "do", Service: st.Proc}
-			for _, arg := range st.Args {
+			for i, arg := range st.Args {
 				if err := e.checkProcExpr(p, arg, locals, types, st.Line, actionSigs); err != nil {
 					return nil, err
+				}
+				// A map parameter takes a map and nothing else; a map goes
+				// nowhere else. (An unknown type, "", is left to the runtime.)
+				prm := sig.params[i]
+				at := e.structExprType(arg, types)
+				if prm.Map && at != "" && !isMapType(at) {
+					return nil, &BuildError{st.Line, fmt.Sprintf("proc %q parameter %q is a {%s: %s} map, got %s", st.Proc, prm.Name, prm.Key, prm.Type, at)}
+				}
+				if prm.Map && at != "" {
+					if dv := mapValType(at); dv != "" && dv != prm.Type {
+						return nil, &BuildError{st.Line, fmt.Sprintf("proc %q parameter %q is a {%s: %s} map, got {%s: %s}", st.Proc, prm.Name, prm.Key, prm.Type, mapKeyType(at), dv)}
+					}
+				}
+				if !prm.Map && isMapType(at) {
+					return nil, &BuildError{st.Line, fmt.Sprintf("proc %q parameter %q is not a map, got one", st.Proc, prm.Name)}
 				}
 				ds.Args = append(ds.Args, e.low(arg))
 			}
@@ -3478,14 +3579,18 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 				if sig.ret == "" {
 					return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns nothing — declare a return type to assign its result", st.Proc)}
 				}
-				if sig.retList {
+				switch {
+				case sig.retMap:
+					types[st.Bind] = mapTag(sig.retKey, sig.ret)
+				case sig.retList:
 					types[st.Bind] = arrayType
-				} else {
+				default:
 					types[st.Bind] = sig.ret
 				}
 				ds.Target = st.Bind
 				ds.Ret = sig.ret
 				ds.RetList = sig.retList
+				ds.RetMap = sig.retMap
 				out = append(out, ds)
 				continue
 			}
@@ -3509,14 +3614,18 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 				// proc would wrongly be rejected by checkIndexTypes as "not an
 				// array" — exactly the composition shape a proc chaining into
 				// another proc's list-typed result needs.
-				if sig.retList {
+				switch {
+				case sig.retMap:
+					types[st.Bind] = mapTag(sig.retKey, sig.ret)
+				case sig.retList:
 					types[st.Bind] = arrayType
-				} else {
+				default:
 					types[st.Bind] = sig.ret
 				}
 				ds.Bind = st.Bind
 				ds.Ret = sig.ret
 				ds.RetList = sig.retList
+				ds.RetMap = sig.retMap
 			}
 			out = append(out, ds)
 		case ast.Act:
@@ -4007,6 +4116,34 @@ const bytesType = "bytes"
 // catch the statically-provable cases before that.
 const mapType = "map"
 
+// mapTag is the type tag of a map whose key and value types are declared —
+// a `{K: V}` parameter, field or return: "map:K:V". A map literal's tag is
+// the bare mapType (its values are whatever was put in). isMapType accepts
+// both; mapValType answers the value type ("" for the bare tag).
+func mapTag(key, val string) string { return mapType + ":" + key + ":" + val }
+
+func isMapType(t string) bool { return t == mapType || strings.HasPrefix(t, mapType+":") }
+
+func mapValType(t string) string {
+	if strings.HasPrefix(t, mapType+":") {
+		rest := t[len(mapType)+1:]
+		if i := strings.IndexByte(rest, ':'); i >= 0 {
+			return rest[i+1:]
+		}
+	}
+	return ""
+}
+
+func mapKeyType(t string) string {
+	if strings.HasPrefix(t, mapType+":") {
+		rest := t[len(mapType)+1:]
+		if i := strings.IndexByte(rest, ':'); i >= 0 {
+			return rest[:i]
+		}
+	}
+	return ""
+}
+
 // taskType is inferProcType/checkNoTaskUse's type tag for a `spawn`-bound
 // task handle (Milestone 5: structured concurrency) — the local a `let h =
 // spawn ProcName(args)` statement declares. Unlike arrayType/bytesType/
@@ -4057,6 +4194,13 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 		return t.Type
 	case ast.Ref:
 		return types[t.Name]
+	case ast.Index:
+		// A typed map's element has the map's declared value type; every
+		// other index read stays unknown (an array's element type is erased).
+		if r, ok := t.Obj.(ast.Ref); ok {
+			return mapValType(types[r.Name])
+		}
+		return ""
 	case ast.Call:
 		switch t.Name {
 		case "append":
@@ -4105,6 +4249,22 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			// checksum primitive, as sha256Hex is its digest one: a table
 			// lookup per byte the evaluator cannot make cheap.
 			return "int"
+		case "bytesCmp", "bytesCmpRange", "uintLE":
+			// The byte-level primitives a binary format is read with, each a
+			// loop the evaluator cannot make cheap: bytesCmp(a, b) -> int is
+			// the lexicographic order of two buffers (-1, 0, 1, shorter
+			// prefix first); bytesCmpRange(a, aFrom, aTo, b, bFrom, bTo) the
+			// same over two sub-ranges, without copying either out; uintLE(b,
+			// at, n) -> int the little-endian unsigned integer in the n bytes
+			// (1-8) of b at `at`.
+			return "int"
+		case "toHex":
+			// toHex(b) -> text: the lowercase hex of a byte buffer.
+			return "text"
+		case "fromHex":
+			// fromHex(s) -> bytes: toHex's inverse; text that is not hex
+			// (an odd length, a non-hex character) decodes to an empty buffer.
+			return bytesType
 		case "readFile", "httpGet", "httpPost":
 			return "text"
 		case "listen", "listenOn", "listenTls", "accept":
@@ -4227,6 +4387,8 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			// floatFromBits(b) -> float, the IEEE-754 bit-cast inverse of
 			// floatBits(f) -> int.
 			return "float"
+		case "exp", "ln", "sqrt":
+			return "float"
 		case "u64Cmp", "u64Min", "u64Max", "u64SatSub", "u64Div", "u64Rem", "u64Parse":
 			// the u64 builtins (runtime/u64.go): an int's 64 bits read unsigned.
 			return "int"
@@ -4342,10 +4504,24 @@ func (e *env) structExprType(ex ast.Expr, types map[string]string) string {
 				if f.list {
 					return arrayType
 				}
+				if f.mapped {
+					return mapTag(f.key, f.typ)
+				}
 				return f.typ
 			}
 		}
 		return ""
+	}
+	// An element of a struct's map field has the field's declared value
+	// type; an element of a typed map local likewise (inferProcType).
+	if ix, ok := ex.(ast.Index); ok {
+		if g, ok := ix.Obj.(ast.Get); ok {
+			if fields, ok := e.structs[e.structExprType(g.Obj, types)]; ok {
+				if f, ok := fields[g.Field]; ok && f.mapped {
+					return f.typ
+				}
+			}
+		}
 	}
 	// An element of a struct's list field has the field's declared element
 	// type — the one place an array's element type is not erased.
@@ -4414,7 +4590,14 @@ func (e *env) checkStructFieldTypes(ex ast.Expr, types map[string]string, line i
 			if got == "" {
 				continue // unprovable — left to the runtime backstop, same stance as elsewhere
 			}
-			if fdecl.list {
+			if fdecl.mapped {
+				if !isMapType(got) {
+					return &BuildError{line, fmt.Sprintf("field %q of %s{...} wants {%s: %s}, got %s", fi.Name, t.Type, fdecl.key, fdecl.typ, got)}
+				}
+				if dv := mapValType(got); dv != "" && dv != fdecl.typ {
+					return &BuildError{line, fmt.Sprintf("field %q of %s{...} wants {%s: %s}, got {%s: %s}", fi.Name, t.Type, fdecl.key, fdecl.typ, mapKeyType(got), dv)}
+				}
+			} else if fdecl.list {
 				// A byte buffer is an [int] whose elements are range-checked on
 				// write (see bytesType), so it fills an [int] field exactly as it
 				// already satisfies a `-> [int]` proc return.
@@ -4437,7 +4620,7 @@ func (e *env) checkStructFieldTypes(ex ast.Expr, types map[string]string, line i
 				if _, exists := fields[t.Field]; !exists {
 					return &BuildError{line, fmt.Sprintf("struct %q has no field %q", ot, t.Field)}
 				}
-			} else if ot == arrayType || ot == mapType || ot == bytesType || ot == taskType || isPrimitive(ot) {
+			} else if ot == arrayType || isMapType(ot) || ot == bytesType || ot == taskType || isPrimitive(ot) {
 				return &BuildError{line, fmt.Sprintf(
 					"field access (`.%s`) needs a struct value, but this expression is %s", t.Field, ot)}
 			}
@@ -4716,7 +4899,7 @@ func checkIndexTypes(ex ast.Expr, types map[string]string, line int) error {
 	switch t := ex.(type) {
 	case ast.Index:
 		if r, ok := t.Obj.(ast.Ref); ok {
-			if ty := types[r.Name]; ty != "" && ty != arrayType && ty != bytesType && ty != mapType {
+			if ty := types[r.Name]; ty != "" && ty != arrayType && ty != bytesType && !isMapType(ty) {
 				return &BuildError{line, fmt.Sprintf(
 					"%q is not an array or map (its type is %s) — index access (`%s[...]`) needs an array, map, or byte-buffer local", r.Name, ty, r.Name)}
 			}
@@ -4788,9 +4971,13 @@ func checkMapKeyTypes(ex ast.Expr, types map[string]string, line int) error {
 			}
 		}
 	case ast.Index:
-		if r, ok := t.Obj.(ast.Ref); ok && types[r.Name] == mapType {
-			if kt := inferProcType(t.Idx, types); !isMapKeyType(kt) {
+		if r, ok := t.Obj.(ast.Ref); ok && isMapType(types[r.Name]) {
+			kt := inferProcType(t.Idx, types)
+			if !isMapKeyType(kt) {
 				return &BuildError{line, fmt.Sprintf("map key must be int or text, got %s", kt)}
+			}
+			if dk := mapKeyType(types[r.Name]); dk != "" && kt != "" && kt != dk {
+				return &BuildError{line, fmt.Sprintf("%q is a {%s: %s} map — its key must be %s, got %s", r.Name, dk, mapValType(types[r.Name]), dk, kt)}
 			}
 		}
 		if err := checkMapKeyTypes(t.Obj, types, line); err != nil {
@@ -7168,7 +7355,12 @@ func (c *viewCtx) checkRowFields(ex ast.Expr, sc scope, line int) error {
 		inner := sc
 		if t.Var != "" {
 			inner = sc.with(t.Var)
-			inner.varTypes[t.Var] = vtype{core: t.Coll}
+			if c.e.stateList[t.Coll] {
+				// Over a list cell the item is an element of the cell's type.
+				inner.varTypes[t.Var] = vtype{core: c.e.stateTypes[t.Coll]}
+			} else {
+				inner.varTypes[t.Var] = vtype{core: t.Coll}
+			}
 		}
 		if err := c.checkRowFields(t.Where, inner, line); err != nil {
 			return err
@@ -7198,7 +7390,36 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 		}
 	case ast.Agg:
 		if !e.entities[t.Coll] {
-			return &BuildError{line, fmt.Sprintf("%s(...) needs an entity collection; %q is not an entity", t.Op, t.Coll)}
+			if !e.stateList[t.Coll] {
+				return &BuildError{line, fmt.Sprintf("%s(...) needs a collection to range over; %q is neither an entity nor a `[T]` list state", t.Op, t.Coll)}
+			}
+			// An aggregate over a `[T]` list cell ranges its elements the way
+			// `for x in <list>` does: count, exists and list over them, the
+			// item variable bound to each element. The cell must be declared
+			// on the authority (@server) — an inferred or @client placement
+			// would leave the browser, which has no aggregates, holding it — and a
+			// field aggregate names the value it reduces, since an element
+			// has no fields to name.
+			if e.states[t.Coll] != "server" && e.states[t.Coll] != "private" {
+				return &BuildError{line, fmt.Sprintf("%s(...) over %q: an aggregate runs on the authority, so the cell must live there — declare it `state %s: [T] = [] @server`", t.Op, t.Coll, t.Coll)}
+			}
+			if isFieldAgg(t.Op) && t.Sel == nil {
+				return &BuildError{line, fmt.Sprintf("%s over the list cell %q needs the value to reduce: %s(<expr over x> in %s where …)", t.Op, t.Coll, t.Op, t.Coll)}
+			}
+			if t.Op == "exists" && t.Var == "" {
+				return &BuildError{line, fmt.Sprintf("exists needs a filtered form: exists(x in %s where <cond>)", t.Coll)}
+			}
+			if t.Order != "" || t.OrderExpr != nil {
+				return &BuildError{line, fmt.Sprintf("list(...) over the list cell %q keeps the cell's own order — drop `by`", t.Coll)}
+			}
+			for _, sub := range []ast.Expr{t.Where, t.Sel, t.Limit} {
+				if sub != nil {
+					if err := e.checkBuiltins(sub, line); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
 		}
 		if isFieldAgg(t.Op) && t.Sel == nil && !e.entityFields[t.Coll][t.Field] {
 			// The message names the two shapes, because the most likely way to
@@ -7281,7 +7502,19 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 			if len(t.Args) != 2 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly two arguments", t.Name)}
 			}
-		case "readFileAt", "writeFileAt", "pollBytes", "crc32":
+		case "bytesCmpRange":
+			if len(t.Args) != 6 {
+				return &BuildError{line, "bytesCmpRange(a, aFrom, aTo, b, bFrom, bTo) takes exactly six arguments"}
+			}
+		case "bytesCmp":
+			if len(t.Args) != 2 {
+				return &BuildError{line, "bytesCmp(a, b) takes exactly two arguments"}
+			}
+		case "toHex", "fromHex":
+			if len(t.Args) != 1 {
+				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly one argument", t.Name)}
+			}
+		case "readFileAt", "writeFileAt", "pollBytes", "crc32", "uintLE":
 			if len(t.Args) != 3 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly three arguments", t.Name)}
 			}
@@ -7798,7 +8031,7 @@ func pureBuiltinArity(name string) (int, bool) {
 	switch name {
 	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day",
 		"ago", "compact", "commas", "iso", "fromIso", "first", "fromJson", "bytes", "toFloat", "toInt", "toMoney", "slug",
-		"textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits",
+		"textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits", "exp", "ln", "sqrt",
 		"u64Text", "u64Parse", "u64ParseError", "u64ToFloat", "sha256Bytes", "base64UrlRaw", "bcryptHash":
 		return 1, true
 	case "print":
@@ -8052,7 +8285,12 @@ func (e *env) checkDeriveArgs(ex ast.Expr, sc scope, line int) error {
 		inner := sc
 		if t.Var != "" {
 			inner = sc.with(t.Var)
-			inner.varTypes[t.Var] = vtype{core: t.Coll}
+			if e.stateList[t.Coll] {
+				// Over a list cell the item is an element of the cell's type.
+				inner.varTypes[t.Var] = vtype{core: e.stateTypes[t.Coll]}
+			} else {
+				inner.varTypes[t.Var] = vtype{core: t.Coll}
+			}
 		}
 		for _, sub := range []ast.Expr{t.Where, t.Sel} {
 			if err := e.checkDeriveArgs(sub, inner, line); err != nil {
@@ -8145,8 +8383,8 @@ func (e *env) depsIR(le *Expr) map[string]bool {
 				out["@act:"+x.Name] = true
 			}
 		case "agg":
-			if e.entities[x.Name] {
-				out[x.Name] = true
+			if e.entities[x.Name] || e.stateList[x.Name] {
+				out[x.Name] = true // an entity\'s rows or a list cell\'s elements
 			}
 			// The filter may read outer state/entities (e.g. `actor`, another entity);
 			// the item variable is a bare ref to neither, so it is ignored naturally.
@@ -9178,4 +9416,64 @@ func (e *env) apiDocs(ap *ast.API, act *Action, pathParams []string, types []Wir
 		docs = append(docs, APIParamDoc{Name: d.Name, Type: d.Type, Description: d.Description, Enum: d.Enum})
 	}
 	return docs, nil
+}
+
+// runCallees lists the actions a body `run`s, walking nested blocks.
+func runCallees(body []Stmt, out *[]string) {
+	for _, st := range body {
+		if st.Op == "run" {
+			*out = append(*out, st.Service)
+		}
+		runCallees(st.Body, out)
+		runCallees(st.Else, out)
+	}
+}
+
+// checkRunGraph refuses a `run` of a client-placed action and any cycle of
+// runs (a runs b runs a): an action's transaction must end.
+func checkRunGraph(acts []Action, byName map[string]*Action) error {
+	edges := map[string][]string{}
+	for _, a := range acts {
+		var callees []string
+		runCallees(a.Body, &callees)
+		for _, c := range callees {
+			if callee := byName[c]; callee != nil && callee.Placement != Server {
+				return &BuildError{0, fmt.Sprintf("action %q runs %q, which is client-placed — a run joins the authority's transaction, so the callee must be a server action", a.Name, c)}
+			}
+		}
+		edges[a.Name] = callees
+	}
+	const (
+		white = iota
+		grey
+		black
+	)
+	color := map[string]int{}
+	var path []string
+	var visit func(n string) error
+	visit = func(n string) error {
+		color[n] = grey
+		path = append(path, n)
+		for _, m := range edges[n] {
+			switch color[m] {
+			case grey:
+				return &BuildError{0, fmt.Sprintf("actions run each other in a cycle: %s → %s — an action's transaction must end", strings.Join(path, " → "), m)}
+			case white:
+				if err := visit(m); err != nil {
+					return err
+				}
+			}
+		}
+		path = path[:len(path)-1]
+		color[n] = black
+		return nil
+	}
+	for _, a := range acts {
+		if color[a.Name] == white {
+			if err := visit(a.Name); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

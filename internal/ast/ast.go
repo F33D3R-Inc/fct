@@ -582,6 +582,10 @@ type StructField struct {
 	Name string
 	Type string
 	List bool
+	// Map / Key: a `{K: V}` field — a map from Key (int or text) to Type
+	// values, exactly as a `{K: V}` proc parameter.
+	Map  bool
+	Key  string
 	Line int
 }
 
@@ -847,6 +851,8 @@ type Proc struct {
 	Params  []Param
 	Ret     string // return type core ("" = no return)
 	RetList bool   // the return is a list of Ret (`-> [T]`)
+	RetMap  bool   // the return is a map of Ret values (`-> {K: Ret}`)
+	RetKey  string // the map return's key type (int or text)
 	// Uses is the proc's declared I/O capability set — `uses io.file, io.net`,
 	// trailing the header the same way `requires <policy>` trails a mount/view
 	// header (see parseMount/parseView). Empty means the proc's body may not
@@ -1050,6 +1056,11 @@ type Param struct {
 	Type     string
 	List     bool // a `[T]` parameter (a service operation, a proc, or an action)
 	Optional bool
+	// Map / Key: a `{K: V}` parameter (a proc only) — a map from Key (int or
+	// text) to Type values. Type is the value type, as it is the element
+	// type of a list.
+	Map bool
+	Key string
 	// Ref makes the parameter a *reference* rather than a value: it is bound at
 	// the call site to the NAME of a declaration, not to the result of an
 	// expression. RefValue ("") is an ordinary value parameter.
@@ -1317,6 +1328,20 @@ type Continue struct{ Line int }
 // egress over HTTP — so it carries no placement effect of its own beyond what
 // calling an unconditionally-server-executed proc already implies. Valid inside
 // both an action body and a proc body (a proc may call another proc).
+// RunAction is `run name(args)` / `let x = run name(args)` in an action body:
+// it runs another server action inside the caller's transaction. The callee's
+// `requires` gates and `check`s apply exactly as they would to a request; its
+// writes join the caller's, so a failure anywhere — in the callee or after it
+// in the caller — undoes both. Its `return` ends only the callee, and its
+// value is what a bind receives. (A daemon's `act` is the other way to invoke
+// an action: a separate top-level run with its own transaction.)
+type RunAction struct {
+	Action string
+	Args   []Expr
+	Bind   string
+	Line   int
+}
+
 type Do struct {
 	Proc string
 	Args []Expr
@@ -1445,6 +1470,7 @@ func (IndexAssign) stmt() {}
 func (FieldAssign) stmt() {}
 func (Return) stmt()      {}
 func (Do) stmt()          {}
+func (RunAction) stmt()   {}
 func (Loop) stmt()        {}
 func (IfStmt) stmt()      {}
 func (Break) stmt()       {}

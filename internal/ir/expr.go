@@ -43,6 +43,7 @@ func envFromIR(graph *IR) *env {
 		components:   map[string][]ast.Param{},
 		compDeps:     map[string]map[string]bool{},
 		stateTypes:   map[string]string{},
+		stateList:    map[string]bool{},
 	}
 	for _, en := range graph.Enums {
 		e.enums[en.Name] = en.Values
@@ -59,6 +60,7 @@ func envFromIR(graph *IR) *env {
 		core := st.Type
 		if st.List {
 			core = st.Elem
+			e.stateList[st.Name] = true // an aggregate may range its elements
 		}
 		e.stateTypes[st.Name] = core
 	}

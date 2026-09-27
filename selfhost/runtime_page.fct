@@ -1,4 +1,4 @@
-import "session_store.fct"
+import "store_facetql.fct"
 
 app RuntimePage:
     # runtime_page.fct — runtime/server.go's handlePage: the route match
@@ -354,6 +354,14 @@ app RuntimePage:
         raws = append(raws, aggs)
         keys = append(keys, "@seq")
         raws = append(raws, "" + w.writeSeq)
+        # @media: the signed URL for every media value this bootstrap carries,
+        # minted over the payload as it will be sent (absent when none)
+        if w.mediaTTL > 0:
+            let payload = do jsonParse(rtObjectJSONRaw(keys, raws))
+            let grants = do rtMediaGrants(w.mediaTTL, w.signKey, rtJValToVal(payload))
+            if len(grants.keys) > 0:
+                keys = append(keys, "@media")
+                raws = append(raws, rtValJSON(grants))
         let out = do rtObjectJSONRaw(keys, raws)
         return out
 
@@ -429,7 +437,7 @@ app RuntimePage:
     proc rtTextError(status: int, msg: text) -> HttpServerResponse:
         return HttpServerResponse{status: status, reason: "", headers: [HttpHeader{name: "content-type", value: "text/plain; charset=utf-8"}, HttpHeader{name: "x-content-type-options", value: "nosniff"}], body: msg + "\n"}
 
-    proc rtHandlePage(w0: RtWorld, req: HttpServerRequest) -> RtPageOut:
+    proc rtHandlePage(w0: RtWorld, req: HttpServerRequest) -> RtPageOut uses io.net:
         let mut w = w0
         let m = do rtPageFor(w.g, req.path)
         if !m.found:
@@ -466,7 +474,13 @@ app RuntimePage:
                 let gp = do rtGuardedPage(w.g.app)
                 let forbidden = HttpServerResponse{status: 403, reason: "", headers: [HttpHeader{name: "content-type", value: "text/html; charset=utf-8"}, so.cookie], body: gp}
                 return RtPageOut{resp: forbidden, w: w}
-        let pg = do rtPageSetup(w.g, page)
+        let mut pg = do rtPageSetup(w.g, page)
+        pg.storeOn = w.storeOn
+        pg.fqlBase = w.fqlBase
+        pg.fqlToken = w.fqlToken
+        pg.encKey = w.encKey
+        pg.mediaTTL = w.mediaTTL
+        pg.signKey = w.signKey
         sc.matOn = true
         let rd0 = do rtRenderNew(sc)
         let rd = do rtChildren(pg, rd0, page.view, "", 0)

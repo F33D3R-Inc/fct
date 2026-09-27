@@ -1099,6 +1099,16 @@ func parseStruct(n *source.Node) (*ast.Struct, error) {
 		if !isIdent(fn) {
 			return &Error{line, fmt.Sprintf("invalid struct field name %q", fn)}
 		}
+		if mk, mv, isMap := splitMapType(ft); isMap {
+			if err := checkMapType(mk, mv, "struct field "+fn, line); err != nil {
+				return err
+			}
+			if mv == "money" || mv == "date" {
+				return &Error{line, fmt.Sprintf("struct field %q: %s is not usable inside a proc's own struct type", fn, mv)}
+			}
+			st.Fields = append(st.Fields, ast.StructField{Name: fn, Type: mv, Map: true, Key: mk, Line: line})
+			return nil
+		}
 		core, list, optional := splitType(ft)
 		if optional {
 			return &Error{line, fmt.Sprintf("struct field %q cannot be optional (?) — a struct literal must set every field", fn)}
@@ -1956,6 +1966,12 @@ func parseActionBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
 				return nil, err
 			}
 			body = append(body, d)
+		case strings.HasPrefix(t, "run "):
+			r, err := parseRunAction(strings.TrimSpace(t[len("run "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			body = append(body, r)
 		case strings.HasPrefix(t, "emit "):
 			// `emit Dto{…} [to <expr>]` — a typed stream event (ast.Emit).
 			rest := strings.TrimSpace(t[len("emit "):])
@@ -2191,6 +2207,13 @@ func parseActionBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
 				}
 				d.Bind = name
 				body = append(body, d)
+			case strings.HasPrefix(rhs, "run "):
+				r, err := parseRunAction(strings.TrimSpace(rhs[len("run "):]), c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				r.Bind = name
+				body = append(body, r)
 			case strings.HasPrefix(rhs, "add "):
 				s, err := parseAddText(strings.TrimSpace(rhs[len("add "):]), c)
 				if err != nil {
@@ -2975,6 +2998,25 @@ func parseTrigger(line string, no int) (*ast.Trigger, error) {
 // parseDo parses `ProcName(arg, ...)` — a proc call statement (`do ProcName(args)`,
 // or bound via `let x = do ProcName(args)`). Mirrors parseCall, minus the
 // `Service.op` dot: a proc has no service namespace to route through.
+// parseRunAction parses the `name(args)` of `run name(args)` (ast.RunAction).
+func parseRunAction(s string, line int) (ast.RunAction, error) {
+	if !strings.Contains(s, "(") {
+		// `run name` — a zero-argument action, written as it is declared.
+		if !isIdent(s) {
+			return ast.RunAction{}, &Error{line, fmt.Sprintf("invalid action name %q in run", s)}
+		}
+		return ast.RunAction{Action: s, Line: line}, nil
+	}
+	d, err := parseDo(s, line)
+	if err != nil {
+		if pe, ok := err.(*Error); ok {
+			return ast.RunAction{}, &Error{line, strings.Replace(strings.Replace(pe.Msg, "do ProcName", "run ActionName", 1), "proc name", "action name", 1)}
+		}
+		return ast.RunAction{}, err
+	}
+	return ast.RunAction{Action: d.Proc, Args: d.Args, Line: line}, nil
+}
+
 func parseDo(s string, line int) (ast.Do, error) {
 	open := strings.IndexByte(s, '(')
 	if open < 0 {
@@ -3134,16 +3176,23 @@ func parseProc(n *source.Node) (*ast.Proc, error) {
 			uses = append(uses, c)
 		}
 	}
-	var ret string
-	var retList bool
+	var ret, retKey string
+	var retList, retMap bool
 	if arrow := strings.Index(head, "->"); arrow >= 0 {
 		rt := strings.TrimSpace(head[arrow+2:])
 		head = strings.TrimSpace(head[:arrow])
-		core, list, optional := splitType(rt)
-		if optional || !isTypeName(core) {
-			return nil, &Error{n.Line.No, fmt.Sprintf("invalid return type %q", rt)}
+		if mk, mv, isMap := splitMapType(rt); isMap {
+			if err := checkMapType(mk, mv, "return type", n.Line.No); err != nil {
+				return nil, err
+			}
+			ret, retMap, retKey = mv, true, mk
+		} else {
+			core, list, optional := splitType(rt)
+			if optional || !isTypeName(core) {
+				return nil, &Error{n.Line.No, fmt.Sprintf("invalid return type %q", rt)}
+			}
+			ret, retList = core, list
 		}
-		ret, retList = core, list
 	}
 	// allowList=true: unlike an action/component/policy, a proc parameter may be
 	// list-typed (`buildTree(lines: [text])`) — the shape composing two procs
@@ -3154,7 +3203,7 @@ func parseProc(n *source.Node) (*ast.Proc, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &ast.Proc{Name: name, Params: params, Ret: ret, RetList: retList, Uses: uses, Line: n.Line.No}
+	p := &ast.Proc{Name: name, Params: params, Ret: ret, RetList: retList, RetMap: retMap, RetKey: retKey, Uses: uses, Line: n.Line.No}
 	body, err := parseProcBody(n.Children, fmt.Sprintf("proc %q", name))
 	if err != nil {
 		return nil, err
@@ -3904,6 +3953,14 @@ func parseSignature(head string, line int, allowList, allowRef bool) (string, []
 			}
 			if ref == ast.RefAction {
 				params = append(params, ast.Param{Name: pn, Ref: ref})
+				continue
+			}
+			// `{K: V}`: a map parameter, where a list parameter is allowed (a proc).
+			if mk, mv, isMap := splitMapType(pt); isMap && allowList && ref == ast.RefValue {
+				if err := checkMapType(mk, mv, "parameter "+pn, line); err != nil {
+					return "", nil, err
+				}
+				params = append(params, ast.Param{Name: pn, Type: mv, Map: true, Key: mk})
 				continue
 			}
 			core, list, optional := splitType(pt)
@@ -5897,6 +5954,35 @@ func isType(s string) bool {
 		return true
 	}
 	return false
+}
+
+// splitMapType reads a `{K: V}` type expression: the key type (int or text)
+// and the value type; ok false when s is not one. Only a proc's parameters,
+// return and struct fields take one (see parseSignature, parseProc and
+// parseStruct); V is a scalar or a struct name — never itself a list or map.
+func splitMapType(s string) (key, val string, ok bool) {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "{") || !strings.HasSuffix(s, "}") {
+		return "", "", false
+	}
+	inner := strings.TrimSpace(s[1 : len(s)-1])
+	colon := strings.IndexByte(inner, ':')
+	if colon < 0 {
+		return "", "", false
+	}
+	return strings.TrimSpace(inner[:colon]), strings.TrimSpace(inner[colon+1:]), true
+}
+
+// checkMapType is splitMapType's validation: the key int or text, the value
+// a type name.
+func checkMapType(key, val, what string, line int) error {
+	if key != "int" && key != "text" {
+		return &Error{line, fmt.Sprintf("%s: a map key must be int or text, got %q", what, key)}
+	}
+	if !isTypeName(val) {
+		return &Error{line, fmt.Sprintf("%s: unknown map value type %q (use a scalar or a struct name; a map holds no lists or maps)", what, val)}
+	}
+	return nil
 }
 
 // splitType pulls a trailing `?` (optional/nullable) and a `[...]` list wrapper

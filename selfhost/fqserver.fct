@@ -2585,13 +2585,17 @@ app FqServerSelfHost:
                 let out = do svDispatch(st, req, route, id, types)
                 eng = out.st.eng
                 svSnapshot = eng
+                # As Rust orders it: the events are in the ring and the
+                # writer is free (its mutex released) before the client is
+                # answered — so a client's next write, sent on the answer,
+                # never finds this one still counted as pending.
                 let fd = out.st.feed
                 let mut i = 0
                 loop i < len(fd.seqs):
                     let p = send(ch, svPack(["P", "" + fd.seqs[i], svBoolText(fd.everyone[i]), fd.owners[i], fd.payloads[i]]))
                     i = i + 1
-                let r = do svRespond(req.reply, "R", req.reqid, out.resp)
                 let c = send(ch, svPack(["C"]))
+                let r = do svRespond(req.reply, "R", req.reqid, out.resp)
                 if len(eng.rd.retiredSegs) > 0:
                     eng = do svWriterRetire(eng, ch)
             if k == "Q":
@@ -2908,6 +2912,10 @@ app FqServerSelfHost:
             if bound == 0:
                 bound = cfg.port
             let b5 = writeStdout("FacetQL Server Running on port " + bound + " (HTTP — no TLS; either pass --tls-identity/--tls-identity-password for native HTTPS, or terminate TLS at a reverse proxy in front of this, before running with real traffic)\n")
+        # The cells both tasks read are published before either starts:
+        # the loop's first message reads the engine the writer publishes.
+        svSnapshot = opened.st.eng
+        svFeedCell = opened.st.feed
         let wch = channel()
         detach svWriter(wch, ch, opened.st.cfg, opened.st.eng)
         detach svLoop(ch, wch, sig, opened.st)

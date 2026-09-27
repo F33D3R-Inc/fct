@@ -1,4 +1,5 @@
 import "fabric_frontdoor.fct"
+import "fabric_routing_feed.fct"
 
 # fabric_frontdoor_main.fct — the front door as a process:
 #
@@ -8,7 +9,8 @@ import "fabric_frontdoor.fct"
 # Point FACET_DATABASE_URL at it instead of at one FacetQL and nothing above
 # changes. Configuration, all from the environment:
 #
-#   FRONTDOOR_PORT        the port to serve on (required)
+#   FRONTDOOR_PORT        the port to serve on (required); 0 lets the
+#                         kernel choose, and the banner names the port bound
 #   FRONTDOOR_BACKENDS    `id=url,...` — every FacetQL instance (required)
 #   FRONTDOOR_PLACEMENTS  `shard=id[@region],...` — which instance holds each
 #                         shard's cell (0,0); default: shard 1 on the first
@@ -24,16 +26,41 @@ import "fabric_frontdoor.fct"
 #   FRONTDOOR_FENCE_RETRY_BUDGET_MS / FRONTDOOR_FENCE_RETRY_INTERVAL_MS /
 #   FRONTDOOR_UPSTREAM_TIMEOUT_MS  FrontDoorConfig's knobs (defaults 2000 /
 #                         50 / 35000)
+#   FRONTDOOR_ROUTING_FEED  the operator port of the fabricd whose routing
+#                         this door follows (http://host:port); the placements
+#                         then come from it, never from FRONTDOOR_PLACEMENTS,
+#                         and every cutover the daemon makes waits for this
+#                         door to confirm the fenced table
+#                         (fabric_routing_feed.fct)
+#   FRONTDOOR_ROUTING_TOKEN  that operator port's token (x-api-key)
+#   FRONTDOOR_DOOR_ID     this door's name to the daemon (default door-<port>)
+#   FRONTDOOR_FEED_INTERVAL_MS  how often the feed is polled (default 100)
+#
+# Following a feed, the door routes only on an answer it holds a lease on:
+# before the first answer, and whenever the daemon has not answered within
+# the lease it names, every request is refused 503 (retryable, Retry-After)
+# rather than routed by a table that may have been superseded.
 #
 # A configuration the door cannot serve (no backends, a URL that is not
 # http(s), a malformed list, a keyspace naming a shard nothing places) is
 # refused before the port is opened, exit status 2, saying why.
 app FabricFrontDoorMain:
+    struct FdmFeed:
+        on: bool
+        url: text
+        token: text
+        door: text
+        intervalMs: int
+
     struct FdmParsed:
         ok: bool
         err: text
         config: FdConfig
         fleet: FdFleet
+        feed: FdmFeed
+
+    proc fdmNoFeed() -> FdmFeed:
+        return FdmFeed{on: false, url: "", token: "", door: "", intervalMs: 0}
 
     proc fdmDigits(s: text) -> int:
         let bs = textToBytes(trim(s))
@@ -64,7 +91,7 @@ app FabricFrontDoorMain:
     proc fdmFail(msg: text) -> FdmParsed:
         let config = do fdConfigDefault(0)
         let empty = FdFleet{keyspace: PlanKeyspace{rules: [], hasFallback: false, fallbackKey: routingKeyUnset()}, routing: tableNew(), backends: []}
-        return FdmParsed{ok: false, err: msg, config: config, fleet: empty}
+        return FdmParsed{ok: false, err: msg, config: config, fleet: empty, feed: fdmNoFeed()}
 
     proc fdmKnob(name: text, fallback: int) -> int uses io.env:
         let raw = envVar(name)
@@ -76,8 +103,8 @@ app FabricFrontDoorMain:
     # fdmParse: the environment, read into the door's config and fleet.
     proc fdmParse() -> FdmParsed uses io.env:
         let port = do fdmDigits(envVar("FRONTDOOR_PORT"))
-        if port <= 0 || port > 65535:
-            let f = do fdmFail("FRONTDOOR_PORT must be a port number, got '" + envVar("FRONTDOOR_PORT") + "'")
+        if port < 0 || port > 65535:
+            let f = do fdmFail("FRONTDOOR_PORT must be a port number (0 for one the kernel chooses), got '" + envVar("FRONTDOOR_PORT") + "'")
             return f
         let mut backends = []
         let bs = do fdmItems(envVar("FRONTDOOR_BACKENDS"))
@@ -96,9 +123,34 @@ app FabricFrontDoorMain:
         if len(backends) == 0:
             let f = do fdmFail("facetql endpoint misconfigured: a front door with no backends can serve nothing (set FRONTDOOR_BACKENDS)")
             return f
+        let feedUrl = trim(envVar("FRONTDOOR_ROUTING_FEED"))
+        let mut feed = do fdmNoFeed()
+        if feedUrl != "":
+            let scheme = slice(feedUrl, 0, min(len(feedUrl), 7)) == "http://" || slice(feedUrl, 0, min(len(feedUrl), 8)) == "https://"
+            if !scheme:
+                let f = do fdmFail("FRONTDOOR_ROUTING_FEED must be an http(s) URL, got '" + feedUrl + "'")
+                return f
+            if trim(envVar("FRONTDOOR_PLACEMENTS")) != "":
+                let f = do fdmFail("FRONTDOOR_PLACEMENTS and FRONTDOOR_ROUTING_FEED are two sources of routing; a door following a control plane takes its placements from the feed alone")
+                return f
+            let token = envVar("FRONTDOOR_ROUTING_TOKEN")
+            if token == "":
+                let f = do fdmFail("FRONTDOOR_ROUTING_FEED needs FRONTDOOR_ROUTING_TOKEN, the operator port's token")
+                return f
+            let mut door = trim(envVar("FRONTDOOR_DOOR_ID"))
+            if door == "":
+                door = "door-" + port
+            let interval = do fdmKnob("FRONTDOOR_FEED_INTERVAL_MS", 100)
+            if interval <= 0:
+                let f = do fdmFail("FRONTDOOR_FEED_INTERVAL_MS must be a positive number of milliseconds")
+                return f
+            let mut trimmed = feedUrl
+            loop len(trimmed) > 0 && charAt(trimmed, len(trimmed) - 1) == "/":
+                trimmed = slice(trimmed, 0, len(trimmed) - 1)
+            feed = FdmFeed{on: true, url: trimmed, token: token, door: door, intervalMs: interval}
         let mut reg = do topologyRegistryNew()
         let ps = do fdmItems(envVar("FRONTDOOR_PLACEMENTS"))
-        if len(ps) == 0:
+        if len(ps) == 0 && !feed.on:
             reg = topologyRegistryPlace(reg, backends[0].id, 1, Coordinate{x: 0, y: 0}, "local")
         let mut j = 0
         loop j < len(ps):
@@ -157,6 +209,10 @@ app FabricFrontDoorMain:
             named = append(named, rules[r].key.shardId)
             r = r + 1
         let mut n = 0
+        if feed.on:
+            # The feed's table places the shards; the first answer is awaited
+            # with every request refused until it arrives.
+            n = len(named)
         loop n < len(named):
             let found = do tableShardLookup(routing, named[n])
             if !found.found:
@@ -172,7 +228,117 @@ app FabricFrontDoorMain:
             return f
         let fleet = do fdFleetNew(ks, backends, routing)
         let config = FdConfig{readPref: d.readPref, fenceRetryBudgetMs: budget, fenceRetryIntervalMs: interval, upstreamTimeoutMs: upstream, maxBodyBytes: d.maxBodyBytes, port: port, trustFile: trim(envVar("FRONTDOOR_TRUST_FILE"))}
-        return FdmParsed{ok: true, err: "", config: config, fleet: fleet.fleet}
+        return FdmParsed{ok: true, err: "", config: config, fleet: fleet.fleet, feed: feed}
+
+    # ── following a control plane's routing (fabric_routing_feed.fct) ───
+    shared fdmFeedOn: bool
+    shared fdmLeaseUntil: int
+    shared fdmInflight: int
+
+    # The in-flight accounting, owned by one task: `b|conn` a request
+    # begins, `g|conn|gen` it read that table, `e|conn` it was answered,
+    # `q|adopted|last|reply` what the door can confirm.
+    proc fdmInflightTask(ch: int) -> bool:
+        let mut es = []
+        loop true:
+            let f = split(recv(ch), "|")
+            if f[0] == "b":
+                es = doorInflightBegin(es, toInt(f[1]))
+            if f[0] == "g":
+                es = doorInflightRead(es, toInt(f[1]), u64Parse(f[2]))
+            if f[0] == "e":
+                es = doorInflightEnd(es, toInt(f[1]))
+            if f[0] == "q":
+                let answered = send(toInt(f[3]), sjU64Text(doorInflightConfirmable(es, u64Parse(f[1]), u64Parse(f[2]))))
+        return true
+
+    # The poller: every interval, say what this door adopted and confirms,
+    # adopt a newer table, and take the lease the answer carries — counted
+    # from when the poll was sent.
+    proc fdmPoller(feed: FdmFeed, boundMs: int) -> bool uses io.net, io.console:
+        let reply = channel()
+        let mut confirmed = 0
+        let mut failing = false
+        loop true:
+            let adopted = do fdGeneration()
+            let asked = send(fdmInflight, "q|" + sjU64Text(adopted) + "|" + sjU64Text(confirmed) + "|" + reply)
+            confirmed = u64Parse(recv(reply))
+            let sentAt = monoMs()
+            let url = feed.url + "/routing/feed?door=" + feed.door + "&adopted=" + sjU64Text(adopted) + "&confirmed=" + sjU64Text(confirmed) + "&bound=" + boundMs
+            let r = do httpExchange(HttpRequest{method: "GET", url: url, headers: [HttpHeader{name: "x-api-key", value: feed.token}], body: "", timeoutMs: 1000})
+            let mut why = ""
+            if !r.ok:
+                why = r.err
+            else:
+                if r.status != 200:
+                    why = "status " + r.status + ": " + trim(r.body)
+                else:
+                    let a = do rtfReadAnswer(r.body)
+                    if !a.ok:
+                        why = a.err
+                    else:
+                        if a.hasTable && sjU64Gt(a.table.generation, adopted):
+                            do fdPublishRouting(a.table)
+                        fdmLeaseUntil = sentAt + a.leaseMs
+                        if failing:
+                            let w = writeStderr("fabric front door: the routing feed answers again (generation " + sjU64Text(a.generation) + ")\n")
+                            failing = false
+            if why != "" && !failing:
+                let w2 = writeStderr("fabric front door: the routing feed did not answer (" + why + "); routing stops when the lease runs out\n")
+                failing = true
+            let slept = sleepMs(feed.intervalMs)
+        return true
+
+    proc fdmStale() -> HttpServerResponse:
+        let r = do httpServerPlain(503, "fabric front door: its routing is stale — the control plane's routing feed has not answered within its lease; retry\n")
+        return HttpServerResponse{status: r.status, reason: r.reason, headers: append(r.headers, HttpHeader{name: "retry-after", value: "1"}), body: r.body}
+
+    # fdServeConn, following a feed: a request is refused once the lease has
+    # run out, and every request is accounted in flight — from before it
+    # reads the door's table until it is answered — so the door confirms only
+    # a table nothing older is still being routed by. A subscription is a
+    # read, and ends its accounting once it is routed.
+    proc fdmServeConn(c: int) uses io.net, io.net.listen:
+        let config = fdConfig
+        let inflight = fdmInflight
+        let mut pending = []
+        let mut open = true
+        loop open:
+            let req = do httpServerReadRequest(c, pending, config.maxBodyBytes)
+            if req.state == 0:
+                open = false
+            if req.state == -1:
+                let refused = do httpServerRefuse(c, 400, "bad request: " + req.err)
+                open = false
+            if req.state == -2:
+                let refused2 = do httpServerRefuse(c, 413, "request body exceeds the " + config.maxBodyBytes + " byte limit")
+                open = false
+            if req.state == 1:
+                pending = req.rest
+                let keep = do httpServerKeepAlive(req)
+                let until = fdmLeaseUntil
+                if monoMs() > until:
+                    let wroteStale = do httpServerWriteResponse(c, req.method, fdmStale(), keep)
+                    open = wroteStale && keep
+                else:
+                    let b = send(inflight, "b|" + c)
+                    let g = send(inflight, "g|" + c + "|" + sjU64Text(fdGeneration()))
+                    let routed = do fdRoute(req)
+                    if routed.decided:
+                        let e0 = send(inflight, "e|" + c)
+                        let wrote = do httpServerWriteResponse(c, req.method, routed.response, keep)
+                        open = wrote && keep
+                    else:
+                        if routed.plan.kind == 2:
+                            let e1 = send(inflight, "e|" + c)
+                            let again = do fdSubscribe(c, req.method, req.target, req.headers)
+                            open = again && keep
+                        else:
+                            let r = do fdDispatchNoting(req, routed.plan, inflight, c)
+                            let e2 = send(inflight, "e|" + c)
+                            let wrote2 = do httpServerWriteResponse(c, req.method, r, keep)
+                            open = wrote2 && keep
+        let closed = closeConn(c)
 
     daemon FrontDoor uses io.net, io.net.listen, io.env, io.console:
         let parsed = do fdmParse()
@@ -180,8 +346,20 @@ app FabricFrontDoorMain:
             let w = writeStderr("fabric front door: " + parsed.err + "\n")
             let e = exitProcess(2)
         do fdInstall(parsed.config, parsed.fleet)
+        fdmFeedOn = parsed.feed.on
+        fdmLeaseUntil = 0
+        if parsed.feed.on:
+            fdmInflight = channel()
+            detach fdmInflightTask(fdmInflight)
+            detach fdmPoller(parsed.feed, parsed.config.upstreamTimeoutMs)
         let l = listen(parsed.config.port)
-        let b = writeStdout("fabric front door serving on port " + parsed.config.port + " in front of " + len(parsed.fleet.backends) + " FacetQL instance(s)\n")
+        let mut following = ""
+        if parsed.feed.on:
+            following = ", following the routing of " + parsed.feed.url + " as " + parsed.feed.door
+        let b = writeStdout("fabric front door serving on port " + listenerPort(l) + " in front of " + len(parsed.fleet.backends) + " FacetQL instance(s)" + following + "\n")
         loop true:
             let c = accept(l)
-            detach fdServeConn(c)
+            if parsed.feed.on:
+                detach fdmServeConn(c)
+            else:
+                detach fdServeConn(c)

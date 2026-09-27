@@ -1,0 +1,419 @@
+import "contract_history.fct"
+
+app StreamsWebhooks:
+    # streams_webhooks.fct — runtime/streams.go and runtime/webhook.go.
+    #
+    # A declared `stream "/path/{param}"` is a GET-only, rate-metered
+    # text/event-stream: a session is required when the stream says so (401
+    # "sign in to subscribe", then its policy — 403 "forbidden: <policy>"),
+    # its `connect -> action [as event]` hooks run as the subscriber before
+    # the head (a refusal is the hook's own status and message), and the
+    # stream opens with a ": connected" comment, the unnumbered hello frame
+    # when declared, the connect frames, and — for a client presenting
+    # Last-Event-ID (or ?last_event_id) — every retained frame after it that
+    # this subscriber may see. Every `emit` an action makes is appended, as
+    # `id: N / event: name / data: json`, to the log of each stream carrying
+    # an event of that type (capped at 512 frames) and sent to each open
+    # subscriber it is addressed to (`to` an actor; `on` a parameterised
+    # instance). When the subscriber leaves, the `disconnect` hook runs.
+    #
+    # A declared `webhook "/path" -> action` accepts a POST whose body is
+    # signed (X-Facet-Signature: hex HMAC-SHA256 of the body under the
+    # webhook's secret, or the app's signing key when that secret is unset),
+    # runs the action with system authority on the body's fields, and
+    # remembers the outcome under the delivery's Idempotency-Key (or its
+    # signature) for FACET_WEBHOOK_IDEM_TTL seconds, so a redelivery is
+    # answered with the first outcome instead of running again. The Go
+    # runtime has no outbound webhook delivery; neither does this.
+    #
+    # ── matching ────────────────────────────────────────────────────────
+    struct RtStreamMatch:
+        found: bool
+        at: int
+        names: [text]
+        vals: [text]
+
+    # rtMatchPattern: ServeMux's matching of a `{name}` wildcard pattern —
+    # each wildcard one non-empty segment, its value unescaped.
+    proc rtMatchPattern(pattern: text, path: text) -> RtMatch:
+        let ps = split(rtTrimSlashes(pattern), "/")
+        let cs = split(rtTrimSlashes(path), "/")
+        if len(ps) != len(cs):
+            return RtMatch{ok: false, names: [], vals: []}
+        let mut names = []
+        let mut vals = []
+        let mut i = 0
+        loop i < len(ps):
+            let p = ps[i]
+            if len(p) > 1 && charAt(p, 0) == "{" && charAt(p, len(p) - 1) == "}":
+                if cs[i] == "":
+                    return RtMatch{ok: false, names: [], vals: []}
+                names = append(names, slice(p, 1, len(p) - 1))
+                vals = append(vals, rtPathUnescape(cs[i]))
+            else:
+                if p != cs[i]:
+                    return RtMatch{ok: false, names: [], vals: []}
+            i = i + 1
+        return RtMatch{ok: true, names: names, vals: vals}
+
+    proc rtStreamFor(g: IRGraph, path: text) -> RtStreamMatch:
+        let mut i = 0
+        loop i < len(g.streams):
+            let m = do rtMatchPattern(g.streams[i].path, path)
+            if m.ok:
+                return RtStreamMatch{found: true, at: i, names: m.names, vals: m.vals}
+            i = i + 1
+        return RtStreamMatch{found: false, at: -1, names: [], vals: []}
+
+    proc rtWebhookIndex(g: IRGraph, path: text) -> int:
+        let mut i = 0
+        loop i < len(g.webhooks):
+            if g.webhooks[i].path == path:
+                return i
+            i = i + 1
+        return -1
+
+    # ── hooks ───────────────────────────────────────────────────────────
+    struct RtHook:
+        ok: bool
+        status: int
+        msg: text
+        value: Val
+        w: RtWorld
+
+    # rtRunStreamHook: runStreamHook — the action, each parameter bound from
+    # the path value of the same name.
+    proc rtRunStreamHook(w0: RtWorld, sid: text, action: text, names: [text], vals: [text]) -> RtHook:
+        let ai = do rtActionIndex(w0.g, action)
+        if ai < 0:
+            return RtHook{ok: false, status: 500, msg: "no such action " + action, value: noneVal(), w: w0}
+        let act = w0.g.actions[ai]
+        let mut args = []
+        let mut i = 0
+        loop i < len(act.params):
+            let p = act.params[i]
+            let mut raw = ""
+            let mut k = 0
+            loop k < len(names):
+                if names[k] == p.name:
+                    raw = vals[k]
+                k = k + 1
+            let c = do rtParamArg(textVal(raw), p)
+            if !c.ok:
+                return RtHook{ok: false, status: 404, msg: "parameter \"" + p.name + "\" expects " + rtParamTypeName(p), value: noneVal(), w: w0}
+            args = append(args, c.v)
+            i = i + 1
+        let run = do rtRunActionValue(w0, sid, act, args)
+        if run.status != 200:
+            return RtHook{ok: false, status: run.status, msg: run.msg, value: noneVal(), w: run.w}
+        return RtHook{ok: true, status: 200, msg: "", value: run.value, w: run.w}
+
+    # ── the stream route ────────────────────────────────────────────────
+    proc rtHelloEvent(w: RtWorld) -> text:
+        let id = do rtHex(randomBytes(12))
+        let body = do rtObjectJSONRaw(["session_id", "contract_version", "schema_version", "server_time"], [jsonQuote(id), jsonQuote(w.contractVersion), jsonQuote("" + w.schemaVersion), jsonQuote(iso(nowMs() / 1000))])
+        return body
+
+    proc rtVisibleTo(f: RtLoggedFrame, actor: text, key: text) -> bool:
+        return (!f.targeted || f.to == actor) && f.key == key
+
+    struct RtStreamOpen:
+        stream: bool
+        resp: HttpServerResponse
+        w: RtWorld
+        chan: int
+
+    proc rtHandleStream(w0: RtWorld, req: HttpServerRequest, m: RtStreamMatch, peer: text) -> RtStreamOpen uses io.net:
+        let mut w = w0
+        let st = w.g.streams[m.at]
+        if req.method != "GET":
+            let na = do rtAPIError(405, "method not allowed")
+            return RtStreamOpen{stream: false, resp: na, w: w, chan: 0}
+        let ip = do rtClientIP(req, peer)
+        let rate = do rtMeterRate(w, st.rate, ip)
+        w = rate.w
+        if !rate.allowed:
+            let limited = do rtAPIError(429, "rate limited")
+            let lr = do rtWithHeaders(limited, rate.headers)
+            return RtStreamOpen{stream: false, resp: lr, w: w, chan: 0}
+        let so = do rtSidForRequest(w, req)
+        w = so.w
+        let mut sid = so.sid
+        let sc = do rtScope(w, sid)
+        if st.auth == "session":
+            if sid == "":
+                let mut ua = do rtAPIError(401, "sign in to subscribe")
+                ua.headers = append(ua.headers, HttpHeader{name: "www-authenticate", value: "Bearer"})
+                let uar = do rtWithHeaders(ua, rate.headers)
+                return RtStreamOpen{stream: false, resp: uar, w: w, chan: 0}
+            let ok = do rtPolicyPasses(w.g, IRRequire{name: st.requires, args: []}, sc)
+            if !ok:
+                let fb = do rtAPIError(403, "forbidden: " + st.requires)
+                let fbr = do rtWithHeaders(fb, rate.headers)
+                return RtStreamOpen{stream: false, resp: fbr, w: w, chan: 0}
+        let mut lastID = -1
+        let mut raw = do rtHeaderValue(req.headers, "last-event-id")
+        if raw == "":
+            raw = do rtQueryValue(req.query, "last_event_id")
+        if raw != "":
+            let t = trim(raw)
+            let num = do rtIsDigits(t)
+            if num:
+                lastID = toInt(t)
+        let mut headers = rate.headers
+        if sid == "" && (len(st.connects) > 0 || st.disconnect != ""):
+            let minted = do rtSession(w, req)
+            w = minted.w
+            sid = minted.sid
+            headers = append(headers, minted.cookie)
+        let mut connectFrames = ""
+        let mut h = 0
+        loop h < len(st.connects):
+            let hook = do rtRunStreamHook(w, sid, st.connects[h].action, m.names, m.vals)
+            w = hook.w
+            if !hook.ok:
+                let hf = do rtAPIError(hook.status, hook.msg)
+                let hfr = do rtWithHeaders(hf, headers)
+                return RtStreamOpen{stream: false, resp: hfr, w: w, chan: 0}
+            if st.connects[h].event != "":
+                connectFrames = connectFrames + "event: " + st.connects[h].event + "\ndata: " + rtValJSON(hook.value) + "\n\n"
+            # A hook is an action: its writes are durable and its changes and
+            # events fan out when it completes (runActionLocked) — before this
+            # subscriber is registered, so it never receives its own join.
+            let done = do rtStoreCommit(w)
+            if !done.ok:
+                let hf2 = do rtAPIError(500, "the write could not be stored and was rolled back")
+                let hf2r = do rtWithHeaders(hf2, headers)
+                let mut reverted = w0
+                reverted.pendingOps = []
+                reverted.pendingChanged = []
+                reverted.pendingEvents = []
+                return RtStreamOpen{stream: false, resp: hf2r, w: reverted, chan: 0}
+            w = done.w
+            let changed = w.pendingChanged
+            w.pendingChanged = []
+            if len(changed) > 0:
+                w = do rtBroadcast(w, changed)
+            w = do rtFanoutEvents(w)
+            h = h + 1
+        let actorV = do rtGet(rtScope(w, sid), "actor")
+        let actor = do valToStr(actorV)
+        let key = do rtJoinTexts(m.vals, "\x00")
+        let ch = channel()
+        w.streamSubs = append(w.streamSubs, RtStreamSub{ch: ch, path: st.path, actor: actor, key: key, sid: sid, paramNames: m.names, paramVals: m.vals})
+        let mut replay = ""
+        if lastID >= 0:
+            let li = do rtStreamLogIndex(w, st.path)
+            if li >= 0:
+                let frames = w.streamLogs[li].frames
+                let mut f = 0
+                loop f < len(frames):
+                    let vis = do rtVisibleTo(frames[f], actor, key)
+                    if frames[f].seq > lastID && vis:
+                        replay = replay + frames[f].frame
+                    f = f + 1
+        let mut body = ": connected\n\n"
+        if st.hello != "":
+            body = body + "event: hello\ndata: " + rtHelloEvent(w) + "\n\n"
+        body = body + connectFrames + replay
+        headers = headers + [HttpHeader{name: "content-type", value: "text/event-stream"}, HttpHeader{name: "cache-control", value: "no-cache"}, HttpHeader{name: "connection", value: "keep-alive"}]
+        return RtStreamOpen{stream: true, resp: HttpServerResponse{status: 200, reason: "", headers: headers, body: body}, w: w, chan: ch}
+
+    proc rtIsDigits(s: text) -> bool:
+        if s == "":
+            return false
+        let mut i = 0
+        loop i < len(s):
+            let c = charAt(s, i)
+            if !(c >= "0" && c <= "9"):
+                return false
+            i = i + 1
+        return true
+
+    proc rtStreamLogIndex(w: RtWorld, path: text) -> int:
+        let mut i = 0
+        loop i < len(w.streamLogs):
+            if w.streamLogs[i].path == path:
+                return i
+            i = i + 1
+        return -1
+
+    # rtStreamGone: a subscriber's connection ended — drop it and run the
+    # stream's disconnect hook as that subscriber.
+    proc rtStreamGone(w0: RtWorld, ch: int) -> RtWorld:
+        let mut w = w0
+        let mut at = -1
+        let mut i = 0
+        loop i < len(w.streamSubs):
+            if w.streamSubs[i].ch == ch:
+                at = i
+            i = i + 1
+        if at < 0:
+            return w
+        let sub = w.streamSubs[at]
+        w.streamSubs = slice(w.streamSubs, 0, at) + slice(w.streamSubs, at + 1, len(w.streamSubs))
+        let closed = closeChannel(ch)
+        let m = do rtStreamFor(w.g, sub.path)
+        if m.found:
+            let st = w.g.streams[m.at]
+            if st.disconnect != "":
+                let hook = do rtRunStreamHook(w, sub.sid, st.disconnect, sub.paramNames, sub.paramVals)
+                w = hook.w
+        return w
+
+    # rtFanoutEvents: fanoutEvents — each pending event onto every stream
+    # carrying its type (and name), logged and sent.
+    proc rtFanoutEvents(w0: RtWorld) -> RtWorld:
+        let mut w = w0
+        let events = w.pendingEvents
+        w.pendingEvents = []
+        let mut e = 0
+        loop e < len(events):
+            let ev = events[e]
+            let mut si = 0
+            loop si < len(w.g.streams):
+                let st = w.g.streams[si]
+                let mut d = 0
+                loop d < len(st.events):
+                    let def = st.events[d]
+                    if def.type == ev.typ && (ev.name == "" || def.name == ev.name):
+                        let mut li = do rtStreamLogIndex(w, st.path)
+                        if li < 0:
+                            w.streamLogs = append(w.streamLogs, RtStreamLog{path: st.path, seq: 0, frames: []})
+                            li = len(w.streamLogs) - 1
+                        let mut lg = w.streamLogs[li]
+                        lg.seq = lg.seq + 1
+                        let f = RtLoggedFrame{seq: lg.seq, frame: "id: " + lg.seq + "\nevent: " + def.name + "\ndata: " + ev.payload + "\n\n", to: ev.to, targeted: ev.targeted, key: ev.key}
+                        lg.frames = append(lg.frames, f)
+                        if len(lg.frames) > 512:
+                            lg.frames = slice(lg.frames, len(lg.frames) - 512, len(lg.frames))
+                        w.streamLogs[li] = lg
+                        let mut k = 0
+                        loop k < len(w.streamSubs):
+                            let sub = w.streamSubs[k]
+                            let vis = do rtVisibleTo(f, sub.actor, sub.key)
+                            if sub.path == st.path && vis:
+                                let sent = send(sub.ch, f.frame)
+                            k = k + 1
+                    d = d + 1
+                si = si + 1
+            e = e + 1
+        return w
+
+    # ── webhooks ────────────────────────────────────────────────────────
+    proc rtWebhookKey(w: RtWorld, path: text) -> [int]:
+        let mut i = 0
+        loop i < len(w.whPaths):
+            if w.whPaths[i] == path && w.whKeys[i] != "":
+                return textToBytes(w.whKeys[i])
+            i = i + 1
+        return w.signKey
+
+    proc rtIdemIndex(w: RtWorld, key: text) -> int:
+        let mut i = 0
+        loop i < len(w.idemKeys):
+            if w.idemKeys[i] == key:
+                return i
+            i = i + 1
+        return -1
+
+    # rtIdemPurge: every expired record dropped (idemBegin's sweep).
+    proc rtIdemPurge(w0: RtWorld) -> RtWorld:
+        let mut w = w0
+        let now = nowMs() / 1000
+        let mut keys = []
+        let mut done = []
+        let mut status = []
+        let mut body = []
+        let mut exp = []
+        let mut i = 0
+        loop i < len(w.idemKeys):
+            if now <= w.idemExpires[i]:
+                keys = append(keys, w.idemKeys[i])
+                done = append(done, w.idemDone[i])
+                status = append(status, w.idemStatus[i])
+                body = append(body, w.idemBody[i])
+                exp = append(exp, w.idemExpires[i])
+            i = i + 1
+        w.idemKeys = keys
+        w.idemDone = done
+        w.idemStatus = status
+        w.idemBody = body
+        w.idemExpires = exp
+        return w
+
+    proc rtIdemRecord(w0: RtWorld, key: text, st: int, body: text) -> RtWorld:
+        let mut w = w0
+        let at = do rtIdemIndex(w, key)
+        let exp = nowMs() / 1000 + w.idemTTL
+        if at >= 0:
+            w.idemDone[at] = true
+            w.idemStatus[at] = st
+            w.idemBody[at] = body
+            w.idemExpires[at] = exp
+            return w
+        w.idemKeys = append(w.idemKeys, key)
+        w.idemDone = append(w.idemDone, true)
+        w.idemStatus = append(w.idemStatus, st)
+        w.idemBody = append(w.idemBody, body)
+        w.idemExpires = append(w.idemExpires, exp)
+        return w
+
+    proc rtWebhookOK() -> HttpServerResponse:
+        return HttpServerResponse{status: 200, reason: "", headers: [HttpHeader{name: "content-type", value: "application/json"}], body: "{\"ok\":true}"}
+
+    proc rtHandleWebhook(w0: RtWorld, req: HttpServerRequest, at: int) -> RtHandled:
+        let mut w = w0
+        let wh = w.g.webhooks[at]
+        if req.method != "POST":
+            let m = do rtTextError(405, "POST only")
+            return RtHandled{resp: m, w: w}
+        let mut body = do rtBodyBytes(req)
+        if len(body) > 1024 * 1024:
+            body = slice(body, 0, 1024 * 1024)
+        let sig = do rtHeaderValue(req.headers, "x-facet-signature")
+        let key = do rtWebhookKey(w, wh.path)
+        let want = do rtHex(hmacSha256(key, body))
+        if sig == "" || sig != want:
+            let fb = do rtTextError(403, "invalid webhook signature")
+            return RtHandled{resp: fb, w: w}
+        let hdr = do rtHeaderValue(req.headers, "idempotency-key")
+        let mut idem = "s:" + sig
+        if hdr != "":
+            idem = "k:" + hdr
+        let ikey = wh.path + "\x00" + idem
+        w = do rtIdemPurge(w)
+        let seen = do rtIdemIndex(w, ikey)
+        if seen >= 0:
+            if w.idemStatus[seen] == 200:
+                let mut ok = do rtWebhookOK()
+                ok.body = w.idemBody[seen]
+                ok.headers = append(ok.headers, HttpHeader{name: "x-facet-idempotent-replay", value: "1"})
+                return RtHandled{resp: ok, w: w}
+            let mut again = do rtTextError(w.idemStatus[seen], w.idemBody[seen])
+            again.headers = append(again.headers, HttpHeader{name: "x-facet-idempotent-replay", value: "1"})
+            return RtHandled{resp: again, w: w}
+        let mut fields = do jNone()
+        if len(body) > 0:
+            fields = do jsonParse(bytesToText(body))
+            if fields.kind != "obj":
+                let bad = do rtTextError(400, "bad payload")
+                return RtHandled{resp: bad, w: w}
+        let ai = do rtActionIndex(w.g, wh.action)
+        let act = w.g.actions[ai]
+        let mut args = []
+        let mut i = 0
+        loop i < len(act.params):
+            let jv = do jGet(fields, act.params[i].name)
+            let v = do rtJValToVal(jv)
+            args = append(args, v)
+            i = i + 1
+        let run = do rtRunActionValue(w, "__system", act, args)
+        w = run.w
+        if run.status != 200:
+            w = do rtIdemRecord(w, ikey, run.status, run.msg)
+            let e = do rtTextError(run.status, run.msg)
+            return RtHandled{resp: e, w: w}
+        let ok2 = do rtWebhookOK()
+        w = do rtIdemRecord(w, ikey, 200, ok2.body)
+        return RtHandled{resp: ok2, w: w}

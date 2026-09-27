@@ -263,7 +263,7 @@ app CheckSelfHost:
     # restated with -1 as its "not a pure builtin" second return.
     # ============================================================
     proc pureBuiltinArity(name: text) -> int:
-        if name in ["abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day", "ago", "compact", "commas", "iso", "fromIso", "first", "fromJson", "bytes", "toFloat", "toInt", "toMoney", "slug", "textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits", "u64Text", "u64Parse", "u64ParseError", "u64ToFloat", "sha256Bytes", "base64UrlRaw", "bcryptHash"]:
+        if name in ["abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day", "ago", "compact", "commas", "iso", "fromIso", "first", "fromJson", "bytes", "toFloat", "toInt", "toMoney", "slug", "textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits", "exp", "ln", "sqrt", "u64Text", "u64Parse", "u64ParseError", "u64ToFloat", "sha256Bytes", "base64UrlRaw", "bcryptHash"]:
             return 1
         if name == "print":
             return 1
@@ -304,6 +304,10 @@ app CheckSelfHost:
         # `failed(a)` and `dirty(s)`/`touched(s)` may name.
         actionNames: [text]
         stateNames: [text]
+        # stateDeclPlacements: each cell's DECLARED placement ("server",
+        # "client", "private", "" when inferred), parallel to stateNames —
+        # e.states as checkBuiltins' aggregate-over-a-list-cell rule reads it.
+        stateDeclPlacements: [text]
         # inDerive: the expression is a parameterized derive's body, which
         # may call a proc (the derive then being usable only in actions).
         inDerive: bool
@@ -316,7 +320,7 @@ app CheckSelfHost:
         tsc: TyScope
 
     proc emptyCallEnv() -> CallEnv:
-        return CallEnv{fnNames: [], fnArities: [], procNames: [], procArities: [], procDerives: [], listNames: [], jsonNames: [], deriveKeys: [], inAction: false, inDerive: false, inProc: false, ty: tyEmptyEnv(), tsc: tyEmptyScope(), actionNames: [], stateNames: []}
+        return CallEnv{fnNames: [], fnArities: [], procNames: [], procArities: [], procDerives: [], listNames: [], jsonNames: [], deriveKeys: [], inAction: false, inDerive: false, inProc: false, ty: tyEmptyEnv(), tsc: tyEmptyScope(), actionNames: [], stateNames: [], stateDeclPlacements: []}
 
     # indexIsJson / indexIsList: checkIndexable's exprType test on an
     # index's object — a list (a list-valued name, split(...), list(...)) or
@@ -377,7 +381,7 @@ app CheckSelfHost:
             if argc != 1:
                 return "rand(n) takes exactly one argument (an exclusive upper bound)"
             return ""
-        if name == "readFile" || name == "httpGet" || name == "fileExists" || name == "fileSize" || name == "fileModTime" || name == "syncFile" || name == "removeFile" || name == "lockFile" || name == "listen" || name == "accept" || name == "closeListener" || name == "listenError" || name == "listenerPort" || name == "grantRead" || name == "closeConn" || name == "connError" || name == "connPeer" || name == "connOpen" || name == "shutdownConn" || name == "writeStdout" || name == "writeStderr" || name == "envVar" || name == "envSet" || name == "randomBytes":
+        if name == "readFile" || name == "httpGet" || name == "fileExists" || name == "fileSize" || name == "fileModTime" || name == "syncFile" || name == "removeFile" || name == "lockFile" || name == "toHex" || name == "fromHex" || name == "listen" || name == "accept" || name == "closeListener" || name == "listenError" || name == "listenerPort" || name == "grantRead" || name == "closeConn" || name == "connError" || name == "connPeer" || name == "connOpen" || name == "shutdownConn" || name == "writeStdout" || name == "writeStderr" || name == "envVar" || name == "envSet" || name == "randomBytes":
             if argc != 1:
                 return name + "(...) takes exactly one argument"
             return ""
@@ -385,7 +389,15 @@ app CheckSelfHost:
             if argc != 2:
                 return name + "(...) takes exactly two arguments"
             return ""
-        if name == "readFileAt" || name == "writeFileAt" || name == "pollBytes" || name == "crc32":
+        if name == "bytesCmpRange":
+            if argc != 6:
+                return "bytesCmpRange(a, aFrom, aTo, b, bFrom, bTo) takes exactly six arguments"
+            return ""
+        if name == "bytesCmp":
+            if argc != 2:
+                return "bytesCmp(a, b) takes exactly two arguments"
+            return ""
+        if name == "readFileAt" || name == "writeFileAt" || name == "pollBytes" || name == "crc32" || name == "uintLE":
             if argc != 3:
                 return name + "(...) takes exactly three arguments"
             return ""
@@ -514,12 +526,31 @@ app CheckSelfHost:
     # entity; a field aggregate with no general reduced value needs a
     # field the entity has; `exists` needs the filtered (item-variable)
     # form.
-    proc aggDiag(n: ExprNode, entityNames: [text], entityFields: [text]) -> text:
+    proc aggDiag(n: ExprNode, entityNames: [text], entityFields: [text], ce: CallEnv) -> text:
         let op = n.text
         let coll = n.coll
         let isEntity = do nameIn(coll, entityNames)
         if !isEntity:
-            return op + "(...) needs an entity collection; \"" + coll + "\" is not an entity"
+            # An aggregate over a `[T]` list cell ranges its elements the way
+            # `for x in <list>` does (build.go's checkBuiltins Agg arm).
+            let st = do tyLookup(ce.ty.stateNames, ce.ty.stateTypes, coll)
+            let isListCell = slice(st, 0, 1) == "["
+            if !isListCell:
+                return op + "(...) needs a collection to range over; \"" + coll + "\" is neither an entity nor a `[T]` list state"
+            let at = do indexOfName(ce.stateNames, coll)
+            let mut place = ""
+            if at >= 0 && at < len(ce.stateDeclPlacements):
+                place = ce.stateDeclPlacements[at]
+            if place != "server" && place != "private":
+                return op + "(...) over \"" + coll + "\": an aggregate runs on the authority, so the cell must live there — declare it `state " + coll + ": [T] = [] @server`"
+            let fieldAggL = do isFieldAgg(op)
+            if fieldAggL && len(n.sel) == 0:
+                return op + " over the list cell \"" + coll + "\" needs the value to reduce: " + op + "(<expr over x> in " + coll + " where …)"
+            if op == "exists" && n.itemVar == "":
+                return "exists needs a filtered form: exists(x in " + coll + " where <cond>)"
+            if n.order != "" || len(n.orderBy) > 0:
+                return "list(...) over the list cell \"" + coll + "\" keeps the cell's own order — drop `by`"
+            return ""
         let fieldAgg = do isFieldAgg(op)
         if fieldAgg && len(n.sel) == 0:
             let hasField = do entityHasField(coll, n.field, entityFields)
@@ -569,7 +600,7 @@ app CheckSelfHost:
             let rd = do tyRecordFieldDiag(ce.ty, n, ce.tsc)
             return rd
         if n.kind == "agg":
-            let d = do aggDiag(n, entityNames, entityFields)
+            let d = do aggDiag(n, entityNames, entityFields, ce)
             return d
         if n.kind == "call":
             let d2 = do callArityDiag(n, ce)

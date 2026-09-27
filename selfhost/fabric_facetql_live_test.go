@@ -21,7 +21,6 @@ package selfhost
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -77,17 +76,12 @@ func fqlLiveServerBin(t *testing.T) string {
 func fqlLiveStart(t *testing.T) string {
 	t.Helper()
 	bin := fqlLiveServerBin(t)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
-	var log strings.Builder
+	// Port 0: the engine names the port the kernel gave it in its banner.
+	var log fdtSyncBuffer
 	cmd := exec.Command(bin, "start")
 	cmd.Env = append(os.Environ(),
 		"FACETQL_DATA_DIR="+t.TempDir(),
-		fmt.Sprintf("FACETQL_PORT=%d", port),
+		"FACETQL_PORT=0",
 		"FACETQL_TOKENS=fabtok:fabric:admin",
 		"FACETQL_MASTER_KEY="+facetqlCheckKey,
 		"FACETQL_ALLOW_PLAINTEXT=1",
@@ -101,7 +95,7 @@ func fqlLiveStart(t *testing.T) string {
 		cmd.Process.Kill()
 		cmd.Wait()
 	})
-	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+	base := fmt.Sprintf("http://127.0.0.1:%d", fdtEngineBanner(t, log.String, fdtEngineBannerRE))
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		req, _ := http.NewRequest("GET", base+"/stats", nil)

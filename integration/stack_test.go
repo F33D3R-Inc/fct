@@ -413,12 +413,16 @@ func (e *engine) waitReady() bool {
 	return false
 }
 
+// engineClient bounds every harness request to the engine: an engine that
+// accepts a connection and never answers is a failed start, not a hang.
+var engineClient = &http.Client{Timeout: 10 * time.Second}
+
 func (e *engine) get(path string) ([]byte, error) {
 	req, _ := http.NewRequest(http.MethodGet,
 		fmt.Sprintf("http://127.0.0.1:%d%s", e.port, path), nil)
 	req.Header.Set("x-api-key", e.token)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := engineClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

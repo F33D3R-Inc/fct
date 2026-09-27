@@ -1,5 +1,5 @@
 import "runtime_page.fct"
-import "contract_history.fct"
+import "streams_webhooks.fct"
 
 app RuntimeServer:
     # runtime_server.fct — the facet web runtime as a service written in
@@ -95,7 +95,7 @@ app RuntimeServer:
         return headers
 
     # ── the loop ────────────────────────────────────────────────────────
-    proc rtLoop(ch: int, w0: RtWorld, js: text) uses io.net.listen, io.console, io.file:
+    proc rtLoop(ch: int, w0: RtWorld, js: text) uses io.net.listen, io.console, io.file, io.net:
         let mut w = w0
         loop true:
             let msg = recv(ch)
@@ -103,15 +103,74 @@ app RuntimeServer:
             if f[0] == "Q":
                 let reply = toInt(f[1])
                 let req = do rtReqAt(f)
-                let out = do rtRoute(w, req, js, reply)
+                let before = w
+                let mut out = do rtRoute(w, req, js, reply)
                 w = out.w
+                # The request's writes commit as one transaction before the
+                # reply; a refused commit fails the request and leaves the
+                # world as it was (runActionLocked's rollback).
+                let committed = do rtStoreCommit(w)
+                if !committed.ok:
+                    let e = writeStderr("facet: action rolled back: the store refused the write: " + committed.err + "\n")
+                    # runActionLocked's rollback undoes what the action wrote —
+                    # entity rows and the session state it changed — but not the
+                    # session the request was given before the action ran (a
+                    # guest minted by `session`): that one stays, at its
+                    # defaults, and its cookie rides the 500.
+                    let failedW = out.w
+                    w = before
+                    w.pendingOps = []
+                    w.pendingChanged = []
+                    w.pendingEvents = []
+                    out.stream = false
+                    let mut si = 0
+                    loop si < len(failedW.sessions):
+                        let ses = failedW.sessions[si]
+                        let known = do rtSessionIndex(before, ses.sid)
+                        if known < 0:
+                            let mut fresh = do rtNewSession(before, ses.sid, "guest", "guest")
+                            fresh.visitor = ses.visitor
+                            fresh.expires = ses.expires
+                            w = do rtPutSession(w, fresh)
+                        si = si + 1
+                    let mut refused = do rtTextError(500, "the write could not be stored and was rolled back")
+                    let mut hi = 0
+                    loop hi < len(out.resp.headers):
+                        if out.resp.headers[hi].name == "set-cookie":
+                            refused.headers = append(refused.headers, out.resp.headers[hi])
+                        hi = hi + 1
+                    out = do rtWhole(w, refused)
+                else:
+                    w = committed.w
+                    let changed = w.pendingChanged
+                    w.pendingChanged = []
+                    if len(changed) > 0:
+                        w = do rtBroadcast(w, changed)
+                    w = do rtFanoutEvents(w)
                 if out.stream:
                     let sent = send(reply, rtPack(["S", "" + out.chan, "" + out.resp.status] + rtHeaderPairs(out.resp.headers)))
                     let sent2 = send(out.chan, out.resp.body)
                 else:
                     let sent3 = send(reply, rtPack(rtRespFields(out.resp)))
             if f[0] == "U":
-                w = do rtUnsubscribe(w, toInt(f[1]))
+                let gone = toInt(f[1])
+                let isStream = do rtIsStreamSub(w, gone)
+                if isStream:
+                    w = do rtStreamGone(w, gone)
+                    let done = do rtStoreCommit(w)
+                    if done.ok:
+                        w = done.w
+                        let ch2 = w.pendingChanged
+                        w.pendingChanged = []
+                        if len(ch2) > 0:
+                            w = do rtBroadcast(w, ch2)
+                        w = do rtFanoutEvents(w)
+                    else:
+                        w.pendingOps = []
+                        w.pendingChanged = []
+                        w.pendingEvents = []
+                else:
+                    w = do rtUnsubscribe(w, gone)
 
     proc rtHeaderPairs(hs: [HttpHeader]) -> [text]:
         let mut out = []
@@ -134,7 +193,7 @@ app RuntimeServer:
         return RtRouted{resp: r, w: w, stream: false, chan: 0}
 
     # rtRoute: Handler — the built-ins first, then the view router.
-    proc rtRoute(w0: RtWorld, req: HttpServerRequest, js: text, reply: int) -> RtRouted uses io.file:
+    proc rtRoute(w0: RtWorld, req: HttpServerRequest, js: text, reply: int) -> RtRouted uses io.file, io.net:
         let mut w = w0
         let path = req.path
         # Declared `api` endpoints first (serveDeclaredAPI): the app's own
@@ -163,6 +222,17 @@ app RuntimeServer:
         if path == "/live":
             let lv = do rtHandleLive(w, req)
             return RtRouted{resp: lv.resp, w: lv.w, stream: lv.ok, chan: lv.chan}
+        # ServeMux's most specific pattern wins: a declared stream or webhook
+        # path beats the /api/ subtree and the view router.
+        let sm = do rtStreamFor(w.g, path)
+        if sm.found:
+            let so = do rtHandleStream(w, req, sm, peer)
+            return RtRouted{resp: so.resp, w: so.w, stream: so.stream, chan: so.chan}
+        let wi = do rtWebhookIndex(w.g, path)
+        if wi >= 0:
+            let wr = do rtHandleWebhook(w, req, wi)
+            let wrr = do rtWhole(wr.w, wr.resp)
+            return wrr
         let isContract = do cIsContractPath(w, path)
         if isContract:
             let cr = do cHandleContract(w, req, peer)
@@ -205,14 +275,13 @@ app RuntimeServer:
         let pr = do rtWhole(pg.w, pg.resp)
         return pr
 
-    proc rtWithoutHeader(hs: [HttpHeader], name: text) -> [HttpHeader]:
-        let mut out = []
+    proc rtIsStreamSub(w: RtWorld, ch: int) -> bool:
         let mut i = 0
-        loop i < len(hs):
-            if hs[i].name != name:
-                out = append(out, hs[i])
+        loop i < len(w.streamSubs):
+            if w.streamSubs[i].ch == ch:
+                return true
             i = i + 1
-        return out
+        return false
 
     # rtInjectContractEntity: injectContractEntities — a declared `contract`
     # records the document this process serves in a reserved table, which
@@ -274,10 +343,15 @@ app RuntimeServer:
                     let headers = do rtHeadersAt(f, 3)
                     let started = do httpServerStartStream(c, toInt(f[2]), headers)
                     let mut ok = started
+                    # Go writes nothing while a stream is idle; it learns the
+                    # client left from the request context. Here the socket
+                    # is read for a moment each quarter second: a read that
+                    # finds the end marks the connection closed.
                     loop ok:
-                        let which = awaitAny([frames], 15000)
+                        let which = awaitAny([frames], 250)
                         if which < 0:
-                            ok = do httpServerWriteChunk(c, textToBytes(":\n\n"))
+                            let probe = pollBytes(c, 1, 1)
+                            ok = connOpen(c)
                         else:
                             let frame = recv(frames)
                             ok = do httpServerWriteChunk(c, textToBytes(frame))
@@ -318,7 +392,7 @@ app RuntimeServer:
             return RtConfig{port: toInt(envVar("RT_PORT")), irPath: envVar("RT_IR")}
         return RtConfig{port: 0, irPath: ""}
 
-    daemon RuntimeServe uses io.file, io.net.listen, io.env, io.console:
+    daemon RuntimeServe uses io.file, io.net.listen, io.env, io.console, io.net:
         let cfg = do rtConfigFromEnv()
         let mut port = cfg.port
         let mut irPath = cfg.irPath
@@ -348,14 +422,44 @@ app RuntimeServer:
         let hasTotal = envSet("FACET_MAX_MEDIA_MB")
         if hasTotal && toInt(envVar("FACET_MAX_MEDIA_MB")) > 0:
             w.uploadTotalCap = toInt(envVar("FACET_MAX_MEDIA_MB")) * 1024 * 1024
+        let hasIdem = envSet("FACET_WEBHOOK_IDEM_TTL")
+        if hasIdem && toInt(envVar("FACET_WEBHOOK_IDEM_TTL")) > 0:
+            w.idemTTL = toInt(envVar("FACET_WEBHOOK_IDEM_TTL"))
+        let mut whi = 0
+        loop whi < len(w.g.webhooks):
+            w.whPaths = append(w.whPaths, w.g.webhooks[whi].path)
+            let mut secret = ""
+            if w.g.webhooks[whi].secret != "":
+                secret = envVar(w.g.webhooks[whi].secret)
+            w.whKeys = append(w.whKeys, secret)
+            whi = whi + 1
         let hasTTL = envSet("FACET_MEDIA_TTL")
         if hasTTL:
             w.mediaTTL = toInt(envVar("FACET_MEDIA_TTL"))
         w.rateClassNames = rc.names
         w.rateClassLimits = rc.limits
         w.rateDefault = rc.fallback
+        let hasDSN = envSet("FACET_DATABASE_URL")
+        if hasDSN && envVar("FACET_DATABASE_URL") != "":
+            let opened = do rtStoreOpen(w, envVar("FACET_DATABASE_URL"))
+            if !opened.ok:
+                let e0 = writeStderr("facet: " + opened.err + "\n")
+                let x0 = exitProcess(1)
+            w = opened.w
         w = do cRecordContractVersion(w)
         w = do rtRunOnStartJobs(w)
+        let booted = do rtStoreCommit(w)
+        if !booted.ok:
+            let e1 = writeStderr("facet: " + booted.err + "\n")
+            let x1 = exitProcess(1)
+        w = booted.w
+        # an `on start` job's changes fan out as any action's do (no
+        # subscriber yet, but the write sequence advances)
+        let bootChanged = w.pendingChanged
+        w.pendingChanged = []
+        if len(bootChanged) > 0:
+            w = do rtBroadcast(w, bootChanged)
+        w = do rtFanoutEvents(w)
         let js = readFile("facet.js")
         let ch = channel()
         detach rtLoop(ch, w, js)

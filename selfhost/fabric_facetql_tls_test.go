@@ -81,12 +81,11 @@ func fqlTlsWait(t *testing.T, port int, caPEM string, log func() string) {
 func fqlTlsStartRust(t *testing.T, p12, caPEM string) int {
 	t.Helper()
 	bin := fqlLiveServerBin(t)
-	port := fqFreePort(t)
-	var log strings.Builder
+	var log fdtSyncBuffer
 	cmd := exec.Command(bin, "start")
 	cmd.Env = append(os.Environ(),
 		"FACETQL_DATA_DIR="+t.TempDir(),
-		fmt.Sprintf("FACETQL_PORT=%d", port),
+		"FACETQL_PORT=0",
 		"FACETQL_TOKENS=fabtok:fabric:admin",
 		"FACETQL_MASTER_KEY="+facetqlCheckKey,
 		"FACETQL_TLS_IDENTITY="+p12,
@@ -101,6 +100,7 @@ func fqlTlsStartRust(t *testing.T, p12, caPEM string) int {
 		cmd.Process.Kill()
 		cmd.Wait()
 	})
+	port := fdtEngineBanner(t, log.String, fdtEngineBannerRE)
 	fqlTlsWait(t, port, caPEM, log.String)
 	return port
 }
@@ -122,13 +122,12 @@ func fqlTlsStartFct(t *testing.T, p12, caPEM string) int {
 	if err := os.WriteFile(filepath.Join(dir, "srv.p12"), raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	port := fqFreePort(t)
-	var log strings.Builder
+	var log fdtSyncBuffer
 	cmd := exec.Command(facet, "exec", server)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
 		"FACET_DATA_DIR="+dir, "FACETQL_DATA_DIR="+dir,
-		fmt.Sprintf("FACETQL_PORT=%d", port),
+		"FACETQL_PORT=0",
 		"FACETQL_TOKENS=fabtok:fabric:admin",
 		"FACETQL_MASTER_KEY="+facetqlCheckKey,
 		"FACETQL_TLS_IDENTITY=srv.p12",
@@ -143,6 +142,7 @@ func fqlTlsStartFct(t *testing.T, p12, caPEM string) int {
 		cmd.Process.Kill()
 		cmd.Wait()
 	})
+	port := fdtEngineBanner(t, log.String, fdtEngineBannerRE)
 	fqlTlsWait(t, port, caPEM, log.String)
 	return port
 }
@@ -228,7 +228,7 @@ func TestFabricFacetqlOverTLS(t *testing.T) {
 			{"wrong name", fmt.Sprintf("https://127.0.0.1:%d", rustPort), true},
 			{"plain server behind an https url", "https://" + plain, true},
 			{"http url to a tls server", fmt.Sprintf("http://localhost:%d", rustPort), true},
-			{"nothing listening", fmt.Sprintf("https://localhost:%d", fqFreePort(t)), true},
+			{"nothing listening", "https://localhost:1", true}, // a port no unprivileged process can bind
 		}
 		for _, c := range cases {
 			args := []string{"fql-tls", c.base, "fabtok"}

@@ -456,74 +456,36 @@ app FqEngineSelfHost:
 
     # Staged: a batch's pending view (transaction.rs's staged map) — every
     # staging in order (addrs/live/nodes; an address staged twice has two
-    # entries, the later one current), plus a sorted index over the
-    # distinct addresses (sorted, and at: each one's latest entry) so a
-    # lookup is a binary search, not a scan of the batch.
+    # entries, the later one current), the distinct addresses in the order
+    # first staged, and `at`: each address's current entry, plus one (a
+    # map's missing key reads as 0).
     struct Staged:
         addrs: [text]
         live: [bool]
         nodes: [Node]
-        sorted: [text]
-        at: [int]
+        distinct: [text]
+        at: {text: int}
 
     proc stagedNew() -> Staged:
-        return Staged{addrs: [], live: [], nodes: [], sorted: [], at: []}
-
-    # stagedSlot: the position address would have in the sorted index
-    # (its own, or where it would be inserted), and whether it is there.
-    struct StagedSlot:
-        found: bool
-        pos: int
-
-    proc stagedSlot(st: Staged, address: text) -> StagedSlot:
-        let mut lo = 0
-        let mut hi = len(st.sorted)
-        loop lo < hi:
-            let mid = (lo + hi) / 2
-            if st.sorted[mid] < address:
-                lo = mid + 1
-            else:
-                hi = mid
-        if lo < len(st.sorted) && st.sorted[lo] == address:
-            return StagedSlot{found: true, pos: lo}
-        return StagedSlot{found: false, pos: lo}
+        return Staged{addrs: [], live: [], nodes: [], distinct: [], at: {}}
 
     # stagedFind: the current entry for address, or -1.
     proc stagedFind(st: Staged, address: text) -> int:
-        let s = do stagedSlot(st, address)
-        if s.found:
-            return st.at[s.pos]
-        return -1
+        let i = st.at[address]
+        if i == 0:
+            return -1
+        return i - 1
 
     # stagedPut: one more staging of address.
     proc stagedPut(st0: Staged, address: text, isLive: bool, node: Node) -> Staged:
         let mut st = st0
         let idx = len(st.addrs)
+        if st.at[address] == 0:
+            st.distinct = append(st.distinct, address)
         st.addrs = append(st.addrs, address)
         st.live = append(st.live, isLive)
         st.nodes = append(st.nodes, node)
-        let s = do stagedSlot(st, address)
-        if s.found:
-            let mut at = st.at
-            at[s.pos] = idx
-            st.at = at
-        else:
-            let mut sorted = []
-            let mut ats = []
-            let n = len(st.sorted)
-            let mut i = 0
-            loop i < n:
-                if i == s.pos:
-                    sorted = append(sorted, address)
-                    ats = append(ats, idx)
-                sorted = append(sorted, st.sorted[i])
-                ats = append(ats, st.at[i])
-                i = i + 1
-            if s.pos == n:
-                sorted = append(sorted, address)
-                ats = append(ats, idx)
-            st.sorted = sorted
-            st.at = ats
+        st.at[address] = idx + 1
         return st
 
     # enStagedNode: staged_node — this batch's pending view of an address
@@ -564,14 +526,14 @@ app FqEngineSelfHost:
                 cands = append(cands, a)
             i = i + 1
         # staged_kinds: every address the batch had staged live (its last
-        # staging) under the kind, when the closure began — the sorted
-        # index names each distinct address's latest entry.
-        let ns = len(kst.sorted)
+        # staging) under the kind, when the closure began.
+        let ns = len(kst.distinct)
         let mut j = 0
         loop j < ns:
-            let k = kst.at[j]
-            if kst.live[k] && kst.nodes[k].kind == def.kind && !(kst.sorted[j] in cands):
-                cands = append(cands, kst.sorted[j])
+            let addr = kst.distinct[j]
+            let k = kst.at[addr] - 1
+            if kst.live[k] && kst.nodes[k].kind == def.kind && !(addr in cands):
+                cands = append(cands, addr)
             j = j + 1
         let sorted = do fqwSortText(cands)
         let mut nodes = []
@@ -1726,19 +1688,18 @@ app FqEngineSelfHost:
     # enRecordAt: the heap record a location value names, of the kind the
     # index promises (mismatched_record otherwise).
     proc enRecordAt(e: FqEngine, locHex: text, want: text) -> FqEngRecord uses io.file:
-        let blank = do hpNodeRecord(operationBlank("insert").node)
         let l = do hpLocDecode(fqwHexBytes(locHex))
         if !l.ok:
-            return FqEngRecord{ok: false, err: l.err, eng: e, record: blank}
+            return FqEngRecord{ok: false, err: l.err, eng: e, record: hpBlankRecord()}
         let r = do hpRead(e.st.heap, l.loc)
         let e2 = do enWith(e, stWith(e.st, r.heap, e.st.ix))
         if !r.ok:
-            return FqEngRecord{ok: false, err: r.err, eng: e2, record: blank}
+            return FqEngRecord{ok: false, err: r.err, eng: e2, record: hpBlankRecord()}
         if r.record.kind != want:
             let mut w = want
             if want == "history":
                 w = "history entry"
-            return FqEngRecord{ok: false, err: "expected a " + w + " record at " + hpLocText(l.loc) + ", found " + r.record.kind + " — the index and the heap disagree", eng: e2, record: blank}
+            return FqEngRecord{ok: false, err: "expected a " + w + " record at " + hpLocText(l.loc) + ", found " + r.record.kind + " — the index and the heap disagree", eng: e2, record: hpBlankRecord()}
         return FqEngRecord{ok: true, err: "", eng: e2, record: r.record}
 
     # enNodeAt: node_at — the node record at a location, its read

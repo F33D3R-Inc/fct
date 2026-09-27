@@ -17,6 +17,7 @@ package selfhost
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -1122,6 +1124,51 @@ func TestFabricDaemonAdminGoldenMatchesRust(t *testing.T) {
 
 // ---------------------------------------------------------------- the process
 
+var fdtBannerRE = regexp.MustCompile(`fabricd: serving FacetQL's wire on \S+:(\d+) and the operator surface on \S+:(\d+)`)
+
+// fdtBanner waits for fabricd's startup line — the crate's and the port's
+// are the same, naming the addresses the listeners hold (daemon.rs
+// local_addr) — and answers the data and operator ports it names. A
+// configuration asking for port 0 on both is how these tests start a
+// daemon: no port is chosen here that another process could take first.
+func fdtBanner(t *testing.T, stderr func() string) (int, int) {
+	t.Helper()
+	for end := time.Now().Add(60 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if m := fdtBannerRE.FindStringSubmatch(stderr()); m != nil {
+			data, _ := strconv.Atoi(m[1])
+			admin, _ := strconv.Atoi(m[2])
+			if data == 0 || admin == 0 {
+				t.Fatalf("fabricd named port 0 in its banner: %s", m[0])
+			}
+			return data, admin
+		}
+		if time.Now().After(end) {
+			t.Fatalf("fabricd never named the ports it bound: %s", stderr())
+		}
+	}
+}
+
+var (
+	fdtEngineBannerRE = regexp.MustCompile(`FacetQL Server Running on port (\d+)`)
+	fdtDoorBannerRE   = regexp.MustCompile(`fabric front door serving on port (\d+)`)
+)
+
+// fdtEngineBanner waits for a process started on port 0 — a FacetQL
+// (`facetql start` and fqserver.fct print the same line) or the standalone
+// front door — to name the port the kernel gave it.
+func fdtEngineBanner(t *testing.T, out func() string, re *regexp.Regexp) int {
+	t.Helper()
+	for end := time.Now().Add(60 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if m := re.FindStringSubmatch(out()); m != nil {
+			port, _ := strconv.Atoi(m[1])
+			return port
+		}
+		if time.Now().After(end) {
+			t.Fatalf("never named the port it bound: %s", out())
+		}
+	}
+}
+
 func fdtFreePort(t *testing.T) int {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1163,7 +1210,7 @@ func TestFabricDaemonProcess(t *testing.T) {
 	defer destination.Close()
 
 	dir := t.TempDir()
-	dataPort, adminPort := fdtFreePort(t), fdtFreePort(t)
+	dataPort, adminPort := 0, 0 // bound by fabricd, named in its banner (fdtBanner)
 	config := fmt.Sprintf(`{
 		"data_listen": "127.0.0.1:%d", "admin_listen": "127.0.0.1:%d",
 		"backends": [
@@ -1195,6 +1242,11 @@ func TestFabricDaemonProcess(t *testing.T) {
 	var stderrMu sync.Mutex
 	srv.SetStdio(strings.NewReader(""), io.Discard, fdtLockedWriter{&stderrMu, &stderr})
 	go srv.RunMain([]string{"--config", path})
+	dataPort, adminPort = fdtBanner(t, func() string {
+		stderrMu.Lock()
+		defer stderrMu.Unlock()
+		return stderr.String()
+	})
 
 	admin := fmt.Sprintf("http://127.0.0.1:%d", adminPort)
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -1474,7 +1526,7 @@ func TestFabricDaemonSigtermMatchesRust(t *testing.T) {
 	defer upstream.Close()
 	dir := t.TempDir()
 	run := func(port bool) fdtRunResult {
-		dataPort, adminPort := fdtFreePort(t), fdtFreePort(t)
+		dataPort, adminPort := 0, 0 // bound by fabricd, named in its banner (fdtBanner)
 		config := fmt.Sprintf(`{"data_listen": "127.0.0.1:%d", "admin_listen": "127.0.0.1:%d",
 			"backends": [{"id": "db-a", "url": %q, "placements": [{"shard": 1, "x": 0, "y": 0}]}],
 			"keyspace": {"fallback": {"shard": 1, "x": 0, "y": 0}},
@@ -1494,6 +1546,7 @@ func TestFabricDaemonSigtermMatchesRust(t *testing.T) {
 				t.Fatalf("never served (port=%v): %s", port, errOut.String())
 			}
 		}
+		dataPort, adminPort = fdtBanner(t, errOut.String)
 		time.Sleep(300 * time.Millisecond)
 		cmd.Process.Signal(syscall.SIGTERM)
 		err := cmd.Wait()
@@ -1696,7 +1749,7 @@ func fdtMoverLiveScenario(t *testing.T, engine string) {
 	}
 
 	dir := t.TempDir()
-	dataPort, adminPort := fdtFreePort(t), fdtFreePort(t)
+	dataPort, adminPort := 0, 0 // bound by fabricd, named in its banner (fdtBanner)
 	config := fdtDaemonConfig(dataPort, adminPort, source, destination)
 	if err := os.WriteFile(filepath.Join(dir, "fabric.json"), []byte(config), 0o644); err != nil {
 		t.Fatal(err)
@@ -1708,6 +1761,7 @@ func fdtMoverLiveScenario(t *testing.T, engine string) {
 		t.Fatal(err)
 	}
 	defer cmd.Process.Kill()
+	dataPort, adminPort = fdtBanner(t, stderr.String)
 
 	admin := fmt.Sprintf("http://127.0.0.1:%d", adminPort)
 	adminJSON := func(path string) any { return fdtAdminJSON(admin, path) }
@@ -1893,7 +1947,7 @@ func fdtReplicateLiveScenario(t *testing.T, engine string) {
 	fdtFacetqlWrite(t, source, token, ops)
 
 	dir := t.TempDir()
-	dataPort, adminPort := fdtFreePort(t), fdtFreePort(t)
+	dataPort, adminPort := 0, 0 // bound by fabricd, named in its banner (fdtBanner)
 	if err := os.WriteFile(filepath.Join(dir, "fabric.json"), []byte(fdtDaemonConfig(dataPort, adminPort, source, destination)), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1904,6 +1958,7 @@ func fdtReplicateLiveScenario(t *testing.T, engine string) {
 		t.Fatal(err)
 	}
 	defer cmd.Process.Kill()
+	dataPort, adminPort = fdtBanner(t, stderr.String)
 
 	admin := fmt.Sprintf("http://127.0.0.1:%d", adminPort)
 	adminJSON := func(path string) any { return fdtAdminJSON(admin, path) }
@@ -2049,7 +2104,7 @@ func TestFabricDaemonGracefulShutdownMatchesRust(t *testing.T) {
 		stderr                string
 	}
 	run := func(port bool) outcome {
-		dataPort, adminPort := fdtFreePort(t), fdtFreePort(t)
+		dataPort, adminPort := 0, 0 // bound by fabricd, named in its banner (fdtBanner)
 		config := fmt.Sprintf(`{"data_listen": "127.0.0.1:%d", "admin_listen": "127.0.0.1:%d",
 			"backends": [{"id": "db-a", "url": %q, "placements": [{"shard": 1, "x": 0, "y": 0}]}],
 			"keyspace": {"fallback": {"shard": 1, "x": 0, "y": 0}}}`, dataPort, adminPort, upstream.URL)
@@ -2068,6 +2123,7 @@ func TestFabricDaemonGracefulShutdownMatchesRust(t *testing.T) {
 				t.Fatalf("never served (port=%v): %s", port, errOut.String())
 			}
 		}
+		dataPort, adminPort = fdtBanner(t, errOut.String)
 		var o outcome
 		done := make(chan int, 1)
 		go func() {
@@ -2115,7 +2171,6 @@ func TestFabricDaemonGracefulShutdownMatchesRust(t *testing.T) {
 func fdtLoadedFacetql(t *testing.T, taskset string) (string, func()) {
 	t.Helper()
 	bin := fqlLiveServerBin(t)
-	port := fdtFreePort(t)
 	var log fdtSyncBuffer
 	cmd := exec.Command(taskset, "-c", "0", bin, "start")
 	// Exactly the crate's Instance::start_with environment: development
@@ -2124,7 +2179,7 @@ func fdtLoadedFacetql(t *testing.T, taskset string) (string, func()) {
 	cmd.Env = append(os.Environ(),
 		"FACETQL_ENV=development",
 		"ENOCHIAN_DATA_DIR="+t.TempDir(),
-		fmt.Sprintf("ENOCHIAN_PORT=%d", port),
+		"ENOCHIAN_PORT=0",
 		"ENOCHIAN_TOKENS=app-secret:app:admin",
 		"FACETQL_MAX_CONCURRENT_REQUESTS=6",
 	)
@@ -2141,7 +2196,7 @@ func fdtLoadedFacetql(t *testing.T, taskset string) (string, func()) {
 			cmd.Wait()
 		})
 	}
-	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+	base := fmt.Sprintf("http://127.0.0.1:%d", fdtEngineBanner(t, log.String, fdtEngineBannerRE))
 	// The readiness poll is bounded per request: an instance that accepts
 	// the connection but has not begun answering must not hold this loop
 	// past the 60 s it is given (http.DefaultClient has no timeout).
@@ -2220,13 +2275,24 @@ func fdtLoadedWindow(t *testing.T, ts *httptest.Server, checkBin, taskset string
 		sampled <- answer{out, err}
 	}()
 	// The crate's own poller and optimizer, over the same instance in the
-	// same window, for comparison.
+	// same window, for comparison: its window ends when the port's does
+	// (its stdin is closed then), while the load is still running, so it
+	// never polls an instance whose load has stopped or that is gone.
 	crateSaw := make(chan string, 1)
+	crateCmd := exec.Command(checkBin, "daemon-loaded-poll")
+	crateIn, err := crateCmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crateOut bytes.Buffer
+	crateCmd.Stdout = &crateOut
+	if err := crateCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	io.WriteString(crateIn, base+"|app-secret|20\n")
 	go func() {
-		cmd := exec.Command(checkBin, "daemon-loaded-poll")
-		cmd.Stdin = strings.NewReader(base + "|app-secret|20\n")
-		out, _ := cmd.Output()
-		crateSaw <- strings.TrimSpace(string(out))
+		crateCmd.Wait()
+		crateSaw <- strings.TrimSpace(crateOut.String())
 	}()
 	time.Sleep(300 * time.Millisecond)
 	var halt sync.WaitGroup
@@ -2261,13 +2327,15 @@ func fdtLoadedWindow(t *testing.T, ts *httptest.Server, checkBin, taskset string
 		}(worker)
 	}
 	a := <-sampled
+	crateIn.Close()
+	crate = <-crateSaw
 	close(quit)
 	halt.Wait()
 	stop()
 	if a.err != nil {
 		t.Fatalf("the port's poller could not be run over the loaded instance: %v", a.err)
 	}
-	return a.out, <-crateSaw
+	return a.out, crate
 }
 
 // tests/mover.rs a_loaded_cell_crosses_the_pressure_threshold_from_real_
@@ -2319,4 +2387,198 @@ func TestFabricDaemonLoadedCellCrossesThreshold(t *testing.T) {
 		}
 	}
 	t.Fatalf("a real, heavily loaded cell produced no decision in 8 attempts — last %s", last)
+}
+
+// TestFabricStandaloneDoorFollowsTheDaemon: fabric_frontdoor_main.fct as its
+// own process, following fabricd's published routing
+// (FRONTDOOR_ROUTING_FEED; fabric_routing_feed.fct), over two real FacetQL
+// instances. The crate has no standalone door to compare with — its
+// FrontDoor lives inside fabricd and is handed each table in-process — so
+// what is asserted is the crate's guarantee, kept across processes:
+//
+//   - a door that has stopped confirming (SIGSTOP) holds a fenced cutover:
+//     authority does not move until the daemon has forgotten it, which is no
+//     sooner than its lease (2000 ms) plus its in-flight bound (its upstream
+//     timeout, 1000 ms here) after it was last heard;
+//   - once the daemon has moved the cell, the door — resumed — routes a
+//     write to the new holder and not the old one;
+//   - with the daemon gone, the door stops routing once its lease runs out:
+//     503, retryable, saying why, and never a request routed by a table
+//     that may be stale.
+func TestFabricStandaloneDoorFollowsTheDaemon(t *testing.T) {
+	fdtBinaries(t)
+	const token = "fabtok"
+	source, destination := fqlLiveStart(t), fqlLiveStart(t)
+	var ops []any
+	for i := 0; i < 200; i++ {
+		ops = append(ops, fdtInsert(i, 1))
+	}
+	fdtFacetqlWrite(t, source, token, ops)
+
+	dir := t.TempDir()
+	dataPort, adminPort := 0, 0 // bound by fabricd, named in its banner (fdtBanner)
+	if err := os.WriteFile(filepath.Join(dir, "fabric.json"), []byte(fdtDaemonConfig(dataPort, adminPort, source, destination)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	daemon := fdtProgram(true, "../integration/testdata/fabricd_hotcell_gated.fct", dir, []string{"FABRIC_ADMIN_TOKEN=operator-secret", "FABRIC_TEST_DB_TOKEN=" + token, "FACET_DATA_DIR=" + dir}, "--config", "fabric.json")
+	var daemonErr fdtSyncBuffer
+	daemon.Stdout, daemon.Stderr = io.Discard, &daemonErr
+	if err := daemon.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer daemon.Process.Kill()
+	dataPort, adminPort = fdtBanner(t, daemonErr.String)
+	admin := fmt.Sprintf("http://127.0.0.1:%d", adminPort)
+	adminJSON := func(path string) any { return fdtAdminJSON(admin, path) }
+	until := func(what string, budget time.Duration, cond func() bool) {
+		t.Helper()
+		for end := time.Now().Add(budget); !cond(); time.Sleep(20 * time.Millisecond) {
+			if time.Now().After(end) {
+				st, _ := json.Marshal(adminJSON("/status"))
+				t.Fatalf("timed out waiting for %s; fabricd: %s; status: %s", what, daemonErr.String(), st)
+			}
+		}
+	}
+	until("the daemon to boot", 20*time.Second, func() bool { return strings.Contains(daemonErr.String(), "serving FacetQL's wire") })
+
+	doorDir := t.TempDir()
+	doorProgram, _ := filepath.Abs("fabric_frontdoor_main.fct")
+	door := exec.Command(fdtFacetBin, "exec", doorProgram)
+	door.Dir = doorDir
+	door.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "FACET_DATA_DIR=" + doorDir,
+		"FRONTDOOR_PORT=0",
+		"FRONTDOOR_BACKENDS=" + fdtSource + "=" + source + "," + fdtDestination + "=" + destination,
+		"FRONTDOOR_KEYSPACE=Post|Post:|1", "FRONTDOOR_FALLBACK_SHARD=1",
+		"FRONTDOOR_ROUTING_FEED=" + admin, "FRONTDOOR_ROUTING_TOKEN=operator-secret",
+		"FRONTDOOR_DOOR_ID=door-under-test", "FRONTDOOR_FEED_INTERVAL_MS=50",
+		"FRONTDOOR_UPSTREAM_TIMEOUT_MS=1000",
+	}
+	var doorOut fdtSyncBuffer
+	door.Stdout, door.Stderr = &doorOut, &doorOut
+	if err := door.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		door.Process.Signal(syscall.SIGCONT)
+		door.Process.Kill()
+		door.Wait()
+	}()
+	doorURL := fmt.Sprintf("http://127.0.0.1:%d", fdtEngineBanner(t, doorOut.String, fdtDoorBannerRE))
+	doorGet := func(path string) (int, string, string) {
+		req, _ := http.NewRequest("GET", doorURL+path, nil)
+		req.Header.Set("x-api-key", token)
+		resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+		if err != nil {
+			return 0, err.Error(), ""
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b), resp.Header.Get("Retry-After")
+	}
+	var lastCode int
+	var lastBody string
+	for end := time.Now().Add(30 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		lastCode, lastBody, _ = doorGet("/node/Post:0000")
+		if lastCode == 200 {
+			break
+		}
+		if time.Now().After(end) {
+			t.Fatalf("the door never held the daemon's routing: last %d %s; door: %s", lastCode, lastBody, doorOut.String())
+		}
+	}
+
+	// The door stops confirming; the daemon is shown a hot cell.
+	if err := door.Process.Signal(syscall.SIGSTOP); err != nil {
+		t.Fatal(err)
+	}
+	stopped := time.Now()
+	if err := os.WriteFile(filepath.Join(dir, "hot"), []byte("hot\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	type seen struct {
+		at     time.Duration
+		holder string
+		phase  string
+	}
+	var trace []seen
+	until("the cell to move", 60*time.Second, func() bool {
+		routing, _ := adminJSON("/routing").(map[string]any)
+		placements, _ := routing["placements"].([]any)
+		if len(placements) == 0 {
+			return false
+		}
+		p := placements[0].(map[string]any)
+		phase := ""
+		if m, ok := p["migration"].(map[string]any); ok {
+			phase, _ = m["phase"].(string)
+		}
+		holder, _ := p["holder"].(string)
+		trace = append(trace, seen{time.Since(stopped), holder, phase})
+		return holder == fdtDestination
+	})
+	fencedAt, movedAt := time.Duration(-1), trace[len(trace)-1].at
+	for _, s := range trace {
+		if s.phase == "cutover" && fencedAt < 0 {
+			fencedAt = s.at
+		}
+	}
+	// The daemon last heard the door no earlier than one feed interval (and
+	// a request's latency) before it was stopped: authority may move no
+	// sooner than lease + bound after that.
+	const heldFor = 2000*time.Millisecond + 1000*time.Millisecond - 200*time.Millisecond
+	if fencedAt < 0 || fencedAt >= heldFor {
+		t.Fatalf("the cutover's fence was never seen before the door's lease ran out (fenced at %v); trace %v", fencedAt, trace)
+	}
+	if movedAt < heldFor {
+		t.Fatalf("authority moved %v after the door stopped confirming — before its lease and in-flight bound (%v) ran out; trace %v", movedAt, heldFor, trace)
+	}
+	t.Logf("fenced %v after the door stopped confirming; authority moved %v after (held for its lease + bound)", fencedAt, movedAt)
+
+	// Resumed, the door follows the move: a write lands on the new holder.
+	if err := door.Process.Signal(syscall.SIGCONT); err != nil {
+		t.Fatal(err)
+	}
+	until("the door to route again", 10*time.Second, func() bool {
+		code, _, _ := doorGet("/node/Post:0000")
+		return code == 200
+	})
+	code, body := fdtFacetqlPost(t, doorURL+"/node", token, map[string]any{"address": "Post:9999", "kind": "Post", "x": 0, "y": 0, "z": 0, "q": 0, "data": `{"through":"the standalone door"}`})
+	if code != 201 {
+		t.Fatalf("a write through the standalone door after the move: %d %s", code, body)
+	}
+	if _, ok := fdtFacetqlNodes(t, destination, token)["Post:9999"]; !ok {
+		t.Fatal("the standalone door did not route a write to the new holder")
+	}
+	if _, ok := fdtFacetqlNodes(t, source, token)["Post:9999"]; ok {
+		t.Fatal("the standalone door routed a write to the old holder after the move")
+	}
+
+	// The daemon goes away: once the lease runs out the door refuses.
+	daemon.Process.Kill()
+	daemon.Wait()
+	killed := time.Now()
+	var refusedAt time.Duration
+	until("the door to stop routing", 10*time.Second, func() bool {
+		code, body, retry := doorGet("/node/Post:0000")
+		if code == 503 && strings.Contains(body, "routing is stale") && retry == "1" {
+			refusedAt = time.Since(killed)
+			return true
+		}
+		if code != 200 {
+			t.Fatalf("with the daemon gone and the lease still running the door answered %d %s", code, body)
+		}
+		return false
+	})
+	if refusedAt > 2000*time.Millisecond+500*time.Millisecond {
+		t.Errorf("the door kept routing %v after the daemon went away, past its 2000 ms lease", refusedAt)
+	}
+	for i := 0; i < 5; i++ {
+		if code, body, _ := doorGet("/node/Post:0000"); code != 503 {
+			t.Fatalf("the door routed again with no daemon: %d %s", code, body)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !strings.Contains(doorOut.String(), "the routing feed did not answer") {
+		t.Errorf("the door did not say its feed stopped answering: %s", doorOut.String())
+	}
 }

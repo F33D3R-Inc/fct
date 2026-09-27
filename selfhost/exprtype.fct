@@ -92,6 +92,15 @@ app ExprTypeSelfHost:
 
     # tyScopeWith: sc with name bound to type label t (replacing a binding
     # of the same name).
+    # tyAggItemType: what an aggregate's item variable is — a row of the
+    # entity ranged, or an element of the `[T]` list cell ranged
+    # (build.go's checkRowFields / bindRange over e.stateList).
+    proc tyAggItemType(te: TyEnv, coll: text) -> text:
+        let st = do tyLookup(te.stateNames, te.stateTypes, coll)
+        if slice(st, 0, 1) == "[":
+            return slice(st, 1, len(st) - 1)
+        return coll
+
     proc tyScopeWith(sc: TyScope, name: text, t: text) -> TyScope:
         return TyScope{names: append(sc.names, name), types: append(sc.types, t), recNames: sc.recNames, recTypes: sc.recTypes}
 
@@ -211,14 +220,15 @@ app ExprTypeSelfHost:
                 return VT{core: "int", list: false}
             if op == "exists":
                 return VT{core: "bool", list: false}
+            let itemT = do tyAggItemType(te, n.coll)
             if op == "list":
                 if len(n.sel) > 0:
-                    let inner = do tyScopeWith(sc, n.itemVar, n.coll)
+                    let inner = do tyScopeWith(sc, n.itemVar, itemT)
                     let vt = do tyExpr(te, n.sel[0], inner)
                     return VT{core: vt.core, list: true}
-                return VT{core: n.coll, list: true}
+                return VT{core: itemT, list: true}
             if len(n.sel) > 0:
-                let inner2 = do tyScopeWith(sc, n.itemVar, n.coll)
+                let inner2 = do tyScopeWith(sc, n.itemVar, itemT)
                 let st2 = do tyExpr(te, n.sel[0], inner2)
                 return st2
             let af = do tyEntityField(te, n.coll, n.field)
@@ -437,7 +447,8 @@ app ExprTypeSelfHost:
         if k == "agg":
             let mut inner = sc
             if n.itemVar != "":
-                inner = do tyScopeWith(sc, n.itemVar, n.coll)
+                let itemT = do tyAggItemType(te, n.coll)
+                inner = do tyScopeWith(sc, n.itemVar, itemT)
             let subs = [n.whereClause, n.sel]
             let mut s = 0
             loop s < 2:
@@ -559,7 +570,8 @@ app ExprTypeSelfHost:
         if k == "agg":
             let mut inner = sc
             if n.itemVar != "":
-                inner = do tyScopeWith(sc, n.itemVar, n.coll)
+                let itemT = do tyAggItemType(te, n.coll)
+                inner = do tyScopeWith(sc, n.itemVar, itemT)
             let subs = [n.whereClause, n.sel, n.limit]
             let mut s = 0
             loop s < 3:

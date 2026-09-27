@@ -86,17 +86,25 @@ app FqHeapSelfHost:
         return FqLocR{ok: true, err: "", loc: FqLocation{segment: s, page: p, slot: sl, length: ln}}
 
     # ── records ────────────────────────────────────────────────────────
+    # The fillers a record's unused variants carry: built from the two
+    # cheapest constructors, not a whole blank Operation (every variant of
+    # every operation) per record read.
+    proc hpBlankNode() -> Node:
+        return nodeNew(coordinateNew(0, 0, 0, 0), "", "", "")
+
+    proc hpBlankRecord() -> FqHeapRecord:
+        let r = do hpNodeRecord(hpBlankNode())
+        return r
+
     proc hpNodeRecord(n: Node) -> FqHeapRecord:
-        let b = do operationBlank("insert")
-        return FqHeapRecord{kind: "node", node: n, edge: b.edge, entry: b.entry}
+        return FqHeapRecord{kind: "node", node: n, edge: edgeNew("", "", "", ""), entry: historyEntryMake(hpBlankNode(), 0, 0)}
 
     proc hpEdgeRecord(e: Edge) -> FqHeapRecord:
-        let b = do operationBlank("insert")
-        return FqHeapRecord{kind: "edge", node: b.node, edge: e, entry: b.entry}
+        let n = do hpBlankNode()
+        return FqHeapRecord{kind: "edge", node: n, edge: e, entry: historyEntryMake(n, 0, 0)}
 
     proc hpHistoryRecord(h: HistoryEntry) -> FqHeapRecord:
-        let b = do operationBlank("insert")
-        return FqHeapRecord{kind: "history", node: b.node, edge: b.edge, entry: h}
+        return FqHeapRecord{kind: "history", node: hpBlankNode(), edge: edgeNew("", "", "", ""), entry: h}
 
     proc hpEncodeRecord(r: FqHeapRecord) -> [int]:
         if r.kind == "edge":
@@ -123,15 +131,14 @@ app FqHeapSelfHost:
         record: FqHeapRecord
 
     proc hpDecodeRecord(bs: [int]) -> FqRecR:
-        let blank = do hpNodeRecord(operationBlank("insert").node)
         let c0 = FqwCur{buf: bs, pos: 0, err: ""}
         let tag = do fqwGetUint(c0, 4)
         if tag.cur.err != "":
-            return FqRecR{ok: false, err: tag.cur.err, record: blank}
+            return FqRecR{ok: false, err: tag.cur.err, record: hpBlankRecord()}
         if tag.v == 0:
             let nd = do fqwGetNode(tag.cur)
             if nd.cur.err != "":
-                return FqRecR{ok: false, err: nd.cur.err, record: blank}
+                return FqRecR{ok: false, err: nd.cur.err, record: hpBlankRecord()}
             let r0 = do hpNodeRecord(nd.node)
             return FqRecR{ok: true, err: "", record: r0}
         if tag.v == 1:
@@ -140,7 +147,7 @@ app FqHeapSelfHost:
             let k = do fqwGetString(t.cur)
             let o = do fqwGetString(k.cur)
             if o.cur.err != "":
-                return FqRecR{ok: false, err: o.cur.err, record: blank}
+                return FqRecR{ok: false, err: o.cur.err, record: hpBlankRecord()}
             let e = do edgeNew(f.v, t.v, k.v, o.v)
             let r1 = do hpEdgeRecord(e)
             return FqRecR{ok: true, err: "", record: r1}
@@ -150,10 +157,10 @@ app FqHeapSelfHost:
             let nd2 = do fqwGetNode(at.cur)
             let vr = do fqwGetUint(nd2.cur, 8)
             if vr.cur.err != "":
-                return FqRecR{ok: false, err: vr.cur.err, record: blank}
+                return FqRecR{ok: false, err: vr.cur.err, record: hpBlankRecord()}
             let r2 = do hpHistoryRecord(HistoryEntry{address: ad.v, archivedAtUnix: at.v, node: nd2.node, version: vr.v})
             return FqRecR{ok: true, err: "", record: r2}
-        return FqRecR{ok: false, err: "invalid value: integer `" + tag.v + "`, expected variant index 0 <= i < 3", record: blank}
+        return FqRecR{ok: false, err: "invalid value: integer `" + tag.v + "`, expected variant index 0 <= i < 3", record: hpBlankRecord()}
 
     # ── segments ───────────────────────────────────────────────────────
     proc hpSegmentPath(id: int) -> text:
@@ -494,16 +501,15 @@ app FqHeapSelfHost:
         record: FqHeapRecord
 
     proc hpRead(h: FqHeap, l: FqLocation) -> FqReadR uses io.file:
-        let blank = do hpNodeRecord(operationBlank("insert").node)
         let f = do hpReadFrame(h, l)
         if !f.ok:
-            return FqReadR{ok: false, err: f.err, heap: f.heap, record: blank}
+            return FqReadR{ok: false, err: f.err, heap: f.heap, record: hpBlankRecord()}
         let d = do bnDecodeFrame(f.frame)
         if !d.ok:
-            return FqReadR{ok: false, err: d.err, heap: f.heap, record: blank}
+            return FqReadR{ok: false, err: d.err, heap: f.heap, record: hpBlankRecord()}
         let r = do hpDecodeRecord(d.bytes)
         if !r.ok:
-            return FqReadR{ok: false, err: "failed to decode the record at segment " + l.segment + " page " + l.page + " slot " + l.slot + ": " + r.err, heap: f.heap, record: blank}
+            return FqReadR{ok: false, err: "failed to decode the record at segment " + l.segment + " page " + l.page + " slot " + l.slot + ": " + r.err, heap: f.heap, record: hpBlankRecord()}
         return FqReadR{ok: true, err: "", heap: f.heap, record: r.record}
 
     # hpMarkObsolete: mark_obsolete — the segment's reclaimable bytes grow.

@@ -35,19 +35,33 @@ package selfhost
 //     500s they become. spawn/join, file statements, `act` and service
 //     `call`s inside procs are not (no concurrency or I/O in a request).
 //   - `emit` evaluates its payload and drops it: the declared event
-//     streams (streams.go), webhooks and the `contract` routes (the
-//     OpenAPI document, its history and diffs) are not served yet, nor are
-//     /upload, /uploads/, /assets/, /admin, /metrics, signed media
-//     (FACET_MEDIA_TTL), i18n catalogs, entity derives with parameters at
-//     run time (the compiler inlines them), clustering, or a declared
-//     route's multipart (`bytes`) body and HTTP Basic (`basicId`) auth.
-//     Each is an endpoint or a projection rule the Go runtime has and this
-//     harness would diff the day a step asks for it.
+//     streams (streams.go) and webhooks (webhook.go) are the next slice.
+//     Ported since the first phase: /upload, /upload/{init,chunk,finish,
+//     abort} and /uploads/ (upload_media.fct, with a `fileModTime` builtin
+//     added in Go for ServeFile's Last-Modified), the contract routes
+//     (contract_doc.fct / contract_history.fct: the OpenAPI document byte
+//     for byte, /version, /history, /diff), and the FacetQL store
+//     (store_facetql.fct: FACET_DATABASE_URL, index/reference migration,
+//     paged load, one transaction per action, entity lists and the API
+//     read through the engine — TestRuntimeParityDurable proves the fct
+//     runtime on fqserver.fct and the Go runtime on the Rust engine answer
+//     alike and leave the same rows in their engines).
+//   - Not yet ported: /assets/, /admin, /metrics, signed media
+//     (FACET_MEDIA_TTL is honoured on /uploads/ but not minted into
+//     rendered URLs), i18n catalogs, HTTP Range on /uploads/, HLS playlist
+//     rewriting, multipart (`bytes`) bodies and HTTP Basic (`basicId`) on
+//     declared routes, proc spawn/join and file statements, aggregate
+//     pushdown to the engine (aggregates are computed over the working
+//     set; the values are the same), clustering.
 //
 import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -58,6 +72,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -92,11 +108,32 @@ type rtSide struct {
 	// the last stored upload's reference and the last resumable session id
 	upload   string
 	uploadID string
+	// the last page cursor this side answered (opaque: an engine's own)
+	next string
+	// signed media: each upload's reference and the signed URL this side
+	// minted for it, in upload order (SIDE_REF_n / SIDE_SIGNED_n)
+	refs   []string
+	signed []string
 }
 
 // rtMultipartType and rtMultipart build one-file multipart bodies with a
 // fixed boundary, so both sides receive the same bytes.
 const rtMultipartType = "multipart/form-data; boundary=facetparity"
+
+// rtMultipartParts builds a multipart body of several parts, each
+// {field, filename ("" for a plain value), content}.
+func rtMultipartParts(parts ...[3]string) string {
+	var b strings.Builder
+	for _, p := range parts {
+		b.WriteString("--facetparity\r\nContent-Disposition: form-data; name=\"" + p[0] + "\"")
+		if p[1] != "" {
+			b.WriteString("; filename=\"" + p[1] + "\"\r\nContent-Type: application/octet-stream")
+		}
+		b.WriteString("\r\n\r\n" + p[2] + "\r\n")
+	}
+	b.WriteString("--facetparity--\r\n")
+	return b.String()
+}
 
 func rtMultipart(field, filename, content string) string {
 	return "--facetparity\r\nContent-Disposition: form-data; name=\"" + field + "\"; filename=\"" + filename + "\"\r\nContent-Type: text/plain\r\n\r\n" + content + "\r\n--facetparity--\r\n"
@@ -205,6 +242,9 @@ type rtStep struct {
 	body    string
 	headers map[string]string
 	csrf    bool
+	// sign, when set, is the webhook key the body is signed with
+	// (X-Facet-Signature: hex HMAC-SHA256 of the body).
+	sign string
 }
 
 // rtAnswer is what one side answered, reduced to what is compared.
@@ -213,6 +253,7 @@ type rtAnswer struct {
 	contentType string
 	cookieAttrs string
 	body        string
+	replay      string // X-Facet-Idempotent-Replay
 }
 
 var (
@@ -224,6 +265,15 @@ var (
 	rtCookieExp  = regexp.MustCompile(`Expires=[^;]*`)
 	rtNextCursor = regexp.MustCompile(`"next":"([^"]*)"`)
 	rtUploadURL  = regexp.MustCompile(`"url":"(/uploads/[0-9a-f]{32}[^"]*)"`)
+	// a stored upload's reference wherever a reply carries it (a track's
+	// audio, a cover): the name is 16 random bytes on each side
+	rtUploadRef = regexp.MustCompile(`/uploads/[0-9a-f]{32}`)
+	// a signed media link's expiry and signature (a clock reading and its
+	// HMAC), wherever it is spelled: raw, HTML-escaped or JSON-escaped
+	rtSignedPart = regexp.MustCompile(`exp=[0-9]+(&amp;|&|\\u0026)sig=[0-9a-f]{64}`)
+	rtGrant      = regexp.MustCompile(`"(/uploads/[0-9a-f]{32}[^"?]*)\?exp=([0-9]+)\\u0026sig=([0-9a-f]{64})"`)
+	// a multipart/byteranges boundary: 30 random bytes, hex
+	rtBoundary   = regexp.MustCompile(`[0-9a-f]{60}`)
 	rtUploadID   = regexp.MustCompile(`"id":"([0-9a-f]{32})"`)
 	rtTokenValue = regexp.MustCompile(`"token":"([^"]*)"`)
 	rtISOTime    = regexp.MustCompile(`"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z?"`)
@@ -249,6 +299,9 @@ func rtNormalize(s string) string {
 	s = rtNextCursor.ReplaceAllString(s, `"next":"NEXT"`)
 	s = rtUploadURL.ReplaceAllString(s, `"url":"/uploads/NAME"`)
 	s = rtUploadID.ReplaceAllString(s, `"id":"ID"`)
+	s = rtUploadRef.ReplaceAllString(s, "/uploads/NAME")
+	s = rtSignedPart.ReplaceAllString(s, "exp=EXP${1}sig=SIG")
+	s = rtBoundary.ReplaceAllString(s, "BOUNDARY")
 	return s
 }
 
@@ -256,7 +309,14 @@ func rtDo(t *testing.T, side *rtSide, st rtStep, csrf string) rtAnswer {
 	t.Helper()
 	path := strings.ReplaceAll(st.path, "SIDE_UPLOAD_ID", side.uploadID)
 	path = strings.ReplaceAll(path, "SIDE_UPLOAD", side.upload)
-	req, err := http.NewRequest(st.method, side.base+path, strings.NewReader(st.body))
+	body := st.body
+	for i := len(side.refs) - 1; i >= 0; i-- {
+		n := strconv.Itoa(i)
+		path = strings.ReplaceAll(path, "SIDE_SIGNED_"+n, side.signed[i])
+		path = strings.ReplaceAll(path, "SIDE_REF_"+n, side.refs[i])
+		body = strings.ReplaceAll(body, "SIDE_REF_"+n, side.refs[i])
+	}
+	req, err := http.NewRequest(st.method, side.base+path, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,6 +331,11 @@ func rtDo(t *testing.T, side *rtSide, st rtStep, csrf string) rtAnswer {
 	if st.csrf {
 		req.Header.Set("X-Facet-CSRF", csrf)
 	}
+	if st.sign != "" {
+		mac := hmac.New(sha256.New, []byte(st.sign))
+		mac.Write([]byte(st.body))
+		req.Header.Set("X-Facet-Signature", hex.EncodeToString(mac.Sum(nil)))
+	}
 	resp, err := side.client.Do(req)
 	if err != nil {
 		t.Fatalf("%s: %s %s: %v", side.name, st.method, st.path, err)
@@ -283,11 +348,20 @@ func rtDo(t *testing.T, side *rtSide, st rtStep, csrf string) rtAnswer {
 	if m := rtTokenValue.FindSubmatch(b); m != nil {
 		side.token = string(m[1])
 	}
+	if m := rtNextCursor.FindSubmatch(b); m != nil {
+		side.next = string(m[1])
+	}
 	if e := resp.Header.Get("ETag"); e != "" {
 		side.etag = e
 	}
 	if m := rtUploadURL.FindSubmatch(b); m != nil {
 		side.upload = string(m[1])
+	}
+	if st.path == "/upload" {
+		if m := rtGrant.FindSubmatch(b); m != nil {
+			side.refs = append(side.refs, string(m[1]))
+			side.signed = append(side.signed, string(m[1])+"?exp="+string(m[2])+"&sig="+string(m[3]))
+		}
 	}
 	if m := rtUploadID.FindSubmatch(b); m != nil {
 		side.uploadID = string(m[1])
@@ -298,8 +372,8 @@ func rtDo(t *testing.T, side *rtSide, st rtStep, csrf string) rtAnswer {
 		c = rtCookieExp.ReplaceAllString(c, "Expires=EXP")
 		attrs += c + "\n"
 	}
-	return rtAnswer{status: resp.StatusCode, contentType: resp.Header.Get("Content-Type"),
-		cookieAttrs: attrs, body: rtNormalize(string(b))}
+	return rtAnswer{status: resp.StatusCode, contentType: rtBoundary.ReplaceAllString(resp.Header.Get("Content-Type"), "BOUNDARY"),
+		cookieAttrs: attrs, body: rtNormalize(string(b)), replay: resp.Header.Get("X-Facet-Idempotent-Replay")}
 }
 
 // rtCsrfOf reads the CSRF token a side stamped on the page it last served.
@@ -347,6 +421,9 @@ func rtCompare(t *testing.T, step rtStep, g, f rtAnswer) {
 	}
 	if g.contentType != f.contentType {
 		t.Errorf("%s: content-type go=%q fct=%q", step.name, g.contentType, f.contentType)
+	}
+	if g.replay != f.replay {
+		t.Errorf("%s: idempotent replay header go=%q fct=%q", step.name, g.replay, f.replay)
 	}
 	if g.cookieAttrs != f.cookieAttrs {
 		t.Errorf("%s: set-cookie go=%q fct=%q", step.name, g.cookieAttrs, f.cookieAttrs)
@@ -467,6 +544,10 @@ func rtScript(g *ir.IR) []rtStep {
 	return steps
 }
 
+// rtHookKey is the webhook secret both runtimes are given
+// (MARKETS_INGEST_KEY, the variable facets/api's webhooks name).
+const rtHookKey = "parity-hook-key"
+
 // rtScriptAPI drives an app whose contract is its declared `api` routes
 // (facets/api/main.fct): the page, an account created through the
 // contract, the refusals the router makes on its own, and bearer-
@@ -504,6 +585,28 @@ func rtScriptAPI(g *ir.IR) []rtStep {
 		{name: "dispatch: block", method: "POST", path: "/events", headers: bearer, body: `{"event_type":"block","target_handle":"alan"}`},
 		{name: "declared: sessions after login", method: "GET", path: "/api/v2/sessions", headers: bearer},
 		{name: "unknown route", method: "GET", path: "/api/v2/no/such/route"},
+		{name: "webhook get", method: "GET", path: "/hooks/markets/source"},
+		{name: "webhook unsigned", method: "POST", path: "/hooks/markets/source", body: `{"kind":"quote","provider":"tiingo","enabled":true}`},
+		{name: "webhook wrong key", method: "POST", path: "/hooks/markets/source", body: `{"kind":"quote","provider":"tiingo","enabled":true}`, sign: "not-the-key"},
+		{name: "webhook delivery", method: "POST", path: "/hooks/markets/source", body: `{"kind":"quotes","provider":"tiingo","enabled":true}`, sign: rtHookKey},
+		{name: "webhook redelivery (replayed success)", method: "POST", path: "/hooks/markets/source", body: `{"kind":"quotes","provider":"tiingo","enabled":true}`, sign: rtHookKey},
+		{name: "webhook refused delivery", method: "POST", path: "/hooks/markets/source", body: `{"kind":"quote","provider":"tiingo","enabled":true}`, sign: rtHookKey},
+		{name: "webhook refused redelivery (replayed refusal)", method: "POST", path: "/hooks/markets/source", body: `{"kind":"quote","provider":"tiingo","enabled":true}`, sign: rtHookKey},
+		{name: "webhook keyed delivery", method: "POST", path: "/hooks/markets/source", body: `{"kind":"gifs","provider":"giphy","enabled":false}`, sign: rtHookKey, headers: map[string]string{"Idempotency-Key": "delivery-7"}},
+		{name: "webhook keyed redelivery", method: "POST", path: "/hooks/markets/source", body: `{"kind":"sports","provider":"x","enabled":true}`, sign: rtHookKey, headers: map[string]string{"Idempotency-Key": "delivery-7"}},
+		{name: "webhook refused by the action", method: "POST", path: "/hooks/markets/close", body: `{"symbol":"","ts":0,"close":0}`, sign: rtHookKey},
+		{name: "webhook malformed", method: "POST", path: "/hooks/markets/source", body: `not json`, sign: rtHookKey},
+		{name: "stream post", method: "POST", path: "/api/v2/events", headers: bearer},
+		{name: "dev token without credentials", method: "POST", path: "/api/v2/dev/oauth/token", body: "grant_type=authorization_code&code=x", headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"}},
+		{name: "dev token malformed basic", method: "POST", path: "/api/v2/dev/oauth/token", body: "grant_type=authorization_code&code=x", headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded", "Authorization": "Basic not*base64"}},
+		{name: "dev token empty secret", method: "POST", path: "/api/v2/dev/oauth/token", body: "grant_type=authorization_code&code=x", headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded", "Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte("cid:"))}},
+		{name: "dev token wrong grant", method: "POST", path: "/api/v2/dev/oauth/token", body: "grant_type=password&code=x", headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded", "Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte("cid:csecret"))}},
+		{name: "dev token unknown code", method: "POST", path: "/api/v2/dev/oauth/token", body: "grant_type=authorization_code&code=nope", headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded", "Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte("cid:csecret"))}},
+		{name: "dev token as JSON", method: "POST", path: "/api/v2/dev/oauth/token", body: `{"grant_type":"authorization_code","code":"nope"}`, headers: map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte("cid:csecret"))}},
+		{name: "track upload not multipart", method: "POST", path: "/api/v2/music/tracks", body: `{"title":"x"}`, headers: bearer},
+		{name: "track upload without the file", method: "POST", path: "/api/v2/music/tracks", body: rtMultipartParts([3]string{"title", "", "Song"}), headers: map[string]string{"Authorization": "Bearer SIDE_TOKEN", "Content-Type": rtMultipartType}},
+		{name: "track upload unsupported file", method: "POST", path: "/api/v2/music/tracks", body: rtMultipartParts([3]string{"audio", "notes.txt", "not audio"}, [3]string{"title", "", "Song"}), headers: map[string]string{"Authorization": "Bearer SIDE_TOKEN", "Content-Type": rtMultipartType}},
+		{name: "track upload", method: "POST", path: "/api/v2/music/tracks", body: rtMultipartParts([3]string{"audio", "song.mp3", "ID3\x03\x00\x00\x00\x00\x00\x00frame"}, [3]string{"title", "", "Song"}, [3]string{"genre", "", "ambient"}, [3]string{"duration_secs", "", "187"}), headers: map[string]string{"Authorization": "Bearer SIDE_TOKEN", "Content-Type": rtMultipartType}},
 		{name: "contract document", method: "GET", path: "/api/v2/contract"},
 		{name: "contract conditional", method: "GET", path: "/api/v2/contract", headers: map[string]string{"If-None-Match": "SIDE_ETAG"}},
 		{name: "contract post", method: "POST", path: "/api/v2/contract", body: "{}"},
@@ -524,6 +627,12 @@ func rtRunApp(t *testing.T, app string) {
 	// One secret for both runtimes, so signatures are computed the same way
 	// (the values still differ: session ids are random on both sides).
 	t.Setenv("FACET_SECRET", "runtime-parity-secret")
+	t.Setenv("MARKETS_INGEST_KEY", rtHookKey)
+	// The script signs up, logs in and asks for dev tokens more often than
+	// the `auth` class's default burst (10) allows; both sides get the same
+	// wider budget so every step reaches its action (the limiter itself is
+	// compared by the contract document's x-rate-limit and the 429 texts).
+	t.Setenv("FACET_RATE_LIMIT_AUTH", "6000")
 	// Uploads land in a directory both sides share the name of; the fct
 	// side's sandbox is that same temp directory (see rtStartFct).
 	shared := t.TempDir()
@@ -537,8 +646,13 @@ func rtRunApp(t *testing.T, app string) {
 	gGo, _ := compile.File(app)
 	goSide := rtStartGo(t, gGo)
 	fctSide := rtStartFct(t, g)
+	rtDrive(t, app, g, goSide, fctSide)
+}
+
+// rtDrive runs the app's script against both sides, step by step.
+func rtDrive(t *testing.T, app string, g *ir.IR, goSide, fctSide *rtSide) {
+	t.Helper()
 	var goCsrf, fctCsrf string
-	next := ""
 	script := rtScript(g)
 	if len(g.APIs) > 0 {
 		script = rtScriptAPI(g)
@@ -556,14 +670,13 @@ func rtRunApp(t *testing.T, app string) {
 		if st.csrf {
 			goCsrf, fctCsrf = rtCsrfOf(t, goSide), rtCsrfOf(t, fctSide)
 		}
-		// A cursor page asks for what the previous page answered; the two
-		// sides mint the same cursor (same rows, same ids), so one serves both.
-		st.path = strings.ReplaceAll(st.path, "after=NEXT", "after="+next)
-		ga := rtDo(t, goSide, st, goCsrf)
-		fa := rtDo(t, fctSide, st, fctCsrf)
-		if m := rtNextCursor.FindStringSubmatch(ga.body); m != nil {
-			next = m[1]
-		}
+		// A cursor page asks for what the previous page answered: each side
+		// replays the cursor it minted (an engine's cursor is its own).
+		goStep, fctStep := st, st
+		goStep.path = strings.ReplaceAll(st.path, "after=NEXT", "after="+goSide.next)
+		fctStep.path = strings.ReplaceAll(st.path, "after=NEXT", "after="+fctSide.next)
+		ga := rtDo(t, goSide, goStep, goCsrf)
+		fa := rtDo(t, fctSide, fctStep, fctCsrf)
 		if os.Getenv("RT_PARITY_TRACE") != "" {
 			t.Logf("%-40s go=%d fct=%d %s", st.name, ga.status, fa.status, ga.contentType)
 		}
@@ -574,6 +687,143 @@ func rtRunApp(t *testing.T, app string) {
 	}
 	if len(g.APIs) == 0 {
 		rtLiveParity(t, g, goSide, fctSide)
+	}
+	if len(g.Streams) > 0 {
+		rtStreamParity(t, g, goSide, fctSide)
+	}
+}
+
+var rtHelloID = regexp.MustCompile(`"session_id":"[0-9a-f]{24}"`)
+
+// rtStreamParity subscribes both sides to the app's first declared stream
+// (a `{param}` filled with 1) with the bearer token each side issued, and
+// compares, frame by frame: the refusal of a request carrying no credential,
+// the opening frames (the connected comment, hello, the connect hooks'
+// frames), then an emitted frame reaching that subscriber — for an app with
+// a `notif_read_all` mutation the event it emits to the actor; for a stream
+// with connect hooks a second subscriber's join and then, when it leaves,
+// its disconnect hook's event.
+func rtStreamParity(t *testing.T, g *ir.IR, goSide, fctSide *rtSide) {
+	t.Helper()
+	st := g.Streams[0]
+	path := regexp.MustCompile(`\{[^}]+\}`).ReplaceAllString(st.Path, "1")
+	opening := 2 // ": connected" and hello
+	if st.Hello == "" {
+		opening = 1
+	}
+	for _, h := range st.Connects {
+		if h.Event != "" {
+			opening++
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	type stream struct {
+		r      *bufio.Reader
+		resp   *http.Response
+		cancel context.CancelFunc
+	}
+	open := func(side *rtSide) *stream {
+		sctx, scancel := context.WithCancel(ctx)
+		req, _ := http.NewRequestWithContext(sctx, "GET", side.base+path, nil)
+		req.Header.Set("Authorization", "Bearer "+side.token)
+		for _, c := range side.client.Jar.Cookies(req.URL) {
+			req.AddCookie(c)
+		}
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		if err != nil {
+			scancel()
+			t.Fatalf("%s: %s: %v", side.name, path, err)
+		}
+		if resp.StatusCode != 200 {
+			b, _ := io.ReadAll(resp.Body)
+			scancel()
+			t.Fatalf("%s: %s: %s %s", side.name, path, resp.Status, b)
+		}
+		return &stream{r: bufio.NewReader(resp.Body), resp: resp, cancel: scancel}
+	}
+	frame := func(s *stream, who string) string {
+		var b strings.Builder
+		for {
+			line, err := s.r.ReadString('\n')
+			if err != nil {
+				t.Fatalf("%s: reading a stream frame: %v (got %q)", who, err, b.String())
+			}
+			if line == "\n" {
+				return rtHelloID.ReplaceAllString(rtNormalize(b.String()), `"session_id":"CONN"`)
+			}
+			b.WriteString(line)
+		}
+	}
+	both := func(what string, gs, fs *stream) string {
+		gf, ff := frame(gs, "go"), frame(fs, "fct")
+		if gf != ff {
+			t.Errorf("%s differs:\n%s", what, rtDiff(gf, ff))
+		}
+		return gf
+	}
+	// No credential at all (no bearer, no cookie): refused before any head.
+	anon := func(side *rtSide) rtAnswer {
+		req, _ := http.NewRequestWithContext(ctx, "GET", side.base+path, nil)
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("%s: anonymous %s: %v", side.name, path, err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return rtAnswer{status: resp.StatusCode, contentType: resp.Header.Get("Content-Type"), body: string(b)}
+	}
+	anonStep := rtStep{name: "stream without a credential", method: "GET", path: path}
+	rtCompare(t, anonStep, anon(goSide), anon(fctSide))
+	gs, fs := open(goSide), open(fctSide)
+	defer gs.cancel()
+	defer fs.cancel()
+	if a, b := gs.resp.Header.Get("Content-Type"), fs.resp.Header.Get("Content-Type"); a != b {
+		t.Errorf("stream content-type go=%q fct=%q", a, b)
+	}
+	for i := 0; i < opening; i++ {
+		both(fmt.Sprintf("stream opening frame %d", i), gs, fs)
+	}
+	emitted := ""
+	hasNotif := false
+	for _, m := range g.Messages {
+		for _, v := range m.Variants {
+			if v.WireName() == "notif_read_all" {
+				hasNotif = true
+			}
+		}
+	}
+	switch {
+	case hasNotif:
+		bearer := map[string]string{"Authorization": "Bearer SIDE_TOKEN"}
+		emit := rtStep{name: "dispatch notif_read_all while subscribed", method: "POST", path: "/events", headers: bearer, body: `{"event_type":"notif_read_all"}`}
+		ga, fa := rtDo(t, goSide, emit, ""), rtDo(t, fctSide, emit, "")
+		rtCompare(t, emit, ga, fa)
+		emitted = both("the emitted frame", gs, fs)
+	case len(st.Connects) > 0:
+		// A connect hook announces a *new* member of the room: the second
+		// subscriber is a second account, signed up on its own client.
+		viewer := func(side *rtSide) *rtSide {
+			v := &rtSide{name: side.name, base: side.base, client: rtClient(t)}
+			su := rtStep{name: "second subscriber signs up", method: "POST", path: "/api/signup", body: `{"args":["viewer2","watching-2"]}`}
+			if a := rtDo(t, v, su, ""); a.status != 200 {
+				t.Fatalf("%s: %s: %d %s", side.name, su.name, a.status, a.body)
+			}
+			return v
+		}
+		g2, f2 := open(viewer(goSide)), open(viewer(fctSide))
+		for i := 0; i < opening; i++ {
+			both(fmt.Sprintf("second subscriber's opening frame %d", i), g2, f2)
+		}
+		emitted = both("the second subscriber's join, as the first sees it", gs, fs)
+		g2.cancel()
+		f2.cancel()
+		if st.Disconnect != "" {
+			emitted += both("the second subscriber's leave, as the first sees it", gs, fs)
+		}
+	}
+	if os.Getenv("RT_PARITY_TRACE") != "" {
+		t.Logf("emitted: %q", emitted)
 	}
 }
 
@@ -693,3 +943,186 @@ func TestRuntimeParityHome(t *testing.T)     { rtRunApp(t, rtParityApps[2]) }
 func TestRuntimeParityApiMain(t *testing.T)  { rtRunApp(t, rtParityApps[3]) }
 func TestRuntimeParityLive(t *testing.T)     { rtRunApp(t, rtParityApps[4]) }
 func TestRuntimeParityMessages(t *testing.T) { rtRunApp(t, rtParityApps[5]) }
+
+// TestRuntimeParityDurable is the parity harness with a store behind both
+// runtimes: the Go runtime on the Rust FacetQL engine, the fct runtime on
+// fqserver.fct (the engine written in fct), each reached through
+// FACET_DATABASE_URL. The same script runs against both; afterwards the two
+// engines must hold the same rows (kind, address and data, the clock
+// readings and password hashes masked) — every write the fct runtime made
+// reached its engine exactly as the Go runtime's reached its own.
+func TestRuntimeParityDurable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts two FacetQL engines per app")
+	}
+	for _, app := range rtParityApps {
+		app := app
+		t.Run(filepath.Base(app), func(t *testing.T) { rtRunDurable(t, app) })
+	}
+}
+
+// rtRunDurable is one app's durable run: a fresh engine pair, the same
+// script the in-memory run uses, then the engines compared.
+func rtRunDurable(t *testing.T, app string) {
+	t.Helper()
+	rustPort, fctPort := fqServerPair(t)
+	g, err := compile.File(app)
+	if err != nil {
+		t.Fatalf("compile %s: %v", app, err)
+	}
+	t.Setenv("FACET_SECRET", "runtime-parity-secret")
+	t.Setenv("MARKETS_INGEST_KEY", rtHookKey)
+	// The script signs up, logs in and asks for dev tokens more often than
+	// the `auth` class's default burst (10) allows; both sides get the same
+	// wider budget so every step reaches its action (the limiter itself is
+	// compared by the contract document's x-rate-limit and the 429 texts).
+	t.Setenv("FACET_RATE_LIMIT_AUTH", "6000")
+	shared := t.TempDir()
+	t.Setenv("FACET_DATA_DIR", shared)
+	t.Setenv("FACET_UPLOAD_DIR", filepath.Join(shared, "facet-uploads"))
+	t.Setenv("FACET_API_READ", g.Entities[0].Name)
+	// The Go runtime reads FACET_DATABASE_URL when it is constructed, the fct
+	// runtime when its daemon boots: each is started under its own engine's URL.
+	t.Setenv("FACET_DATABASE_URL", fmt.Sprintf("facetql://tok@127.0.0.1:%d", rustPort))
+	gGo, _ := compile.File(app)
+	goSrv, err := runtime.New(gGo)
+	if err != nil {
+		t.Fatalf("go runtime on the rust engine: %v", err)
+	}
+	goTS := httptest.NewServer(goSrv.Handler())
+	t.Cleanup(goTS.Close)
+	goSrv.StartJobs()
+	goSide := &rtSide{name: "go", base: goTS.URL, client: rtClient(t)}
+	t.Setenv("FACET_DATABASE_URL", fmt.Sprintf("facetql://tok@127.0.0.1:%d", fctPort))
+	fctSide := rtStartFct(t, g)
+	rtDrive(t, app, g, goSide, fctSide)
+	for _, e := range g.Entities {
+		rust := rtEngineRows(t, rustPort, e.Name)
+		fct := rtEngineRows(t, fctPort, e.Name)
+		if rust != fct {
+			t.Errorf("%s rows differ between the engines:\n%s", e.Name, rtDiff(rust, fct))
+		}
+	}
+}
+
+var (
+	rtBcryptHash = regexp.MustCompile(`\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}`)
+	rtSealed     = regexp.MustCompile(`fctenc:[A-Za-z0-9_-]+`)
+	// a session's visitor key (`session`), stored in a row by an app that
+	// keys state to it: 24 random bytes, minted independently per process
+	rtVisitorKey = regexp.MustCompile(`"sid":"[A-Za-z0-9_-]{32}"`)
+)
+
+// rtEngineRows lists one kind's nodes on an engine as "address data" lines,
+// sorted, with what no two processes mint alike masked.
+func rtEngineRows(t *testing.T, port int, kind string) string {
+	t.Helper()
+	var lines []string
+	after := ""
+	for {
+		body, _ := json.Marshal(map[string]any{"kind": kind, "item_var": "item", "order": "id", "limit": 500, "after": after})
+		req, _ := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d/nodes/query", port), strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-api-key", "tok")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("engine %d query %s: %d %s", port, kind, resp.StatusCode, raw)
+		}
+		var page struct {
+			Nodes []struct {
+				Address string `json:"address"`
+				Data    string `json:"data"`
+			} `json:"nodes"`
+			Next string `json:"next"`
+		}
+		if err := json.Unmarshal(raw, &page); err != nil {
+			t.Fatal(err)
+		}
+		for _, n := range page.Nodes {
+			d := rtNormalize(n.Data)
+			d = rtBcryptHash.ReplaceAllString(d, "BCRYPT")
+			d = rtSealed.ReplaceAllString(d, "SEALED")
+			d = rtVisitorKey.ReplaceAllString(d, `"sid":"VISITOR"`)
+			lines = append(lines, n.Address+" "+d)
+		}
+		if page.Next == "" || len(page.Nodes) == 0 {
+			break
+		}
+		after = page.Next
+	}
+	sort.Strings(lines)
+	return strings.Join(lines, "\n")
+}
+
+// TestRuntimeParitySignedMedia runs facets/timeline.fct with media signing
+// on (FACET_MEDIA_TTL): an upload answered with its signed URL, the
+// /uploads/ access rules (unsigned, expired, tampered, signed), http.ServeFile's
+// Range / If-Modified-Since / HEAD behaviour, an HLS playlist whose segment
+// lines come back signed, and a video post whose page renders a signed src
+// and whose bootstrap and region answer carry the grant map.
+func TestRuntimeParitySignedMedia(t *testing.T) {
+	app := rtParityApps[1]
+	g, err := compile.File(app)
+	if err != nil {
+		t.Fatalf("compile %s: %v", app, err)
+	}
+	t.Setenv("FACET_SECRET", "runtime-parity-secret")
+	t.Setenv("FACET_MEDIA_TTL", "3600")
+	shared := t.TempDir()
+	t.Setenv("FACET_DATA_DIR", shared)
+	t.Setenv("FACET_UPLOAD_DIR", filepath.Join(shared, "facet-uploads"))
+	t.Setenv("FACET_API_READ", g.Entities[0].Name)
+	gGo, _ := compile.File(app)
+	goSide := rtStartGo(t, gGo)
+	fctSide := rtStartFct(t, g)
+	mp := map[string]string{"Content-Type": rtMultipartType}
+	steps := []rtStep{
+		{name: "signup", method: "POST", path: "/api/signup", body: `{"args":["grace","hopper"]}`},
+		{name: "upload a clip", method: "POST", path: "/upload", body: rtMultipart("file", "clip.mp4", "0123456789abcdef"), headers: mp, csrf: true},
+		{name: "upload a playlist", method: "POST", path: "/upload", body: rtMultipart("file", "list.m3u8", "#EXTM3U\n#EXTINF:4,\nseg1.ts\n\n#EXTINF:4,\n  seg2.ts\n#EXT-X-ENDLIST"), headers: mp, csrf: true},
+		{name: "unsigned link", method: "GET", path: "SIDE_REF_0"},
+		{name: "expired link", method: "GET", path: "SIDE_REF_0?exp=1&sig=00"},
+		{name: "tampered link", method: "GET", path: "SIDE_REF_0?exp=9999999999&sig=" + strings.Repeat("0", 64)},
+		{name: "non-numeric expiry", method: "GET", path: "SIDE_REF_0?exp=1e9&sig=00"},
+		{name: "signed link", method: "GET", path: "SIDE_SIGNED_0"},
+		{name: "signed HEAD", method: "HEAD", path: "SIDE_SIGNED_0"},
+		{name: "range 2-5", method: "GET", path: "SIDE_SIGNED_0", headers: map[string]string{"Range": "bytes=2-5"}},
+		{name: "range open-ended", method: "GET", path: "SIDE_SIGNED_0", headers: map[string]string{"Range": "bytes=10-"}},
+		{name: "range suffix", method: "GET", path: "SIDE_SIGNED_0", headers: map[string]string{"Range": "bytes=-4"}},
+		{name: "range clamped", method: "GET", path: "SIDE_SIGNED_0", headers: map[string]string{"Range": "bytes=12-100"}},
+		{name: "range multi", method: "GET", path: "SIDE_SIGNED_0", headers: map[string]string{"Range": "bytes=0-1, 4-5"}},
+		{name: "range past the end", method: "GET", path: "SIDE_SIGNED_0", headers: map[string]string{"Range": "bytes=100-200"}},
+		{name: "range malformed", method: "GET", path: "SIDE_SIGNED_0", headers: map[string]string{"Range": "bytes=abc"}},
+		{name: "range wider than the file", method: "GET", path: "SIDE_SIGNED_0", headers: map[string]string{"Range": "bytes=0-10,5-15"}},
+		{name: "if-modified-since future", method: "GET", path: "SIDE_SIGNED_0", headers: map[string]string{"If-Modified-Since": "Fri, 01 Jan 2100 00:00:00 GMT"}},
+		{name: "if-modified-since past", method: "GET", path: "SIDE_SIGNED_0", headers: map[string]string{"If-Modified-Since": "Mon, 01 Jan 2001 00:00:00 GMT"}},
+		{name: "if-modified-since with if-none-match", method: "GET", path: "SIDE_SIGNED_0", headers: map[string]string{"If-Modified-Since": "Fri, 01 Jan 2100 00:00:00 GMT", "If-None-Match": `"x"`}},
+		{name: "signed playlist", method: "GET", path: "SIDE_SIGNED_1"},
+		{name: "unsigned playlist", method: "GET", path: "SIDE_REF_1"},
+		{name: "post a video", method: "POST", path: "/api/postVideo", body: `{"args":["a clip","SIDE_REF_0"]}`},
+		{name: "home with a signed video", method: "GET", path: "/"},
+		{name: "region with a signed video", method: "POST", path: "/region", body: `{"path":"/","key":"","state":{}}`, csrf: true},
+	}
+	var goCsrf, fctCsrf string
+	for _, st := range steps {
+		if st.csrf {
+			goCsrf, fctCsrf = rtCsrfOf(t, goSide), rtCsrfOf(t, fctSide)
+		}
+		ga, fa := rtDo(t, goSide, st, goCsrf), rtDo(t, fctSide, st, fctCsrf)
+		if os.Getenv("RT_PARITY_TRACE") != "" {
+			t.Logf("%-40s go=%d fct=%d %s", st.name, ga.status, fa.status, ga.contentType)
+		}
+		rtCompare(t, st, ga, fa)
+		if t.Failed() && os.Getenv("RT_PARITY_ALL") == "" {
+			t.Fatalf("stopping at the first failing step (%s)", st.name)
+		}
+		if st.name == "upload a playlist" && (len(goSide.refs) != 2 || len(fctSide.refs) != 2) {
+			t.Fatalf("an upload's signed URL was not captured (go %d, fct %d)", len(goSide.refs), len(fctSide.refs))
+		}
+	}
+}

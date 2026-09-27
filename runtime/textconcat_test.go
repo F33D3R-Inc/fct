@@ -26,7 +26,15 @@ const textConcatApp = `app A:
         let chain = "line " + n + ": " + s + " " + ok + " " + f + " " + xs + " " + p.a + " " + len(bs) + "|" + two + (n + 1) + "" + n * 2
         let list = [1] + [2]
         let sum = n + n + 1
-        return chain + "#" + len(list) + "#" + sum
+        let kept = do keeps(p)
+        return chain + "#" + len(list) + "#" + sum + "#" + kept
+    proc pair(p: P) -> int:
+        return p.a + 1
+    proc keeps(p0: P) -> text:
+        # p is handed to pair(...) and read again later in the same chain:
+        # the chain's leaves compile in source order, so p is not moved.
+        let p = p0
+        return "" + pair(p) + ":" + p.a + ":" + pair(p)
     proc failing(xs: [int], i: int) -> text:
         return "at " + i + " = " + xs[i]
     state result: text = ""
@@ -56,7 +64,7 @@ func TestTextConcatChainMatchesStepwise(t *testing.T) {
 	// Each part renders as toStr would: the int, the text, the bool's word,
 	// the float, the list's rendering, the struct field, the byte count —
 	// and `two + (n + 1)`: the parenthesized int sum, then `+ "" + n * 2`.
-	want := "line 70000: héllo true 2.5 " + toStr([]any{1, "two", 3}) + " 4 2|7000070001140000#2#140001"
+	want := "line 70000: héllo true 2.5 " + toStr([]any{1, "two", 3}) + " 4 2|7000070001140000#2#140001#5:4:5"
 	if got := deltas["result"]; got != want {
 		t.Fatalf("result = %v\nwant     %s", got, want)
 	}

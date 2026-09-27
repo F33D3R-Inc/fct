@@ -85,6 +85,136 @@ app APIDecl:
         let none = do rtEmptyRoute()
         return RtAPIMatch{found: false, pathMatched: pathMatched, route: none, vals: []}
 
+    # ── bodies: bytes, multipart (shared with upload_media.fct) ─────────
+    proc rtUploadDir(w: RtWorld) -> text:
+        if w.uploadDir != "":
+            return w.uploadDir
+        return "facet-uploads"
+
+    proc rtRandomName() -> text:
+        let b = randomBytes(16)
+        let h = do rtHex(b)
+        return h
+
+    # rtSafeExt: safeExt — a lowercase extension of at most 5 letters or
+    # digits, else none.
+    proc rtSafeExt(filename: text) -> text:
+        let mut dot = -1
+        let mut i = len(filename) - 1
+        loop i >= 0 && dot < 0:
+            let c = charAt(filename, i)
+            if c == ".":
+                dot = i
+            if c == "/" || c == "\\":
+                i = -1
+            i = i - 1
+        if dot < 0:
+            return ""
+        let ext = lower(slice(filename, dot, len(filename)))
+        if ext == "" || len(ext) > 6:
+            return ""
+        let mut k = 1
+        loop k < len(ext):
+            let c2 = charAt(ext, k)
+            if !((c2 >= "a" && c2 <= "z") || (c2 >= "0" && c2 <= "9")):
+                return ""
+            k = k + 1
+        return ext
+
+    # rtBodyBytes: the request body as the bytes that arrived.
+    proc rtBodyBytes(req: HttpServerRequest) -> [int]:
+        let b64 = do rtHeaderValue(req.headers, "x-facet-body-b64")
+        if b64 == "":
+            return textToBytes(req.body)
+        let bs = do rtBase64UrlDecode(b64)
+        return bs
+
+    # ── multipart/form-data ─────────────────────────────────────────────
+    struct RtPart:
+        name: text
+        filename: text
+        data: [int]
+
+    proc rtBoundaryOf(contentType: text) -> text:
+        let at = do rtIndexOfText(lower(contentType), "boundary=")
+        if at < 0:
+            return ""
+        let mut b = slice(contentType, at + 9, len(contentType))
+        let semi = do rtIndexOfText(b, ";")
+        if semi >= 0:
+            b = slice(b, 0, semi)
+        b = trim(b)
+        if len(b) >= 2 && charAt(b, 0) == "\"":
+            b = slice(b, 1, len(b) - 1)
+        return b
+
+    proc rtBytesIndexOf(hay: [int], needle: [int], from: int) -> int:
+        let n = len(hay)
+        let m = len(needle)
+        let mut i = from
+        loop i + m <= n:
+            let mut k = 0
+            let mut same = true
+            loop k < m && same:
+                if hay[i + k] != needle[k]:
+                    same = false
+                k = k + 1
+            if same:
+                return i
+            i = i + 1
+        return -1
+
+    proc rtDispositionParam(header: text, key: text) -> text:
+        let at = do rtIndexOfText(header, key + "=\"")
+        if at < 0:
+            return ""
+        let rest = slice(header, at + len(key) + 2, len(header))
+        let q = do rtIndexOfText(rest, "\"")
+        if q < 0:
+            return rest
+        return slice(rest, 0, q)
+
+    # rtParseMultipart: every part of a multipart/form-data body; an empty
+    # list when the body is not one.
+    proc rtParseMultipart(contentType: text, body: [int]) -> [RtPart]:
+        let boundary = do rtBoundaryOf(contentType)
+        let isMulti = do rtHasPrefix(lower(contentType), "multipart/form-data")
+        if boundary == "" || !isMulti:
+            return []
+        let delim = textToBytes("--" + boundary)
+        let crlf = textToBytes("\r\n")
+        let mut parts = []
+        let mut pos = do rtBytesIndexOf(body, delim, 0)
+        let mut going = pos >= 0
+        loop going:
+            pos = pos + len(delim)
+            if pos + 2 <= len(body) && body[pos] == 45 && body[pos + 1] == 45:
+                going = false
+            else:
+                let headEnd = do rtBytesIndexOf(body, textToBytes("\r\n\r\n"), pos)
+                if headEnd < 0:
+                    going = false
+                else:
+                    let head = bytesToText(slice(body, pos + 2, headEnd))
+                    let next = do rtBytesIndexOf(body, crlf + delim, headEnd + 4)
+                    if next < 0:
+                        going = false
+                    else:
+                        let data = slice(body, headEnd + 4, next)
+                        let lines = split(head, "\r\n")
+                        let mut name = ""
+                        let mut filename = ""
+                        let mut li = 0
+                        loop li < len(lines):
+                            let isDisp = do rtHasPrefix(lower(lines[li]), "content-disposition:")
+                            if isDisp:
+                                name = do rtDispositionParam(lines[li], "name")
+                                filename = do rtDispositionParam(lines[li], "filename")
+                            li = li + 1
+                        parts = append(parts, RtPart{name: name, filename: filename, data: data})
+                        pos = next + 2
+        return parts
+
     # ── errors ──────────────────────────────────────────────────────────
     proc rtStatusText(status: int) -> text:
         if status == 400:
@@ -373,7 +503,67 @@ app APIDecl:
         return r
 
     # rtServeDeclaredAPI: serveDeclaredAPI.
-    proc rtServeDeclaredAPI(w0: RtWorld, req: HttpServerRequest, peer: text) -> RtServed:
+    # rtBase64StdDecode: base64.StdEncoding.DecodeString — padded, standard
+    # alphabet; ok false for anything else.
+    struct RtDecoded:
+        ok: bool
+        bytes: [int]
+
+    proc rtBase64StdDecode(s: text) -> RtDecoded:
+        if len(s) % 4 != 0:
+            return RtDecoded{ok: false, bytes: []}
+        let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        let mut pad = 0
+        let mut body = s
+        loop len(body) > 0 && charAt(body, len(body) - 1) == "=" && pad < 2:
+            body = slice(body, 0, len(body) - 1)
+            pad = pad + 1
+        let mut out = []
+        let mut acc = 0
+        let mut bits = 0
+        let mut i = 0
+        loop i < len(body):
+            let v = do rtIndexOfText(alphabet, charAt(body, i))
+            if v < 0:
+                return RtDecoded{ok: false, bytes: []}
+            acc = acc * 64 + v
+            bits = bits + 6
+            if bits >= 8:
+                bits = bits - 8
+                out = append(out, (acc / (1 << bits)) % 256)
+                acc = acc % (1 << bits)
+            i = i + 1
+        return RtDecoded{ok: true, bytes: out}
+
+    # rtBasicAuth: Request.BasicAuth — "Basic " (any case), the standard
+    # base64 of "id:secret".
+    struct RtBasic:
+        ok: bool
+        id: text
+        secret: text
+
+    proc rtBasicAuth(req: HttpServerRequest) -> RtBasic:
+        let h = do rtHeaderValue(req.headers, "authorization")
+        if len(h) < 6 || lower(slice(h, 0, 6)) != "basic ":
+            return RtBasic{ok: false, id: "", secret: ""}
+        let d = do rtBase64StdDecode(slice(h, 6, len(h)))
+        if !d.ok:
+            return RtBasic{ok: false, id: "", secret: ""}
+        let pair = bytesToText(d.bytes)
+        let colon = do rtIndexOfText(pair, ":")
+        if colon < 0:
+            return RtBasic{ok: false, id: "", secret: ""}
+        return RtBasic{ok: true, id: slice(pair, 0, colon), secret: slice(pair, colon + 1, len(pair))}
+
+    # rtMediaType: mime.ParseMediaType's type — lowercased, parameters off.
+    proc rtMediaType(ct: text) -> text:
+        let semi = do rtIndexOfText(ct, ";")
+        let mut t = ct
+        if semi >= 0:
+            t = slice(ct, 0, semi)
+        return lower(trim(t))
+
+    proc rtServeDeclaredAPI(w0: RtWorld, req: HttpServerRequest, peer: text) -> RtServed uses io.file:
         let mut w = w0
         let g = w.g
         if len(g.apis) == 0:
@@ -417,6 +607,15 @@ app APIDecl:
                 let uar = do rtWithHeaders(ua, rate.headers)
                 return RtServed{handled: true, resp: uar, w: w}
             bound = do rtBind(bound, r.api.bearer, textVal(tok))
+        if r.api.basicId != "":
+            let ba = do rtBasicAuth(req)
+            if !ba.ok || ba.id == "" || ba.secret == "":
+                let mut ub = do rtAPIErrorCode(401, "invalid_client", "Present your client_id and client_secret as HTTP Basic credentials.")
+                ub.headers = append(ub.headers, HttpHeader{name: "www-authenticate", value: "Basic realm=\"" + r.api.auth + "\""})
+                let ubr = do rtWithHeaders(ub, rate.headers)
+                return RtServed{handled: true, resp: ubr, w: w}
+            bound = do rtBind(bound, r.api.basicId, textVal(ba.id))
+            bound = do rtBind(bound, r.api.basicSecret, textVal(ba.secret))
         let qp = do rtQueryParams(req.query, req.hasQuery)
         let mut pi = 0
         loop pi < len(act.params):
@@ -439,19 +638,96 @@ app APIDecl:
             pi = pi + 1
         if req.method == "POST" || req.method == "PUT" || req.method == "PATCH" || req.method == "DELETE":
             let hasBytes = do rtHasBytesParam(r, act)
+            let ct = do rtHeaderValue(req.headers, "content-type")
+            let mt = do rtMediaType(ct)
+            let formBody = r.api.form && (mt == "application/x-www-form-urlencoded" || mt == "multipart/form-data")
             if hasBytes:
-                let mp = do rtAPIError(400, "request body must be multipart/form-data")
-                let mpr = do rtWithHeaders(mp, rate.headers)
-                return RtServed{handled: true, resp: mpr, w: w}
+                # bindMultipartBody: each file part stored as an upload and
+                # bound as its /uploads/ reference; each other field bound
+                # from its value unless the path or query already bound it.
+                let raw = do rtBodyBytes(req)
+                let parts = do rtParseMultipart(ct, raw)
+                if mt != "multipart/form-data" || len(parts) == 0 || len(raw) > w.uploadCap:
+                    let mp = do rtAPIError(400, "request body must be multipart/form-data")
+                    let mpr = do rtWithHeaders(mp, rate.headers)
+                    return RtServed{handled: true, resp: mpr, w: w}
+                let mut bi = 0
+                loop bi < len(act.params):
+                    let bp = act.params[bi]
+                    let inPath = do rtInList(r.api.params, bp.name)
+                    if !inPath:
+                        if bp.type == "bytes":
+                            let mut fi = -1
+                            let mut k = 0
+                            loop k < len(parts):
+                                if parts[k].name == bp.name && parts[k].filename != "" && fi < 0:
+                                    fi = k
+                                k = k + 1
+                            if fi >= 0:
+                                let name = rtRandomName() + rtSafeExt(parts[fi].filename)
+                                let stored = writeFileAt(rtUploadDir(w) + "/" + name, 0, parts[fi].data)
+                                bound = do rtBind(bound, bp.name, textVal("/uploads/" + name))
+                        else:
+                            let already = do rtBoundHas(bound, bp.name)
+                            if !already:
+                                let mut k2 = 0
+                                let mut got = false
+                                loop k2 < len(parts) && !got:
+                                    if parts[k2].name == bp.name && parts[k2].filename == "":
+                                        let v = bytesToText(parts[k2].data)
+                                        if v != "":
+                                            bound = do rtBind(bound, bp.name, textVal(v))
+                                        got = true
+                                    k2 = k2 + 1
+                    bi = bi + 1
+            if !hasBytes && formBody:
+                # a `form` route: an urlencoded or multipart body's fields
+                # (PostForm), every value for a list parameter, else the first
+                let mut names = []
+                let mut vals = []
+                if mt == "multipart/form-data":
+                    let raw2 = do rtBodyBytes(req)
+                    let parts2 = do rtParseMultipart(ct, raw2)
+                    let mut k3 = 0
+                    loop k3 < len(parts2):
+                        if parts2[k3].filename == "":
+                            names = append(names, parts2[k3].name)
+                            vals = append(vals, bytesToText(parts2[k3].data))
+                        k3 = k3 + 1
+                else:
+                    let qp2 = do rtQueryParams(req.body, true)
+                    names = qp2.names
+                    vals = qp2.vals
+                let mut fp = 0
+                loop fp < len(act.params):
+                    let p3 = act.params[fp]
+                    let already2 = do rtBoundHas(bound, p3.name)
+                    if !already2:
+                        let mut vs = []
+                        let mut k4 = 0
+                        loop k4 < len(names):
+                            if names[k4] == p3.name:
+                                vs = append(vs, textVal(vals[k4]))
+                            k4 = k4 + 1
+                        if len(vs) > 0:
+                            if p3.list:
+                                bound = do rtBind(bound, p3.name, listVal(vs))
+                            else:
+                                bound = do rtBind(bound, p3.name, vs[0])
+                    fp = fp + 1
+            let jsonBody = !hasBytes && !formBody
             let mut body = do jNone()
-            if trim(req.body) != "":
+            if jsonBody && trim(req.body) != "":
                 body = do jsonParse(req.body)
                 if body.kind != "obj":
                     let bj = do rtAPIError(400, "request body must be a JSON object")
                     let bjr = do rtWithHeaders(bj, rate.headers)
                     return RtServed{handled: true, resp: bjr, w: w}
+            # a lone wire-typed body parameter takes the whole JSON object; a
+            # multipart or form body was bound field by field above (and
+            # leaves `body` empty, so the merge below adds nothing)
             let whole = do rtWholeBodyParam(g, r, act)
-            if whole != "":
+            if jsonBody && whole != "":
                 let bv = do rtJValToVal(body)
                 if body.kind == "obj":
                     bound = do rtBind(bound, whole, bv)

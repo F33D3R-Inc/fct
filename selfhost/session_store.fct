@@ -35,6 +35,49 @@ app SessionStore:
         tenantRole: text
         session: text
 
+    # RtDurOp: one durable write an action made (server.go's durOp): a row
+    # saved, a row deleted, or a table cleared — committed as one
+    # transaction after the action, before its reply.
+    struct RtDurOp:
+        kind: text
+        entity: text
+        row: Val
+        id: int
+
+    # RtEmitted: one `emit` an action made (streams.go's emitted), fanned
+    # out once the action is durable.
+    struct RtEmitted:
+        typ: text
+        name: text
+        payload: text
+        to: text
+        targeted: bool
+        key: text
+
+    # RtLoggedFrame / RtStreamLog: a stream's retained frames for
+    # Last-Event-ID replay (streamLog, capped at 512).
+    struct RtLoggedFrame:
+        seq: int
+        frame: text
+        to: text
+        targeted: bool
+        key: text
+
+    struct RtStreamLog:
+        path: text
+        seq: int
+        frames: [RtLoggedFrame]
+
+    # RtStreamSub: one open subscription to a declared stream.
+    struct RtStreamSub:
+        ch: int
+        path: text
+        actor: text
+        key: text
+        sid: text
+        paramNames: [text]
+        paramVals: [text]
+
     struct RtWorld:
         g: IRGraph
         entNames: [text]
@@ -78,6 +121,32 @@ app SessionStore:
         contractVersion: text
         contractGenerated: int
         schemaVersion: int
+        # the store (FACET_DATABASE_URL, a facetql:// engine): whether one is
+        # attached, where, the key @secret columns are sealed with, and the
+        # writes and changes the request in flight has made — committed and
+        # fanned out by the loop once the handler has answered.
+        storeOn: bool
+        fqlBase: text
+        fqlToken: text
+        encKey: [int]
+        pendingOps: [RtDurOp]
+        pendingChanged: [text]
+        # declared streams: open subscriptions, retained logs, and the
+        # events the request in flight emitted
+        streamSubs: [RtStreamSub]
+        streamLogs: [RtStreamLog]
+        pendingEvents: [RtEmitted]
+        # inbound webhooks: each one's HMAC key (its env secret, else the
+        # signing key), and the idempotency records (key, done, status,
+        # body, expiry in unix seconds) with their TTL
+        whPaths: [text]
+        whKeys: [text]
+        idemKeys: [text]
+        idemDone: [bool]
+        idemStatus: [int]
+        idemBody: [text]
+        idemExpires: [int]
+        idemTTL: int
 
     proc rtSessionTTLms() -> int:
         return 24 * 60 * 60 * 1000
@@ -188,7 +257,7 @@ app SessionStore:
         let css = do rtStylesheet(g)
         let ver = do rtStylesheetVersion(css)
         let rules = do rtApiReadRules(g, apiRead)
-        return RtWorld{g: g, entNames: names, entRows: rows, nextIds: ids, sessions: [], writeSeq: 0, subs: [], signKey: key, secure: false, cssBody: css, cssVer: ver, lockNames: [], lockCounts: [], lockFirst: [], lockUntil: [], apiReadNames: rules.names, apiReadGuards: rules.guards, rateKeys: [], rateTokens: [], rateLast: [], rateClassNames: [], rateClassLimits: [], rateDefault: 0, uploadDir: "", uploadCap: 10 * 1024 * 1024, uploadTotalCap: 200 * 1024 * 1024, mediaTTL: 0, upIds: [], upNames: [], upSizes: [], contractRaw: "", contractVersion: "", contractGenerated: 0, schemaVersion: 0}
+        return RtWorld{g: g, entNames: names, entRows: rows, nextIds: ids, sessions: [], writeSeq: 0, subs: [], signKey: key, secure: false, cssBody: css, cssVer: ver, lockNames: [], lockCounts: [], lockFirst: [], lockUntil: [], apiReadNames: rules.names, apiReadGuards: rules.guards, rateKeys: [], rateTokens: [], rateLast: [], rateClassNames: [], rateClassLimits: [], rateDefault: 0, uploadDir: "", uploadCap: 10 * 1024 * 1024, uploadTotalCap: 200 * 1024 * 1024, mediaTTL: 0, upIds: [], upNames: [], upSizes: [], contractRaw: "", contractVersion: "", contractGenerated: 0, schemaVersion: 0, storeOn: false, fqlBase: "", fqlToken: "", encKey: sha256Bytes(textToBytes("facet:encrypt:" + master)), pendingOps: [], pendingChanged: [], streamSubs: [], streamLogs: [], pendingEvents: [], whPaths: [], whKeys: [], idemKeys: [], idemDone: [], idemStatus: [], idemBody: [], idemExpires: [], idemTTL: 86400}
 
     proc rtEntIndex(w: RtWorld, name: text) -> int:
         let mut i = 0
@@ -203,6 +272,35 @@ app SessionStore:
         if i < 0:
             return []
         return w.entRows[i].items
+
+    # rtDurSave / rtDurDelete / rtDurClear: a durable write recorded for the
+    # loop's commit (ephemeral entities never reach the store).
+    proc rtIsEphemeral(g: IRGraph, name: text) -> bool:
+        let ei = do rtEntityIndex(g, name)
+        if ei < 0:
+            return false
+        return g.entities[ei].ephemeral
+
+    proc rtDurSave(w0: RtWorld, entity: text, row: Val) -> RtWorld:
+        let mut w = w0
+        let eph = do rtIsEphemeral(w.g, entity)
+        if !eph:
+            w.pendingOps = append(w.pendingOps, RtDurOp{kind: "save", entity: entity, row: row, id: 0})
+        return w
+
+    proc rtDurDelete(w0: RtWorld, entity: text, id: int) -> RtWorld:
+        let mut w = w0
+        let eph = do rtIsEphemeral(w.g, entity)
+        if !eph:
+            w.pendingOps = append(w.pendingOps, RtDurOp{kind: "delete", entity: entity, row: noneVal(), id: id})
+        return w
+
+    proc rtDurClear(w0: RtWorld, entity: text) -> RtWorld:
+        let mut w = w0
+        let eph = do rtIsEphemeral(w.g, entity)
+        if !eph:
+            w.pendingOps = append(w.pendingOps, RtDurOp{kind: "clear", entity: entity, row: noneVal(), id: 0})
+        return w
 
     proc rtSetEntRows(w0: RtWorld, name: text, rows: [Val]) -> RtWorld:
         let mut w = w0
