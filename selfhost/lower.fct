@@ -71,13 +71,7 @@ app LowerSelfHost:
     # `_, ok := inline[name]` / `_, isEnum := enums[name]` lookup over a
     # parallel list.
     proc lowerFindName(names: [text], name: text) -> int:
-        let n = len(names)
-        let mut i = 0
-        loop i < n:
-            if names[i] == name:
-                return i
-            i = i + 1
-        return -1
+        return indexOf(names, name, 0)
 
     # lowerIntText: strconv.Atoi's effect on the spelling — leading zeros
     # go, a lone "0" stays.
@@ -87,20 +81,70 @@ app LowerSelfHost:
             s = slice(s, 1, len(s))
         return s
 
-    # lowerFloatText: the shortest spelling encoding/json emits for the
-    # float64 strconv.ParseFloat reads from `<digits>.<digits>` — drop
-    # trailing fraction zeros, then a trailing `.`, then leading zeros of
-    # the integer part (`00.5` -> `0.5`).
+    # lowerFloatText: encoding/json's spelling of the float64
+    # strconv.ParseFloat reads from `<digits>.<digits>` — its shortest
+    # round-trip digits (a float's own text form, FormatFloat 'g' -1, or an
+    # integer's digits), laid out as json's floatEncoder does: 'f' form,
+    # except 'e' form below 1e-6 or from 1e21 up, its exponent unpadded
+    # (`1e-8`, `1e+21`).
     proc lowerFloatText(raw: text) -> text:
-        let mut s = raw
-        if contains(s, "."):
-            loop len(s) > 1 && charAt(s, len(s) - 1) == "0":
-                s = slice(s, 0, len(s) - 1)
-            if charAt(s, len(s) - 1) == ".":
-                s = slice(s, 0, len(s) - 1)
-        loop len(s) > 1 && charAt(s, 0) == "0" && charAt(s, 1) != ".":
-            s = slice(s, 1, len(s))
-        return s
+        let g = "" + toFloat(raw)
+        let mut neg = false
+        let mut body = g
+        if charAt(body, 0) == "-":
+            neg = true
+            body = slice(body, 1, len(body))
+        # digits (no leading zeros) and dp: value = 0.<digits> × 10^dp
+        let mut mant = body
+        let mut exp = 0
+        let at = indexOf(body, "e", 0)
+        if at >= 0:
+            mant = slice(body, 0, at)
+            exp = toInt(slice(body, at + 1, len(body)))
+        let dot = indexOf(mant, ".", 0)
+        let mut digits = mant
+        let mut dp = len(mant)
+        if dot >= 0:
+            digits = slice(mant, 0, dot) + slice(mant, dot + 1, len(mant))
+            dp = dot
+        loop len(digits) > 0 && charAt(digits, 0) == "0":
+            digits = slice(digits, 1, len(digits))
+            dp = dp - 1
+        loop len(digits) > 0 && charAt(digits, len(digits) - 1) == "0":
+            digits = slice(digits, 0, len(digits) - 1)
+        if digits == "":
+            return "0"
+        dp = dp + exp
+        let mut out = ""
+        if dp <= -6 || dp >= 22:
+            out = charAt(digits, 0)
+            if len(digits) > 1:
+                out = out + "." + slice(digits, 1, len(digits))
+            let e = dp - 1
+            if e < 0:
+                out = out + "e-" + (0 - e)
+            else:
+                out = out + "e+" + e
+        else:
+            if dp <= 0:
+                out = "0."
+                let mut z = 0
+                loop z < 0 - dp:
+                    out = out + "0"
+                    z = z + 1
+                out = out + digits
+            else:
+                if dp >= len(digits):
+                    out = digits
+                    let mut z2 = len(digits)
+                    loop z2 < dp:
+                        out = out + "0"
+                        z2 = z2 + 1
+                else:
+                    out = slice(digits, 0, dp) + "." + slice(digits, dp, len(digits))
+        if neg:
+            return "-" + out
+        return out
 
     # lowerUnquote: strconv.Unquote over the tokenizer's raw `"..."` token.
     proc lowerUnquote(raw: text) -> text:
@@ -218,84 +262,124 @@ app LowerSelfHost:
             i = i + 1
         return -1
 
+    # exprRenameCalls: manglePrivate's rewriteInlineCalls over one
+    # expression — every call naming one of `from` (a file's private
+    # procs) names its mangled `to` instead, at any depth.
+    proc exprRenameCalls(ex: ExprNode, from: [text], to: [text]) -> ExprNode:
+        let mut x = ex
+        if x.kind == "call":
+            let at = indexOf(from, x.text, 0)
+            if at >= 0:
+                x.text = to[at]
+        x.children = exprsRenameCalls(ex.children, from, to)
+        x.whereClause = exprsRenameCalls(ex.whereClause, from, to)
+        x.sel = exprsRenameCalls(ex.sel, from, to)
+        x.limit = exprsRenameCalls(ex.limit, from, to)
+        x.orderBy = exprsRenameCalls(ex.orderBy, from, to)
+        let mut ps = []
+        let mut i = 0
+        loop i < len(ex.pairs):
+            ps = append(ps, Pair{key: exprRenameCalls(ex.pairs[i].key, from, to), value: exprRenameCalls(ex.pairs[i].value, from, to)})
+            i = i + 1
+        x.pairs = ps
+        return x
+
+    proc exprsRenameCalls(xs: [ExprNode], from: [text], to: [text]) -> [ExprNode]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(xs):
+            out = append(out, exprRenameCalls(xs[i], from, to))
+            i = i + 1
+        return out
+
     # lowFull: env.low — lower(), then markTextAggs, deriveOrders and
-    # markOmits over the result.
+    # markOmits over the result. The three passes are one walk (lowPasses):
+    # each rewrites a node from that node alone, so running all three at
+    # every node of one post-order walk rewrites exactly what three walks
+    # would — with deriveOrders' new `by` expression, which the first two
+    # walks never visit, given markOmits alone (lowOmits).
     proc lowFull(n: ExprNode, ctx: LowCtx) -> IRExpr:
         let l = do lowerC(n, ctx)
-        let a = do lowMarkTextAggs(l, ctx)
-        let b = do lowDeriveOrders(a, ctx)
-        let c = do lowMarkOmits(b, ctx)
+        let c = do lowPasses(l, ctx)
         return c
 
-    # lowMapKids: rebuild x with f applied to every child Kids() visits
-    # (l r x obj key where sel limit keys args) — one proc per pass,
-    # selected by `pass`.
-    proc lowPass(x: IRExpr, ctx: LowCtx, pass: text) -> IRExpr:
-        let l = do lowPassList(x.l, ctx, pass)
-        let r = do lowPassList(x.r, ctx, pass)
-        let xx = do lowPassList(x.x, ctx, pass)
-        let obj = do lowPassList(x.obj, ctx, pass)
-        let key = do lowPassList(x.key, ctx, pass)
-        let wh = do lowPassList(x.where, ctx, pass)
-        let sel = do lowPassList(x.sel, ctx, pass)
-        let lim = do lowPassList(x.limit, ctx, pass)
-        let keys = do lowPassList(x.keys, ctx, pass)
-        let args = do lowPassList(x.args, ctx, pass)
-        let mut ob = x.orderBy
-        if pass == "omit":
-            let o2 = do lowPassList(x.orderBy, ctx, pass)
-            ob = o2
-        return IRExpr{kind: x.kind, hasVal: x.hasVal, val: x.val, vtype: x.vtype, name: x.name, field: x.field, obj: obj, key: key, op: x.op, args: args, keys: keys, fields: x.fields, l: l, r: r, x: xx, itemVar: x.itemVar, where: wh, sel: sel, order: x.order, desc: x.desc, limit: lim, orderBy: ob, omit: x.omit, nulls: x.nulls}
+    # lowPasses: markTextAggs, deriveOrders and markOmits at x and every
+    # node below it (Kids(): l r x obj key where sel limit keys args; the
+    # `by` expressions get markOmits only).
+    proc lowPasses(x0: IRExpr, ctx: LowCtx) -> IRExpr:
+        let mut x = x0
+        x.l = lowPassesList(x0.l, ctx)
+        x.r = lowPassesList(x0.r, ctx)
+        x.x = lowPassesList(x0.x, ctx)
+        x.obj = lowPassesList(x0.obj, ctx)
+        x.key = lowPassesList(x0.key, ctx)
+        x.where = lowPassesList(x0.where, ctx)
+        x.sel = lowPassesList(x0.sel, ctx)
+        x.limit = lowPassesList(x0.limit, ctx)
+        x.keys = lowPassesList(x0.keys, ctx)
+        x.args = lowPassesList(x0.args, ctx)
+        # markTextAggs: min/max of a text field is text
+        if x.kind == "agg" && (x.op == "min" || x.op == "max") && x.field != "":
+            if (x.name + "." + x.field) in ctx.textFieldKeys:
+                x.vtype = "text"
+        # deriveOrders: a list ordered `by` an entity derive orders by that
+        # derive's expression over the item (`$item` when the list binds
+        # no variable)
+        if x.kind == "agg" && x.order != "":
+            let at = do lowerFindName(ctx.deriveKeys, x.name + "." + x.order)
+            if at >= 0:
+                if x.itemVar == "":
+                    x.itemVar = "$item"
+                let rowRef = do irRef(x.itemVar)
+                let ob = do lowSubstParams(ctx.deriveExprs[at], ["$row"], [rowRef], [], [])
+                x.order = ""
+                x.orderBy = [ob.e]
+        x.orderBy = lowOmitsList(x.orderBy, ctx)
+        let m = do lowOmitAt(x, ctx)
+        return m
 
-    proc lowPassList(xs: [IRExpr], ctx: LowCtx, pass: text) -> [IRExpr]:
+    proc lowPassesList(xs: [IRExpr], ctx: LowCtx) -> [IRExpr]:
         let mut out = []
         let n = len(xs)
         let mut i = 0
         loop i < n:
-            let mut y = xs[i]
-            if pass == "text":
-                let t = do lowMarkTextAggs(xs[i], ctx)
-                y = t
-            if pass == "order":
-                let o = do lowDeriveOrders(xs[i], ctx)
-                y = o
-            if pass == "omit":
-                let m = do lowMarkOmits(xs[i], ctx)
-                y = m
-            out = append(out, y)
+            out = append(out, lowPasses(xs[i], ctx))
             i = i + 1
         return out
 
-    # lowMarkTextAggs: markTextAggs — min/max of a text field is text.
-    proc lowMarkTextAggs(x0: IRExpr, ctx: LowCtx) -> IRExpr:
-        let x = do lowPass(x0, ctx, "text")
-        if x.kind == "agg" && (x.op == "min" || x.op == "max") && x.field != "":
-            if (x.name + "." + x.field) in ctx.textFieldKeys:
-                return IRExpr{kind: x.kind, hasVal: x.hasVal, val: x.val, vtype: "text", name: x.name, field: x.field, obj: x.obj, key: x.key, op: x.op, args: x.args, keys: x.keys, fields: x.fields, l: x.l, r: x.r, x: x.x, itemVar: x.itemVar, where: x.where, sel: x.sel, order: x.order, desc: x.desc, limit: x.limit, orderBy: x.orderBy, omit: x.omit, nulls: x.nulls}
-        return x
-
-    # lowDeriveOrders: deriveOrders — a list ordered `by` an entity derive
-    # orders by that derive's expression over the item (`$item` when the
-    # list binds no variable).
-    proc lowDeriveOrders(x0: IRExpr, ctx: LowCtx) -> IRExpr:
+    # lowOmits: markOmits alone at x and every node below it (Kids() and
+    # the `by` expressions).
+    proc lowOmits(x0: IRExpr, ctx: LowCtx) -> IRExpr:
         let mut x = x0
-        if x0.kind == "agg" && x0.order != "":
-            let at = do lowerFindName(ctx.deriveKeys, x0.name + "." + x0.order)
-            if at >= 0:
-                let mut v = x0.itemVar
-                if v == "":
-                    v = "$item"
-                let rowRef = do irRef(v)
-                let ob = do lowSubstParams(ctx.deriveExprs[at], ["$row"], [rowRef], [], [])
-                x = IRExpr{kind: x0.kind, hasVal: x0.hasVal, val: x0.val, vtype: x0.vtype, name: x0.name, field: x0.field, obj: x0.obj, key: x0.key, op: x0.op, args: x0.args, keys: x0.keys, fields: x0.fields, l: x0.l, r: x0.r, x: x0.x, itemVar: v, where: x0.where, sel: x0.sel, order: "", desc: x0.desc, limit: x0.limit, orderBy: [ob.e], omit: x0.omit, nulls: x0.nulls}
-        let y = do lowPass(x, ctx, "order")
-        return y
+        x.l = lowOmitsList(x0.l, ctx)
+        x.r = lowOmitsList(x0.r, ctx)
+        x.x = lowOmitsList(x0.x, ctx)
+        x.obj = lowOmitsList(x0.obj, ctx)
+        x.key = lowOmitsList(x0.key, ctx)
+        x.where = lowOmitsList(x0.where, ctx)
+        x.sel = lowOmitsList(x0.sel, ctx)
+        x.limit = lowOmitsList(x0.limit, ctx)
+        x.keys = lowOmitsList(x0.keys, ctx)
+        x.args = lowOmitsList(x0.args, ctx)
+        x.orderBy = lowOmitsList(x0.orderBy, ctx)
+        let m = do lowOmitAt(x, ctx)
+        return m
 
-    # lowMarkOmits: markOmits — a wire-type literal lists its optional
-    # fields (first marking wins).
-    proc lowMarkOmits(x0: IRExpr, ctx: LowCtx) -> IRExpr:
-        let x = do lowPass(x0, ctx, "omit")
-        if x.kind == "struct" && len(x.omit) == 0:
+    proc lowOmitsList(xs: [IRExpr], ctx: LowCtx) -> [IRExpr]:
+        let mut out = []
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            out = append(out, lowOmits(xs[i], ctx))
+            i = i + 1
+        return out
+
+    # lowOmitAt: markOmits at one node — a wire-type literal lists its
+    # optional fields (first marking wins) and its `T or null` fields, in
+    # declaration order.
+    proc lowOmitAt(x0: IRExpr, ctx: LowCtx) -> IRExpr:
+        if x0.kind == "struct" && len(x0.omit) == 0:
+            let mut x = x0
             let mut omit = []
             let n = len(x.fields)
             let mut i = 0
@@ -303,7 +387,6 @@ app LowerSelfHost:
                 if (x.name + "." + x.fields[i]) in ctx.wireOptKeys:
                     omit = append(omit, x.fields[i])
                 i = i + 1
-            # every `T or null` field of the type, in declaration order
             let mut nulls = []
             let pre = x.name + "."
             let nn = len(ctx.wireNullKeys)
@@ -313,8 +396,10 @@ app LowerSelfHost:
                 if len(key) > len(pre) && slice(key, 0, len(pre)) == pre:
                     nulls = append(nulls, slice(key, len(pre), len(key)))
                 k = k + 1
-            return IRExpr{kind: x.kind, hasVal: x.hasVal, val: x.val, vtype: x.vtype, name: x.name, field: x.field, obj: x.obj, key: x.key, op: x.op, args: x.args, keys: x.keys, fields: x.fields, l: x.l, r: x.r, x: x.x, itemVar: x.itemVar, where: x.where, sel: x.sel, order: x.order, desc: x.desc, limit: x.limit, orderBy: x.orderBy, omit: omit, nulls: nulls}
-        return x
+            x.omit = omit
+            x.nulls = nulls
+            return x
+        return x0
 
     # ── parameterized derives: expandDerive / substParams / irNames ─────
     proc lowIrNames(x: IRExpr, acc: [text]) -> [text]:
@@ -452,6 +537,13 @@ app LowerSelfHost:
             let tv = do lowerUnquote(n.text)
             let tlit = do irLit(tv, "text")
             return tlit
+        # `asset from "…"` the driver resolved (driverResolveAssets): its
+        # literal carries a NUL, then the file's text or the URL it was
+        # copied to — lowered exactly as build.go lowers a resolved Asset
+        if n.kind == "asset":
+            let av = do lowerUnquote(n.text)
+            let alit = do irLit(slice(av, 1, len(av)), "text")
+            return alit
         if n.kind == "ref":
             let at = do lowerFindName(ctx.inlineNames, n.text)
             if at >= 0:

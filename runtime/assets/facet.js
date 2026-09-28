@@ -219,6 +219,10 @@
     // tree alone does not contain them. Component ids are namespaced per component
     // by the compiler, so they cannot collide with the page's own.
     for (const c of list(ir.components)) collect(list(c.view));
+    // Each page ships the components IT reaches, so a page reached by SPA
+    // navigation brings ones the first page never had: register them here, on
+    // every load, not once at boot — or a `use` of one renders nothing.
+    for (const c of list(ir.components)) components[c.name] = c;
     syncTheme(); // apply (and persist) the active palette for this page
   }
 
@@ -534,7 +538,16 @@
       case "split": { const s = toStr(a(0)), sep = toStr(a(1)); return sep === "" ? Array.from(s) : s.split(sep); }
       case "slice": return Array.isArray(a(0)) ? listSlice(a(0), toInt(a(1)), toInt(a(2))) : runeSlice(toStr(a(0)), toInt(a(1)), toInt(a(2)));
       case "charAt": { const i = toInt(a(1)); return i < 0 ? "" : runeSlice(toStr(a(0)), i, i + 1); }
-      case "take": { let n = toInt(a(1)); if (n < 0) n = 0; return runeSlice(toStr(a(0)), 0, n); }
+      case "indexOf": {
+        // runtime/eval.go's listIndexOf / runeIndexOf: a list position or a
+        // rune index at or after from (clamped), -1 when absent.
+        const x = a(0), v = a(1); let from = toInt(a(2)); if (from < 0) from = 0;
+        if (Array.isArray(x)) { for (let i = from; i < x.length; i++) if (eq(x[i], v)) return i; return -1; }
+        const r = Array.from(toStr(x)); if (from > r.length) from = r.length;
+        const rest = r.slice(from).join(""), k = rest.indexOf(toStr(v));
+        return k < 0 ? -1 : from + Array.from(rest.slice(0, k)).length;
+      }
+      case "take": { let n = toInt(a(1)); if (n < 0) n = 0; return Array.isArray(a(0)) ? listSlice(a(0), 0, n) : runeSlice(toStr(a(0)), 0, n); }
       case "ago": return ago(toInt(a(0)), Math.floor(Date.now() / 1000));
       case "iso": return isoJS(toInt(a(0)));
       case "fromIso": return fromIsoJS(toStr(a(0)));
@@ -752,6 +765,21 @@
     return "" + f;
   }
   function eq(a, b) {
+    // runtime/eval.go's equal: lists element by element, records field by
+    // field, and neither ever equal to a scalar.
+    if (Array.isArray(a) || Array.isArray(b)) {
+      if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) if (!eq(a[i], b[i])) return false;
+      return true;
+    }
+    const ao = a !== null && typeof a === "object", bo = b !== null && typeof b === "object";
+    if (ao || bo) {
+      if (!ao || !bo) return false;
+      const ka = Object.keys(a), kb = Object.keys(b);
+      if (ka.length !== kb.length) return false;
+      for (const k of ka) if (!(k in b) || !eq(a[k], b[k])) return false;
+      return true;
+    }
     if (typeof a === "string" || typeof b === "string") return toStr(a) === toStr(b);
     if (typeof a === "boolean" || typeof b === "boolean") return truthy(a) === truthy(b);
     return toInt(a) === toInt(b);
@@ -971,14 +999,17 @@
   // renders 0.
   function render(node, sc, path) {
     curPath = path;
+    // An interpolated class is resolved before the node renders, at this node's
+    // own path, exactly where the top of runtime/server.go's renderer.node
+    // resolves it: render0 recurses into the children, each of which moves
+    // curPath to its own address, so an aggregate in the class read afterwards
+    // was looked up at the last child's address, missed the value the render
+    // materialized, and fell back to an empty collection. Each interpolated run
+    // is filtered to the class-token characters — a class attribute is a token
+    // list, so an unfiltered value could add a class it was never given a slot for.
+    const cls = node.classSegs ? classText(node.classSegs, sc) : node.class;
     const e = render0(node, sc, path);
     if (e && e.nodeType === 1) {
-      // An interpolated class is resolved here, at the same one place the literal
-      // one is applied; mirrors the resolve at the top of runtime/server.go's
-      // renderer.node. Each interpolated run is filtered to the class-token
-      // characters — a class attribute is a token list, so an unfiltered value
-      // could add a class it was never given a slot for.
-      const cls = node.classSegs ? classText(node.classSegs, sc) : node.class;
       if (cls) e.className = (e.className ? e.className + " " : "") + cls;
       if (node.style) e.setAttribute("style", node.style);
       // The author's anchor name is the element's id — what a `#install` link
@@ -1253,8 +1284,36 @@
         label.appendChild(document.createTextNode(attrText(node.label, sc)));
         const i = el("input"); i.type = "file";
         i.setAttribute("data-fa-upload", node.bind);
+        if (node.multiple) i.multiple = true;
         label.appendChild(i);
         return label;
+      }
+      case "camera": {
+        // runtime/server.go's markup: the viewfinder, the shutter and flip, and
+        // the capture-from-camera file input that stands in where there is no
+        // live camera.
+        const box = el("div", "fa-camera");
+        box.setAttribute("data-fa-camera", node.bind);
+        const v = el("video", "fa-camera-view");
+        v.autoplay = true; v.playsInline = true; v.muted = true;
+        v.setAttribute("autoplay", ""); v.setAttribute("playsinline", ""); v.setAttribute("muted", "");
+        box.appendChild(v);
+        const controls = el("div", "fa-camera-controls");
+        const label = attrText(node.label, sc);
+        const shutter = el("button", "fa-camera-shutter"); shutter.type = "button";
+        shutter.setAttribute("data-fa-camera-shutter", ""); shutter.setAttribute("aria-label", label);
+        const flip = el("button", "fa-camera-flip"); flip.type = "button";
+        flip.setAttribute("data-fa-camera-flip", ""); flip.setAttribute("aria-label", "Flip camera");
+        flip.appendChild(document.createTextNode("⟲"));
+        controls.appendChild(shutter); controls.appendChild(flip);
+        box.appendChild(controls);
+        const fb = el("label", "fa-upload fa-camera-fallback");
+        fb.appendChild(document.createTextNode(label));
+        const fi = el("input"); fi.type = "file"; fi.accept = "image/*";
+        fi.setAttribute("capture", "environment"); fi.setAttribute("data-fa-upload", node.bind);
+        fb.appendChild(fi); box.appendChild(fb);
+        startCamera(box);
+        return box;
       }
       case "link": {
         const href = linkHref(node, sc);
@@ -1821,6 +1880,11 @@
         return node.desc ? -c : c;
       });
     }
+    if (node.orderBy) { // a computed key per row (`for … by <expr>`), as runtime/server.go's selectRows
+      const keyed = out.map((r, i) => { const child = Object.assign({}, sc); child[node.var] = r; return { r, i, k: evRow(node.orderBy, child) }; });
+      keyed.sort((a, b) => { const c = cmpVal(a.k, b.k); return c !== 0 ? (node.desc ? -c : c) : a.i - b.i; });
+      out = keyed.map((x) => x.r);
+    }
     if (node.limit) { const lim = toInt(ev(node.limit, sc)); if (lim > 0 && out.length > lim) out = out.slice(0, lim); }
     return out;
   }
@@ -1857,13 +1921,31 @@
   function routeAllowed(href) {
     const path = hrefPath(href);
     if (path === "") return true; // an anchor on the page the reader is already on
+    const rt = routeFor(path);
+    if (!rt) return true; // not an app route (e.g. an external or asset link)
+    if (!rt.requires) return true;
+    const pol = policies[rt.requires];
+    return pol ? truthy(ev(pol.expr, store)) : false;
+  }
+  // routeFor is the route a path reaches — runtime/server.go's pageFor: the
+  // exact route, else the most specific dynamic one (routeMoreSpecific: the
+  // first segment where one pattern is literal and the other a :param
+  // decides, for the literal).
+  function routeFor(path) {
+    let best = null;
     for (const rt of routes) {
-      if (!matchRoute(rt.path, path)) continue;
-      if (!rt.requires) return true;
-      const pol = policies[rt.requires];
-      return pol ? truthy(ev(pol.expr, store)) : false;
+      if (trimSlash(rt.path) === trimSlash(path)) return rt;
+      if (matchRoute(rt.path, path) && (!best || routeMoreSpecific(rt.path, best.path))) best = rt;
     }
-    return true; // not an app route (e.g. an external or asset link)
+    return best;
+  }
+  function routeMoreSpecific(a, b) {
+    const as = trimSlash(a).split("/"), bs = trimSlash(b).split("/");
+    for (let i = 0; i < as.length && i < bs.length; i++) {
+      const al = as[i][0] !== ":", bl = bs[i][0] !== ":";
+      if (al !== bl) return al;
+    }
+    return false;
   }
   function isAppRoute(href) {
     const path = hrefPath(href);
@@ -2135,7 +2217,7 @@
         case "for": {
           // The rows are chosen up front (the authority does the same), with the
           // view's own selectRows so where/order/limit read identically here.
-          const rows = selectRows(work[st.entity] || [], { var: st.var, where: st.where, order: st.order, desc: st.desc, limit: st.limit }, scope);
+          const rows = selectRows(work[st.entity] || [], { var: st.var, where: st.where, order: st.order, orderBy: st.orderBy, desc: st.desc, limit: st.limit }, scope);
           const had = Object.prototype.hasOwnProperty.call(scope, st.var);
           const prev = scope[st.var];
           let ok = true;
@@ -2284,22 +2366,77 @@
 
   async function upload(input) {
     const bind = input.getAttribute("data-fa-upload");
-    const file = input.files && input.files[0];
-    if (!file) return;
+    const files = input.files ? Array.from(input.files) : [];
+    if (!files.length) return;
+    // A many-file upload (a [text] cell) takes every chosen file, one after
+    // another, appending each URL as it lands; a single one takes the first.
+    const many = input.multiple;
     const label = input.closest("label");
     label && label.setAttribute("aria-busy", "true");
     try {
-      // The server answers with two things: the durable reference to bind (and
-      // eventually store), and the grant to preview it by. Binding the signed URL
-      // is what used to put an expiry inside a column.
-      const res = file.size > CHUNK_BYTES ? await uploadChunked(file) : await uploadSingle(file);
-      if (!res || !res.url) { showError(input, "Upload failed."); return; }
-      mergeMedia(res.media);
-      store[bind] = res.url;
-      refresh([bind]);
+      for (const file of many ? files : files.slice(0, 1)) {
+        // The server answers with two things: the durable reference to bind (and
+        // eventually store), and the grant to preview it by. Binding the signed URL
+        // is what used to put an expiry inside a column.
+        const res = file.size > CHUNK_BYTES ? await uploadChunked(file) : await uploadSingle(file);
+        if (!res || !res.url) { showError(input, "Upload failed: " + file.name); if (many) continue; return; }
+        mergeMedia(res.media);
+        store[bind] = many ? (Array.isArray(store[bind]) ? store[bind] : []).concat([res.url]) : res.url;
+        refresh([bind]);
+      }
     } finally {
       label && label.removeAttribute("aria-busy");
     }
+  }
+
+  // ── the camera node: a live viewfinder whose shutter uploads a still ──────
+  // A camera is started when its element is made, and its stream stopped once
+  // the element has left the page (the next camera start or navigation).
+  const cameras = new Set();
+  function stopDetachedCameras() {
+    for (const box of cameras) {
+      if (document.contains(box)) continue;
+      if (box.__faStream) box.__faStream.getTracks().forEach((t) => t.stop());
+      cameras.delete(box);
+    }
+  }
+  async function startCamera(box) {
+    stopDetachedCameras();
+    const md = typeof navigator !== "undefined" && navigator.mediaDevices;
+    if (!md || !md.getUserMedia) { box.classList.add("fa-camera-off"); return; }
+    try {
+      if (box.__faStream) box.__faStream.getTracks().forEach((t) => t.stop());
+      const stream = await md.getUserMedia({ video: { facingMode: box.__faFacing || "environment" }, audio: false });
+      box.__faStream = stream;
+      cameras.add(box);
+      box.querySelector("video").srcObject = stream;
+      box.classList.remove("fa-camera-off");
+      box.classList.add("fa-camera-live");
+    } catch (_) {
+      box.classList.add("fa-camera-off"); // refused or absent: the file input stands in
+    }
+  }
+  // The shutter: the viewfinder's frame as a JPEG (0.92, as vision-camera.js
+  // takes it), uploaded, its URL written to the bound cell.
+  function captureCamera(box) {
+    const v = box.querySelector("video");
+    if (!v || !v.videoWidth) return;
+    const c = document.createElement("canvas");
+    c.width = v.videoWidth; c.height = v.videoHeight;
+    c.getContext("2d").drawImage(v, 0, 0);
+    const bind = box.getAttribute("data-fa-camera");
+    box.setAttribute("aria-busy", "true");
+    c.toBlob(async function (blob) {
+      try {
+        const res = blob ? await uploadSingle(new File([blob], "capture.jpg", { type: "image/jpeg" })) : null;
+        if (!res || !res.url) { showError(box, "Capture failed."); return; }
+        mergeMedia(res.media);
+        store[bind] = res.url;
+        refresh([bind]);
+      } finally {
+        box.removeAttribute("aria-busy");
+      }
+    }, "image/jpeg", 0.92);
   }
 
   async function uploadSingle(file) {
@@ -2382,12 +2519,12 @@
 
     root.textContent = "";
     root.appendChild(frag);
+    stopDetachedCameras(); // a camera the new tree no longer shows stops filming
     openE2E(); // open the sealed values the first render placed
   }
 
   // ── wire it up (once) ─────────────────────────────────────────────────────────
   function boot() {
-    for (const c of list(ir.components)) components[c.name] = c;
     mount();
   }
 
@@ -2396,6 +2533,14 @@
   boot();
 
   root.addEventListener("click", function (e) {
+    const shutter = e.target.closest("[data-fa-camera-shutter]");
+    if (shutter) { captureCamera(shutter.closest("[data-fa-camera]")); return; }
+    const flipBtn = e.target.closest("[data-fa-camera-flip]");
+    if (flipBtn) {
+      const box = flipBtn.closest("[data-fa-camera]");
+      box.__faFacing = box.__faFacing === "user" ? "environment" : "user";
+      startCamera(box); return;
+    }
     const link = e.target.closest("a.fa-link");
     if (link) {
       const href = link.getAttribute("href");
@@ -2469,8 +2614,9 @@
   // with no refresh — and so the acting client sees its own entity writes, which
   // is why /event returns only per-session deltas. The opening snapshot makes a
   // late-joining client whole. We apply deltas the same way as an action result.
-  if (window.EventSource) {
-    const live = new EventSource("/live");
+  // The stream is /api/_live, in the runtime's own namespace; /live is the app's.
+  function openLive(path) {
+    const live = new EventSource(path);
     live.onmessage = function (e) {
       let msg;
       try { msg = JSON.parse(e.data); } catch (_) { return; }
@@ -2487,6 +2633,7 @@
       }
     };
   }
+  if (window.EventSource) openLive("/api/_live");
 
   // pageReads answers whether a write to these entities can change anything THIS
   // page renders.

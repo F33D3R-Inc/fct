@@ -124,8 +124,8 @@ func buildRoutes(g *ir.IR, withRuntime bool) []RouteEntry {
 		})
 	}
 	for _, a := range g.Actions {
-		if a.Placement != ir.Server {
-			continue
+		if a.Placement != ir.Server || a.Internal {
+			continue // client-placed, or @internal: neither is callable over HTTP
 		}
 		out = append(out, RouteEntry{
 			Kind: "api", Method: "POST", Path: "/api/" + a.Name, Name: a.Name,
@@ -244,7 +244,7 @@ func reservedRuntimePaths() []reservedRuntimePath {
 	return []reservedRuntimePath{
 		{Pattern: "/facet.js", Method: "GET", Note: "the client runtime"},
 		{Pattern: "/event", Method: "POST", Note: "client → authority event transport"},
-		{Pattern: "/live", Method: "GET", Note: "server-sent events: durable-state changes"},
+		{Pattern: "/api/_live", Method: "GET", Note: "server-sent events: durable-state changes"},
 		{Pattern: "/region", Method: "GET", Note: "server-sent region fragment"},
 		{Pattern: "/api", Method: "GET", Note: "the API schema: entities, invocable actions, derives"},
 		{Pattern: "/api/", Method: "GET/POST", Note: "per-entity and per-action API routes"},

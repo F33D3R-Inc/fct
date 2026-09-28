@@ -458,7 +458,8 @@ func appFct(p project) string {
 #   facet routes app.fct    every route this app serves
 #   facet inspect app.fct   what it compiles to, and where each piece runs
 #
-# For durable rows, point at a running FacetQL and use ` + "`facet run`" + `:
+# For durable rows, start FacetQL (` + "`facet facetql`" + `) and use ` + "`facet run`" + `:
+#   FACETQL_ENV=development FACETQL_TOKENS=<token>:me:admin facet facetql &
 #   export FACET_DATABASE_URL=facetql://<token>@localhost:8080
 #   export FACET_SECRET=$(facet config --gen-secret)
 app ` + p.App + `:
@@ -1099,11 +1100,12 @@ type deployment struct {
 func scaffoldProduction(graph *ir.IR, entry string) error {
 	d := deployment{App: graph.App, Binary: strings.ToLower(graph.App), Entry: filepath.Base(entry)}
 	files := map[string]string{
-		"deploy/Dockerfile":               prodDockerfile(d),
-		"deploy/Dockerfile.dockerignore":  prodDockerignore(d),
-		"deploy/docker-compose.yml":       prodCompose(d),
-		"deploy/" + d.Binary + ".service": prodSystemd(d),
-		"deploy/.env.example":             prodEnvExample(d),
+		"deploy/Dockerfile":                       prodDockerfile(d),
+		"deploy/Dockerfile.dockerignore":          prodDockerignore(d),
+		"deploy/docker-compose.yml":               prodCompose(d),
+		"deploy/" + d.Binary + ".service":         prodSystemd(d),
+		"deploy/" + d.Binary + "-facetql.service": prodSystemdFacetQL(d),
+		"deploy/.env.example":                     prodEnvExample(d),
 	}
 	if err := writeKeeping(files); err != nil {
 		return err
@@ -1118,6 +1120,8 @@ func scaffoldProduction(graph *ir.IR, entry string) error {
 	fmt.Println("\nor on a host with systemd:")
 	fmt.Printf("  sudo install -m755 dist/%s /usr/local/bin/%s\n", d.Binary, d.Binary)
 	fmt.Printf("  sudo install -m600 deploy/.env /etc/facet/%s.env\n", d.Binary)
+	fmt.Printf("  sudo install -m600 deploy/.env /etc/facet/%s-facetql.env\n", d.Binary)
+	fmt.Printf("  sudo install -m644 deploy/%s-facetql.service /etc/systemd/system/ && sudo systemctl enable --now %s-facetql\n", d.Binary, d.Binary)
 	fmt.Printf("  sudo install -m644 deploy/%s.service /etc/systemd/system/ && sudo systemctl enable --now %s\n", d.Binary, d.Binary)
 	return nil
 }
@@ -1211,8 +1215,19 @@ name: ` + d.Binary + `
 
 services:
   facetql:
-    # Set this to the FacetQL image you run.
-    image: ghcr.io/f33d3r-inc/facetql:latest
+    # The database engine is the app binary itself: every facet release binary
+    # carries FacetQL (` + "`" + d.Binary + " facetql`" + `), so the stack ships one image.
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["facetql"]
+    # The image's own check probes the app's port; this container serves the
+    # engine, whose liveness probe is GET / on 8080 (never capped by load).
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/` + d.Binary + `", "healthcheck", "--port", "8080", "--path", "/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
     environment:
       # Two identities: the admin token (migrate only) and the app token
       # (serve). FacetQL reads them as token:owner[:admin], comma-separated.
@@ -1238,7 +1253,8 @@ services:
       dockerfile: deploy/Dockerfile
     command: ["migrate"]
     depends_on:
-      - facetql
+      facetql:
+        condition: service_healthy
     environment:
       FACET_DATABASE_URL: "facetql://${FACETQL_ADMIN_TOKEN}@facetql:8080"
       FACET_SECRET: "${FACET_SECRET:?set FACET_SECRET in deploy/.env — mint one with facet config --gen-secret}"
@@ -1336,6 +1352,64 @@ WantedBy=multi-user.target
 `
 }
 
+// prodSystemdFacetQL is the database the app's unit connects to, on the same
+// host: the release binary run as ` + "`facetql`" + ` — the engine every facet binary
+// carries — under the same user, with its own state directory as the data
+// directory (and file sandbox) and only the loopback interface reachable.
+func prodSystemdFacetQL(d deployment) string {
+	return `# systemd unit for ` + d.App + `'s FacetQL — the engine inside the release binary.
+#
+#   sudo install -m600 -o ` + d.Binary + ` -g ` + d.Binary + ` deploy/.env /etc/facet/` + d.Binary + `-facetql.env
+#   sudo install -m644 deploy/` + d.Binary + `-facetql.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ` + d.Binary + `-facetql
+#
+# The env file sets FACETQL_TOKENS (admin + app identities), FACETQL_MASTER_KEY
+# and FACETQL_ENV=production; FACETQL_ALLOW_PLAINTEXT=1 is safe only because the
+# port below is bound to loopback — use FACETQL_TLS_IDENTITY otherwise.
+[Unit]
+Description=` + d.App + ` FacetQL (the engine inside the release binary)
+After=network-online.target
+Wants=network-online.target
+Before=` + d.Binary + `.service
+
+[Service]
+Type=exec
+User=` + d.Binary + `
+Group=` + d.Binary + `
+EnvironmentFile=/etc/facet/` + d.Binary + `-facetql.env
+Environment=FACETQL_DATA_DIR=/var/lib/` + d.Binary + `-facetql
+Environment=FACETQL_PORT=8080
+ExecStart=/usr/local/bin/` + d.Binary + ` facetql
+# SIGTERM: in-flight requests finish, the last checkpoint is taken, exit 0.
+KillSignal=SIGTERM
+TimeoutStopSec=40
+Restart=on-failure
+RestartSec=2
+StateDirectory=` + d.Binary + `-facetql
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/` + d.Binary + `-facetql
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+`
+}
+
 // prodEnvExample is the environment a production deployment must supply. Every
 // line here is something `facet doctor --production` checks for, and the file is
 // the answer to each of those checks.
@@ -1408,8 +1482,10 @@ const dockerCompose = `# One-command stack: the app plus its FacetQL.
 #   docker compose up --build
 services:
   facetql:
-    # The FacetQL engine image — set it to the one your organization publishes.
-    image: ghcr.io/f33d3r-inc/facetql:latest
+    # The database engine is the facet toolchain itself (` + "`facet facetql`" + `): the
+    # same image the app builds on, so the stack needs nothing else.
+    build: .
+    entrypoint: ["facet", "facetql"]
     environment:
       # Development posture: plaintext HTTP inside the compose network and a
       # dev master key are fine here. Production is facet deploy --production.
@@ -1443,8 +1519,9 @@ const envExample = `# Copy to .env (git-ignored). Real environment variables alw
 FACET_SECRET=
 
 # Where the rows live. Unset, the dev tools use an in-memory store; ` + "`facet run`" + `
-# needs a running FacetQL: facetql://[token@]host:port. The token is whatever
-# FACETQL_TOKENS names on the engine (token:owner[:admin]).
+# needs a running FacetQL: facetql://[token@]host:port — start one with
+#   FACETQL_ENV=development FACETQL_TOKENS=facet-dev-token:facet:admin facet facetql
+# The token is whatever FACETQL_TOKENS names on the engine (token:owner[:admin]).
 FACET_DATABASE_URL=facetql://facet-dev-token@localhost:8080
 
 # Set to 1 behind TLS in production so session cookies are HTTPS-only:

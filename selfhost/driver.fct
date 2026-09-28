@@ -337,7 +337,7 @@ app DriverSelfHost:
 
     # driverReservedWebhook: reservedWebhookPath.
     proc driverReservedWebhook(p: text) -> bool:
-        if p in ["/", "/event", "/live", "/api", "/upload", "/admin", "/facet.js", "/healthz", "/readyz", "/metrics", "/billing/webhook"]:
+        if p in ["/", "/event", "/api", "/upload", "/admin", "/facet.js", "/healthz", "/readyz", "/metrics", "/billing/webhook"]:
             return true
         let pres = ["/api/", "/uploads/", "/admin/", "/auth/", "/dev/"]
         let mut i = 0
@@ -581,7 +581,7 @@ app DriverSelfHost:
         let nd = len(prog.derives)
         let mut di = 0
         loop di < nd:
-            let wd = do wParseDerive(prog.derives[di].line, prog.derives[di].cont)
+            let wd = do driverParseDerive(prog.derives[di])
             if wd.err == "":
                 let mut dlocals = actorScope
                 let mut ctx = "a derive"
@@ -607,15 +607,15 @@ app DriverSelfHost:
                     if rv.core in ce.ty.wireNames:
                         ret = rv
                     if ret.core == "":
-                        return "derive \"" + wd.name + "\" returns unknown type \"" + wd.type + "\""
-                let dce = CallEnv{fnNames: ce.fnNames, fnArities: ce.fnArities, procNames: ce.procNames, procArities: ce.procArities, procDerives: ce.procDerives, listNames: ce.listNames, jsonNames: ce.jsonNames, deriveKeys: ce.deriveKeys, inAction: false, inDerive: npar > 0, inProc: false, ty: ce.ty, tsc: dsc, actionNames: ce.actionNames, stateNames: ce.stateNames, stateDeclPlacements: ce.stateDeclPlacements}
+                        return driverLineMsg(prog.derives[di].lineNo, "derive \"" + wd.name + "\" returns unknown type \"" + wd.type + "\"")
+                let dce = CallEnv{fnNames: ce.fnNames, fnArities: ce.fnArities, procNames: ce.procNames, procAt: ce.procAt, procArities: ce.procArities, procDerives: ce.procDerives, listNames: ce.listNames, jsonNames: ce.jsonNames, deriveKeys: ce.deriveKeys, inAction: false, inDerive: npar > 0, inProc: false, ty: ce.ty, tsc: dsc, actionNames: ce.actionNames, stateNames: ce.stateNames, stateDeclPlacements: ce.stateDeclPlacements}
                 let ddg = do driverPureDiag(wd.expr, dlocals, ctx, stateNames, entityNames, fieldKeys, enumNames, inlineNames, dce)
                 if ddg != "":
-                    return ddg
+                    return driverLineMsg(prog.derives[di].lineNo, ddg)
                 if npar > 0:
                     let dad = do tyDeriveArgsDiag(ce.ty, wd.expr, dsc)
                     if dad != "":
-                        return dad
+                        return driverLineMsg(prog.derives[di].lineNo, dad)
                     let rv2 = do tyParse(wd.type)
                     let mut ret2 = do tyDeclType(ce.ty, rv2.core, rv2.list)
                     if rv2.core in ce.ty.wireNames:
@@ -625,7 +625,7 @@ app DriverSelfHost:
                     if !asg:
                         let rl2 = do tyLabel(ret2)
                         let gl = do tyLabel(got)
-                        return "derive \"" + wd.name + "\" is declared " + rl2 + ", but its definition is " + gl
+                        return driverLineMsg(prog.derives[di].lineNo, "derive \"" + wd.name + "\" is declared " + rl2 + ", but its definition is " + gl)
             di = di + 1
         let rowScope = do withActor(["$row"])
         let mut ej = 0
@@ -732,16 +732,16 @@ app DriverSelfHost:
         return IREntity{name: "FacetUser", softDelete: false, ephemeral: false, fields: fields, read: [], derives: []}
 
     private proc driverAuthActionNoParams(name: text) -> IRAction:
-        return IRAction{name: name, params: [], requires: [], optimistic: false, ret: "", retList: false, placement: "server", reason: "", writes: [], reads: [], seal: [], body: [], builtin: true}
+        return IRAction{name: name, params: [], requires: [], optimistic: false, ret: "", retList: false, placement: "server", reason: "", writes: [], reads: [], seal: [], body: [], builtin: true, internal: false}
 
     private proc driverAuthActionParams(name: text, paramNames: [text]) -> IRAction:
         let mut ps = []
         let n = len(paramNames)
         let mut i = 0
         loop i < n:
-            ps = append(ps, IRParam{name: paramNames[i], type: "text", optional: false, list: false})
+            ps = append(ps, IRParam{name: paramNames[i], type: "text", optional: false, list: false, map: false, key: "", depth: 0})
             i = i + 1
-        return IRAction{name: name, params: ps, requires: [], optimistic: false, ret: "", retList: false, placement: "server", reason: "", writes: [], reads: [], seal: [], body: [], builtin: true}
+        return IRAction{name: name, params: ps, requires: [], optimistic: false, ret: "", retList: false, placement: "server", reason: "", writes: [], reads: [], seal: [], body: [], builtin: true, internal: false}
 
     proc driverAuthActions() -> [IRAction]:
         let mut acts = []
@@ -790,6 +790,86 @@ app DriverSelfHost:
         whyNames: [text]
         whyTexts: [text]
 
+    # driverRunCallees: build.go's runCallees — the actions a body `run`s,
+    # walking nested blocks.
+    proc driverRunCallees(body: [IRStmt]) -> [text]:
+        let mut out = []
+        let n = len(body)
+        let mut i = 0
+        loop i < n:
+            if body[i].op == "run":
+                out = append(out, body[i].service)
+            let inner = do driverRunCallees(body[i].body)
+            let inner2 = do driverRunCallees(body[i].elseBody)
+            out = out + inner + inner2
+            i = i + 1
+        return out
+
+    struct DrRunVisit:
+        err: text
+        color: [int]
+        path: [text]
+
+    # driverRunVisit: checkRunGraph's depth-first walk (0 white, 1 grey,
+    # 2 black) — a grey successor is a cycle, reported along the path.
+    proc driverRunVisit(names: [text], edges: [text], node: int, st0: DrRunVisit) -> DrRunVisit:
+        let mut st = st0
+        st.color[node] = 1
+        st.path = append(st.path, names[node])
+        let succ = split(edges[node], "|")
+        let mut k = 0
+        loop k < len(succ):
+            if succ[k] != "":
+                let m = do lowerFindName(names, succ[k])
+                if m >= 0:
+                    if st.color[m] == 1:
+                        st.err = "actions run each other in a cycle: " + join(st.path, " → ") + " → " + succ[k] + " — an action's transaction must end"
+                        return st
+                    if st.color[m] == 0:
+                        st = do driverRunVisit(names, edges, m, st)
+                        if st.err != "":
+                            return st
+            k = k + 1
+        st.path = slice(st.path, 0, len(st.path) - 1)
+        st.color[node] = 2
+        return st
+
+    # driverCheckRunGraph: build.go's checkRunGraph — a `run` of a client-
+    # placed action is refused (a run joins the authority's transaction),
+    # and so is any cycle of runs.
+    proc driverCheckRunGraph(actions: [IRAction]) -> text:
+        let mut names = []
+        let mut edges = []
+        let mut color = []
+        let n = len(actions)
+        let mut i = 0
+        loop i < n:
+            names = append(names, actions[i].name)
+            i = i + 1
+        let mut j = 0
+        loop j < n:
+            let callees = do driverRunCallees(actions[j].body)
+            let mut c = 0
+            loop c < len(callees):
+                let at = do lowerFindName(names, callees[c])
+                if at >= 0 && actions[at].placement != "server":
+                    let aq = do goQuote(actions[j].name)
+                    let cq = do goQuote(callees[c])
+                    return "action " + aq + " runs " + cq + ", which is client-placed — a run joins the authority's transaction, so the callee must be a server action"
+                c = c + 1
+            edges = append(edges, join(callees, "|"))
+            color = append(color, 0)
+            j = j + 1
+        let mut st = DrRunVisit{err: "", color: color, path: []}
+        let mut v = 0
+        loop v < n:
+            if st.color[v] == 0:
+                st = do driverRunVisit(names, edges, v, st)
+                if st.err != "":
+                    return st.err
+            v = v + 1
+        return ""
+
     # driverActionNameSet: build.go's e.actionSet — every declared action
     # and, with auth, the built-in auth actions — what pending()/failed()
     # may name anywhere an expression is checked.
@@ -815,20 +895,36 @@ app DriverSelfHost:
     # driverScanRefs: every `P(` naming a proc in src (strings skipped),
     # with whether it is the target of a `detach` statement, and how it is
     # written (do / spawn / detach / a call).
-    proc driverScanRefs(r0: DrRefs, src: text, procNames: [text], renameFrom: [text], renameTo: [text], from: text, what: text) -> DrRefs:
+    # A line with no `(` names no call, and nothing after a line's last `(`
+    # can start one, so the byte walk stops there.
+    # lineNos: the source line of each kept (non-blank, non-comment) line
+    # of src — what a reference's "at line N" names ([] when unknown: 0).
+    proc driverScanRefs(r0: DrRefs, src: text, procNames: {text: bool}, renameFrom: [text], renameTo: [text], from: text, what: text, lineNos: [int]) -> DrRefs:
         let mut r = r0
         let lines = split(src, "\n")
         let nl = len(lines)
         let mut li = 0
+        let mut kept = -1
         loop li < nl:
             let line = trim(lines[li])
             if line != "" && charAt(line, 0) != "#":
+                kept = kept + 1
+            let mut srcLine = 0
+            if kept >= 0 && kept < len(lineNos):
+                srcLine = lineNos[kept]
+            let mut lastParen = indexOf(line, "(", 0)
+            if lastParen >= 0 && charAt(line, 0) != "#":
+                let mut np = indexOf(line, "(", lastParen + 1)
+                loop np >= 0:
+                    lastParen = np
+                    np = indexOf(line, "(", np + 1)
                 let bs = textToBytes(line)
                 let n = len(bs)
+                let stop = byteLen(slice(line, 0, lastParen)) + 1
                 let mut i = 0
                 let mut inStr = false
                 let mut prevWord = ""
-                loop i < n:
+                loop i < stop:
                     let b = bs[i]
                     if inStr:
                         if b == 92:
@@ -866,7 +962,7 @@ app DriverSelfHost:
                                         r.names = append(r.names, target)
                                         r.detach = append(r.detach, kind == "detach")
                                         r.from = append(r.from, from)
-                                        r.where = append(r.where, "`" + shown + "` in " + what)
+                                        r.where = append(r.where, "`" + shown + "` at line " + srcLine + " in " + what)
                                 prevWord = word
                             else:
                                 if b != 32:
@@ -879,10 +975,10 @@ app DriverSelfHost:
         return pd.name == "main" && len(pd.paramNames) == 1 && pd.paramLists[0] && pd.paramTypes[0] == "text" && pd.hasRet && pd.retCore == "int" && !pd.retIsList
 
     proc driverDaemonCtx(prog: Program) -> DrCtx:
-        let mut procNames = []
+        let mut procNames = {}
         let mut i = 0
         loop i < len(prog.procs):
-            procNames = append(procNames, prog.procs[i].name)
+            procNames[prog.procs[i].name] = true
             i = i + 1
         let mut r = DrRefs{names: [], detach: [], from: [], where: []}
         i = 0
@@ -891,99 +987,122 @@ app DriverSelfHost:
             let mut from = pd.name
             if driverIsEntry(pd):
                 from = ""
-            r = do driverScanRefs(r, pd.bodySrc, procNames, pd.renameFrom, pd.renameTo, from, "proc " + pd.name)
+            r = do driverScanRefs(r, pd.bodySrc, procNames, pd.renameFrom, pd.renameTo, from, "proc " + pd.name, pd.bodyLineNos)
             i = i + 1
         i = 0
         loop i < len(prog.daemons):
             let dd = prog.daemons[i]
-            r = do driverScanRefs(r, dd.bodySrc, procNames, dd.renameFrom, dd.renameTo, "", "daemon " + dd.name)
+            r = do driverScanRefs(r, dd.bodySrc, procNames, dd.renameFrom, dd.renameTo, "", "daemon " + dd.name, dd.bodyLineNos)
             i = i + 1
         i = 0
         loop i < len(prog.actions):
-            r = do driverScanRefs(r, prog.actions[i].bodySrc, procNames, [], [], "\u0000", "the app's Actions")
+            r = do driverScanRefs(r, prog.actions[i].bodySrc, procNames, [], [], "\u0000", "the app's Actions", prog.actions[i].bodyLineNos)
             i = i + 1
         i = 0
         loop i < len(prog.views):
-            r = do driverScanRefs(r, prog.views[i].bodySrc, procNames, [], [], "\u0000", "the app's Views")
+            r = do driverScanRefs(r, prog.views[i].bodySrc, procNames, [], [], "\u0000", "the app's Views", [])
             i = i + 1
         i = 0
         loop i < len(prog.components):
-            r = do driverScanRefs(r, prog.components[i].bodySrc, procNames, [], [], "\u0000", "the app's Components")
+            r = do driverScanRefs(r, prog.components[i].bodySrc, procNames, [], [], "\u0000", "the app's Components", [])
             i = i + 1
         i = 0
         loop i < len(prog.derives):
-            r = do driverScanRefs(r, prog.derives[i].line, procNames, [], [], "\u0000", "the app's Derives")
+            r = do driverScanRefs(r, prog.derives[i].line, procNames, prog.derives[i].renameFrom, prog.derives[i].renameTo, "\u0000", "the app's Derives", [prog.derives[i].lineNo])
             i = i + 1
         let nr = len(r.names)
-        # candidates: every referenced proc
+        # Each name's references, in source order: head[name] is the first,
+        # nextRef[q] the one after q (-1 at the end) — so a proc's references
+        # are visited without scanning every reference of the program, and
+        # the sets below are maps, not lists (the fixpoints were quadratic).
+        let mut head = {}
+        let mut nextRef = []
+        let mut q0 = 0
+        loop q0 < nr:
+            nextRef = append(nextRef, -1)
+            q0 = q0 + 1
+        let mut qb = nr - 1
+        loop qb >= 0:
+            let nm = r.names[qb]
+            if nm in head:
+                nextRef[qb] = head[nm]
+            head[nm] = qb
+            qb = qb - 1
+        # candidates: every referenced proc, in first-reference order
         let mut ctx = []
+        let mut inCtx = {}
         let mut k = 0
         loop k < nr:
-            if !(r.names[k] in ctx):
+            if !(r.names[k] in inCtx):
                 ctx = append(ctx, r.names[k])
+                inCtx[r.names[k]] = true
             k = k + 1
         let mut changed = true
         loop changed:
             changed = false
             let mut kept = []
+            let mut keptSet = {}
             let mut c = 0
             loop c < len(ctx):
                 let name = ctx[c]
                 let mut ok = true
-                let mut q = 0
-                loop q < nr && ok:
-                    if r.names[q] == name && (!r.detach[q] || (r.from[q] != "" && !(r.from[q] in ctx))):
+                let mut q = head[name]
+                loop q >= 0 && ok:
+                    if !r.detach[q] || (r.from[q] != "" && !(r.from[q] in inCtx)):
                         ok = false
-                    q = q + 1
+                    q = nextRef[q]
                 if ok:
                     kept = append(kept, name)
+                    keptSet[name] = true
                 else:
                     changed = true
                 c = c + 1
             ctx = kept
+            inCtx = keptSet
         let mut reach = []
+        let mut inReach = {}
         changed = true
         loop changed:
             changed = false
             let mut c2 = 0
             loop c2 < len(ctx):
                 let name2 = ctx[c2]
-                if !(name2 in reach):
-                    let mut q2 = 0
+                if !(name2 in inReach):
+                    let mut q2 = head[name2]
                     let mut found = false
-                    loop q2 < nr && !found:
-                        if r.names[q2] == name2 && (r.from[q2] == "" || r.from[q2] in reach):
+                    loop q2 >= 0 && !found:
+                        if r.from[q2] == "" || r.from[q2] in inReach:
                             found = true
-                        q2 = q2 + 1
+                        q2 = nextRef[q2]
                     if found:
                         reach = append(reach, name2)
+                        inReach[name2] = true
                         changed = true
                 c2 = c2 + 1
         let mut whyNames = []
         let mut whyTexts = []
         let mut w = 0
-        loop w < len(procNames):
-            let pn = procNames[w]
-            if !(pn in reach):
+        loop w < len(prog.procs):
+            let pn = prog.procs[w].name
+            if !(pn in inReach) && pn in head:
                 let mut detached = false
-                let mut q3 = 0
-                loop q3 < nr:
-                    if r.names[q3] == pn && r.detach[q3]:
+                let mut q3 = head[pn]
+                loop q3 >= 0:
+                    if r.detach[q3]:
                         detached = true
-                    q3 = q3 + 1
+                    q3 = nextRef[q3]
                 if detached:
                     let mut why = ""
-                    let mut q4 = 0
+                    let mut q4 = head[pn]
                     let mut stop = false
-                    loop q4 < nr && !stop:
-                        if r.names[q4] == pn:
-                            if !r.detach[q4]:
-                                why = r.where[q4]
-                                stop = true
-                            else:
-                                if r.from[q4] != "" && !(r.from[q4] in reach):
-                                    why = r.where[q4] + ", which is not itself only ever detached from a daemon or main"
-                        q4 = q4 + 1
+                    loop q4 >= 0 && !stop:
+                        if !r.detach[q4]:
+                            why = r.where[q4]
+                            stop = true
+                        else:
+                            if r.from[q4] != "" && !(r.from[q4] in inReach):
+                                why = r.where[q4] + ", which is not itself only ever detached from a daemon or main"
+                        q4 = nextRef[q4]
                     if why != "":
                         whyNames = append(whyNames, pn)
                         whyTexts = append(whyTexts, why)
@@ -1058,7 +1177,7 @@ app DriverSelfHost:
             let mut rfi = 0
             loop rfi < rfn:
                 let rf = rd.fields[rfi]
-                rfields = append(rfields, IRRecordField{name: rf.name, type: rf.typeCore, list: rf.isList, optional: rf.isOptional})
+                rfields = append(rfields, IRRecordField{name: rf.name, type: rf.typeCore, list: rf.isList, optional: rf.isOptional, map: false, key: "", depth: 0})
                 rfi = rfi + 1
             records = append(records, IRRecord{name: rd.name, fields: rfields})
             ri = ri + 1
@@ -1066,15 +1185,34 @@ app DriverSelfHost:
         # Structs (proc-local composite types) — same wire shape as Record.
         let mut structs = []
         let sn2 = len(prog.structs)
+        let mut structNamesB = []
+        let mut sn0 = 0
+        loop sn0 < sn2:
+            structNamesB = append(structNamesB, prog.structs[sn0].name)
+            sn0 = sn0 + 1
         let mut si2 = 0
         loop si2 < sn2:
             let sd2 = prog.structs[si2]
             let mut sfields = []
+            let mut sfSeen = []
             let sfn = len(sd2.fields)
             let mut sfi = 0
             loop sfi < sfn:
                 let sf = sd2.fields[sfi]
-                sfields = append(sfields, IRRecordField{name: sf.name, type: sf.typeCore, list: sf.isList, optional: false})
+                # build.go: no duplicate field; a field's type is a scalar
+                # or another declared struct (a list or map of those)
+                let sqs = do goQuote(sd2.name)
+                let fqs = do goQuote(sf.name)
+                if sf.name in sfSeen:
+                    let fdup = do driverFailed(prog, driverLineMsg(sf.line, "struct " + sqs + " has duplicate field " + fqs))
+                    return fdup
+                sfSeen = append(sfSeen, sf.name)
+                let scalarF = sf.typeCore == "int" || sf.typeCore == "text" || sf.typeCore == "bool" || sf.typeCore == "float"
+                if !scalarF && !(sf.typeCore in structNamesB):
+                    let tqs = do goQuote(sf.typeCore)
+                    let ftyp = do driverFailed(prog, driverLineMsg(sf.line, "struct " + sqs + " field " + fqs + " has type " + tqs + " — a struct field must be int/text/bool/float, another declared struct, or a list of those"))
+                    return ftyp
+                sfields = append(sfields, IRRecordField{name: sf.name, type: sf.typeCore, list: sf.isList, optional: false, map: sf.isMap, key: sf.mapKey, depth: sf.depth})
                 sfi = sfi + 1
             structs = append(structs, IRRecord{name: sd2.name, fields: sfields})
             si2 = si2 + 1
@@ -1165,10 +1303,15 @@ app DriverSelfHost:
             sdp = sdp + 1
 
         # Policies (step 3; zero-arg ones join the inline table).
+        # progProcAt: proc name -> its (first) index among prog.procs, the
+        # order every proc-name list below is built in
         let mut polProcNames = []
+        let mut progProcAt = {}
         let npp = len(prog.procs)
         let mut ppj = 0
         loop ppj < npp:
+            if !(prog.procs[ppj].name in progProcAt):
+                progProcAt[prog.procs[ppj].name] = ppj
             polProcNames = append(polProcNames, prog.procs[ppj].name)
             ppj = ppj + 1
         let mut policies = []
@@ -1187,7 +1330,7 @@ app DriverSelfHost:
             let ppn = len(pd.paramNames)
             let mut ppi = 0
             loop ppi < ppn:
-                pparams = append(pparams, IRParam{name: pd.paramNames[ppi], type: pd.paramTypes[ppi], optional: pd.paramOptionals[ppi], list: false})
+                pparams = append(pparams, IRParam{name: pd.paramNames[ppi], type: pd.paramTypes[ppi], optional: pd.paramOptionals[ppi], list: false, map: false, key: "", depth: 0})
                 ppi = ppi + 1
             policies = append(policies, IRPolicy{name: pd.name, params: pparams, expr: [lowered]})
             policyNames = append(policyNames, pd.name)
@@ -1234,7 +1377,7 @@ app DriverSelfHost:
                 pceEntityDerives = append(pceEntityDerives, prog.entities[ped].name + "." + prog.entities[ped].derives[pedk].name)
                 pedk = pedk + 1
             ped = ped + 1
-        let declCalls = CallEnv{fnNames: pceFns, fnArities: pceArities, procNames: polProcNames, procArities: pceProcArities, procDerives: builtDerives.procDerives, listNames: [], jsonNames: [], deriveKeys: pceEntityDerives, inAction: false, inDerive: false, inProc: false, ty: tyEnv, tsc: tyEmptyScope(), actionNames: actionSet, stateNames: stateNames, stateDeclPlacements: stateDeclPlacements}
+        let declCalls = CallEnv{fnNames: pceFns, fnArities: pceArities, procNames: polProcNames, procAt: progProcAt, procArities: pceProcArities, procDerives: builtDerives.procDerives, listNames: [], jsonNames: [], deriveKeys: pceEntityDerives, inAction: false, inDerive: false, inProc: false, ty: tyEnv, tsc: tyEmptyScope(), actionNames: actionSet, stateNames: stateNames, stateDeclPlacements: stateDeclPlacements}
         let exprDiag = do driverExprDiag(prog, allStates, stateNames, entityNames, entities, enumNames, lowCtx.inlineNames, declCalls)
         if exprDiag != "":
             let edf = do driverFailed(prog, exprDiag)
@@ -1286,22 +1429,60 @@ app DriverSelfHost:
             fdi = fdi + 1
 
         # The struct table a proc's `local.field = expr` write checks against.
+        # structStart/structEnd: each struct's run of keys in that table
+        # (a struct's fields are contiguous, in declaration order).
         let mut structFieldKeys = []
         let mut structFieldTypes = []
+        let mut structStart = {}
+        let mut structEnd = {}
+        let mut structFieldAt = {}
         let nsd = len(prog.structs)
         let mut sdi = 0
         loop sdi < nsd:
             let sdd = prog.structs[sdi]
             let nsf = len(sdd.fields)
+            if !(sdd.name in structStart):
+                structStart[sdd.name] = len(structFieldKeys)
+                structEnd[sdd.name] = len(structFieldKeys) + nsf
             let mut sfj = 0
             loop sfj < nsf:
-                structFieldKeys = append(structFieldKeys, sdd.name + "." + sdd.fields[sfj].name)
+                let sfk = sdd.name + "." + sdd.fields[sfj].name
+                if !(sfk in structFieldAt):
+                    structFieldAt[sfk] = len(structFieldKeys)
+                structFieldKeys = append(structFieldKeys, sfk)
                 let mut sft = sdd.fields[sfj].typeCore
                 if sdd.fields[sfj].isList:
                     sft = "[" + sft + "]"
+                    # a nested list field keeps its extra levels in the type
+                    let mut dd = sdd.fields[sfj].depth
+                    loop dd > 1:
+                        sft = "[" + sft + "]"
+                        dd = dd - 1
+                # a `{K: V}` field is typed with build.go's mapTag, "map:K:V"
+                if sdd.fields[sfj].isMap:
+                    sft = "map:" + sdd.fields[sfj].mapKey + ":" + sft
                 structFieldTypes = append(structFieldTypes, sft)
                 sfj = sfj + 1
             sdi = sdi + 1
+
+        # Proc signatures (build.go 3d‴): each proc's return type is a
+        # primitive or a declared enum, record, struct or wire type — a
+        # nested list's element, a map's value — checked for every proc
+        # before any body is built.
+        let mut psi = 0
+        loop psi < len(prog.procs):
+            let psd = prog.procs[psi]
+            if psd.hasRet:
+                let mut pret = psd.retCore
+                let pms = do parseProcHeaderRetMapSpec(psd.headerLine)
+                if pms != "":
+                    pret = mapSpecVal(pms)
+                pret = nestedBase(pret)
+                let pprim = pret == "int" || pret == "text" || pret == "bool" || pret == "money" || pret == "date" || pret == "float" || pret == "datetime"
+                if pret != "" && !pprim && !(pret in enumNames) && !(pret in structNamesB) && !(pret in wire.names) && !driverIsRecord(prog, pret):
+                    let prf = do driverFailed(prog, driverLineMsg(psd.lineNo, "proc \"" + psd.name + "\" returns unknown type \"" + pret + "\""))
+                    return prf
+            psi = psi + 1
 
         # Shared cells (buildShareds): known before any proc or daemon body.
         let mut sharedNames = []
@@ -1355,21 +1536,42 @@ app DriverSelfHost:
         loop psn < len(prog.structs):
             plStructNames = append(plStructNames, prog.structs[psn].name)
             psn = psn + 1
-        let plctx = PLCtx{sharedNames: sharedNames, sharedTypes: sharedTypes, ctxProcs: dctx.procs, lineNos: [], structNames: plStructNames, ty: tyEnv}
+        # every proc's arity unchecked (-1) in a body's proc calls, one per
+        # proc name below — built once, shared by every body
+        let mut plUnchecked = []
+        loop len(plUnchecked) < len(prog.procs):
+            plUnchecked = append(plUnchecked, -1)
+        let plctx = PLCtx{sharedNames: sharedNames, sharedTypes: sharedTypes, ctxProcs: dctx.procs, lineNos: [], structNames: plStructNames, structStart: structStart, structEnd: structEnd, structFieldAt: structFieldAt, procAt: progProcAt, unchecked: plUnchecked, ty: tyEnv}
 
         # Procs (name/paramCount/ret/retList env, then real lowering).
         let mut procNames = []
         let mut procRets = []
         let mut procRetLists = []
+        let mut procParamMaps = []
         let pcn = len(prog.procs)
         let mut pci = 0
         loop pci < pcn:
             procNames = append(procNames, prog.procs[pci].name)
             let mut rc = ""
             if prog.procs[pci].hasRet:
+                # (retCore of `[[T]]` is `[T]`: a nested list's element,
+                # which plRetCore/plRetDepth read)
                 rc = prog.procs[pci].retCore
+                # a `-> {K: V}` return rides the signature as build.go's
+                # mapTag, "map:K:V" (plRetCore recovers V)
+                let rms = do parseProcHeaderRetMapSpec(prog.procs[pci].headerLine)
+                if rms != "":
+                    rc = "map:" + rms
             procRets = append(procRets, rc)
             procRetLists = append(procRetLists, prog.procs[pci].retIsList)
+            let pnames = do parseProcHeaderParamNames(prog.procs[pci].headerLine)
+            let pmaps = do parseProcHeaderParamMapSpecs(prog.procs[pci].headerLine)
+            let mut pspec = []
+            let mut pk = 0
+            loop pk < len(pnames) && pk < len(pmaps):
+                pspec = append(pspec, pnames[pk] + "=" + pmaps[pk])
+                pk = pk + 1
+            procParamMaps = append(procParamMaps, join(pspec, "|"))
             pci = pci + 1
         let mut procs = []
         let mut pci2 = 0
@@ -1381,7 +1583,7 @@ app DriverSelfHost:
             else:
                 let mut pctx = plctx
                 pctx.lineNos = pd2.bodyLineNos
-                let lp = do plLowerProcX(pd2.name, pd2.headerLine, pd2.bodySrc, procNames, procRets, procRetLists, fileNames, fileTypes, filePaths, enumNames, pd2.renameFrom, pd2.renameTo, structFieldKeys, structFieldTypes, pctx, false, actionSet, [], [])
+                let lp = do plLowerProcX(pd2.name, pd2.headerLine, pd2.bodySrc, pd2.body, procNames, procRets, procRetLists, procParamMaps, fileNames, fileTypes, filePaths, enumNames, pd2.renameFrom, pd2.renameTo, structFieldKeys, structFieldTypes, pctx, false, actionSet, [], [])
                 if lp.diag != "":
                     let pdiag = do driverCtxDiag(dctx, pd2.name, lp.diag)
                     let pf = do driverFailed(prog, pdiag)
@@ -1480,7 +1682,29 @@ app DriverSelfHost:
             procEnvParamCounts = append(procEnvParamCounts, len(prog.procs[pci3].paramNames))
             pci3 = pci3 + 1
 
-        let env = ALowEnv{stateNames: stateNames, stateDeclPlacements: stateDeclPlacements, actionNames: actionSet, statePlacements: alowPlacements, entityNames: entityNames, entityFields: entityFieldKeys, entityDerives: entityDeriveKeys, enumNames: enumNames, policyNames: policyNames, policyParamCounts: policyParamCounts, inlineNames: lowCtx.inlineNames, inlineExprs: lowCtx.inlineExprs, serviceNames: serviceEnvNames, serviceOps: serviceEnvOps, serviceArgCounts: serviceEnvArgCounts, serviceRets: serviceEnvRets, serviceRetLists: serviceEnvRetLists, procNames: procNames, procParamCounts: procEnvParamCounts, procRets: procRets, procRetLists: procRetLists, structNames: structNames, renameFrom: [], renameTo: [], e2eFields: e2eFieldKeys, actionParams: [], wireTypes: wire.names, actionName: "", actionRet: "", recordNames: recordNames, low: lowCtx, privateStates: privateStateNames, ty: tyEnv, tsc: tyEmptyScope()}
+        # every declared action's signature: what an action's `run` names
+        # (build.go's e.astActions — the app's own, not auth's)
+        let mut runNamesD = []
+        let mut runParamCountsD = []
+        let mut runRetsD = []
+        let mut runRetListsD = []
+        let mut runRequiredD = []
+        let nra = len(prog.actions)
+        let mut rai = 0
+        loop rai < nra:
+            let mut req = 0
+            let mut rq = 0
+            loop rq < len(prog.actions[rai].paramOptionals):
+                if !prog.actions[rai].paramOptionals[rq]:
+                    req = rq + 1
+                rq = rq + 1
+            runRequiredD = append(runRequiredD, req)
+            runNamesD = append(runNamesD, prog.actions[rai].name)
+            runParamCountsD = append(runParamCountsD, len(prog.actions[rai].paramNames))
+            runRetsD = append(runRetsD, prog.actions[rai].ret)
+            runRetListsD = append(runRetListsD, prog.actions[rai].retList)
+            rai = rai + 1
+        let env = ALowEnv{lineNos: [], stateNames: stateNames, stateDeclPlacements: stateDeclPlacements, actionNames: actionSet, statePlacements: alowPlacements, entityNames: entityNames, entityFields: entityFieldKeys, entityDerives: entityDeriveKeys, enumNames: enumNames, policyNames: policyNames, policyParamCounts: policyParamCounts, inlineNames: lowCtx.inlineNames, inlineExprs: lowCtx.inlineExprs, serviceNames: serviceEnvNames, serviceOps: serviceEnvOps, serviceArgCounts: serviceEnvArgCounts, serviceRets: serviceEnvRets, serviceRetLists: serviceEnvRetLists, procNames: procNames, procAt: progProcAt, procParamCounts: procEnvParamCounts, procRets: procRets, procRetLists: procRetLists, structNames: structNames, renameFrom: [], renameTo: [], e2eFields: e2eFieldKeys, actionParams: [], wireTypes: wire.names, actionName: "", actionRet: "", recordNames: recordNames, low: lowCtx, privateStates: privateStateNames, ty: tyEnv, tsc: tyEmptyScope(), curAction: "", runNames: runNamesD, runParamCounts: runParamCountsD, runRets: runRetsD, runRetLists: runRetListsD, standIn: false, runRequired: runRequiredD}
 
         # Actions.
         let mut actions = []
@@ -1488,18 +1712,34 @@ app DriverSelfHost:
         let mut ai = 0
         loop ai < an:
             let ad = prog.actions[ai]
-            let aenv = ALowEnv{stateNames: env.stateNames, stateDeclPlacements: env.stateDeclPlacements, actionNames: env.actionNames, statePlacements: env.statePlacements, entityNames: env.entityNames, entityFields: env.entityFields, entityDerives: env.entityDerives, enumNames: env.enumNames, policyNames: env.policyNames, policyParamCounts: env.policyParamCounts, inlineNames: env.inlineNames, inlineExprs: env.inlineExprs, serviceNames: env.serviceNames, serviceOps: env.serviceOps, serviceArgCounts: env.serviceArgCounts, serviceRets: env.serviceRets, serviceRetLists: env.serviceRetLists, procNames: env.procNames, procParamCounts: env.procParamCounts, procRets: env.procRets, procRetLists: env.procRetLists, structNames: env.structNames, renameFrom: ad.renameFrom, renameTo: ad.renameTo, e2eFields: env.e2eFields, actionParams: [], wireTypes: env.wireTypes, actionName: "", actionRet: "", recordNames: env.recordNames, low: env.low, privateStates: env.privateStates, ty: env.ty, tsc: env.tsc}
+            let aenv = ALowEnv{lineNos: [], stateNames: env.stateNames, stateDeclPlacements: env.stateDeclPlacements, actionNames: env.actionNames, statePlacements: env.statePlacements, entityNames: env.entityNames, entityFields: env.entityFields, entityDerives: env.entityDerives, enumNames: env.enumNames, policyNames: env.policyNames, policyParamCounts: env.policyParamCounts, inlineNames: env.inlineNames, inlineExprs: env.inlineExprs, serviceNames: env.serviceNames, serviceOps: env.serviceOps, serviceArgCounts: env.serviceArgCounts, serviceRets: env.serviceRets, serviceRetLists: env.serviceRetLists, procNames: env.procNames, procAt: env.procAt, procParamCounts: env.procParamCounts, procRets: env.procRets, procRetLists: env.procRetLists, structNames: env.structNames, renameFrom: ad.renameFrom, renameTo: ad.renameTo, e2eFields: env.e2eFields, actionParams: [], wireTypes: env.wireTypes, actionName: "", actionRet: "", recordNames: env.recordNames, low: env.low, privateStates: env.privateStates, ty: env.ty, tsc: env.tsc, curAction: env.curAction, runNames: env.runNames, runParamCounts: env.runParamCounts, runRets: env.runRets, runRetLists: env.runRetLists, standIn: env.standIn, runRequired: env.runRequired}
             if ad.retErr != "":
                 let re = do driverFailed(prog, ad.retErr)
                 return re
-            let ira = do lowerActionSrcFull(ad.name, ad.paramNames, ad.paramTypes, ad.paramLists, ad.paramOptionals, ad.optimistic, ad.ret, ad.retList, ad.bodySrc, aenv)
+            let mut npi = 0
+            loop npi < len(ad.paramTypes):
+                if len(ad.paramTypes[npi]) > 0 && charAt(ad.paramTypes[npi], 0) == "[":
+                    let naq = do goQuote(ad.name)
+                    let npq = do goQuote(ad.paramNames[npi])
+                    let nf = do driverFailed(prog, driverActionLine(prog, ai, "action " + naq + " parameter " + npq + " is a nested list — a list of lists is a proc-only type; an action takes scalars or a list of them (bind a nested list inside a proc)"))
+                    return nf
+                npi = npi + 1
+            let mut aenvS = aenv
+            aenvS.standIn = ad.standIn
+            let mut ira = do lowerActionSrcFull(ad.name, ad.paramNames, ad.paramTypes, ad.paramLists, ad.paramOptionals, ad.optimistic, ad.ret, ad.retList, alowRenameCalls(ad.requires, ad.renameFrom, ad.renameTo), alowRenameCalls(ad.body, ad.renameFrom, ad.renameTo), ad.bodyLineNos, aenvS)
+            ira.internal = ad.internal
             # lowerActionSrc's refusal is an unnamed action carrying the
             # diagnostic as its reason.
             if ira.name == "":
-                let af = do driverFailed(prog, ira.reason)
+                let ar = do driverActionLine(prog, ai, ira.reason)
+                let af = do driverFailed(prog, ar)
                 return af
             actions = append(actions, ira)
             ai = ai + 1
+        let rg = do driverCheckRunGraph(actions)
+        if rg != "":
+            let rgf = do driverFailed(prog, rg)
+            return rgf
         if prog.hasAuth:
             let authActs = do driverAuthActions()
             let aan = len(authActs)
@@ -1527,7 +1767,7 @@ app DriverSelfHost:
             if driverIsEntry(pd3) || pd3.name in dctx.procs:
                 let mut pctx3 = plctx
                 pctx3.lineNos = pd3.bodyLineNos
-                let lp3 = do plLowerProcX(pd3.name, pd3.headerLine, pd3.bodySrc, procNames, procRets, procRetLists, fileNames, fileTypes, filePaths, enumNames, pd3.renameFrom, pd3.renameTo, structFieldKeys, structFieldTypes, pctx3, true, sigNames, sigServer, sigCounts)
+                let lp3 = do plLowerProcX(pd3.name, pd3.headerLine, pd3.bodySrc, pd3.body, procNames, procRets, procRetLists, procParamMaps, fileNames, fileTypes, filePaths, enumNames, pd3.renameFrom, pd3.renameTo, structFieldKeys, structFieldTypes, pctx3, true, sigNames, sigServer, sigCounts)
                 if lp3.diag != "":
                     let pf3 = do driverFailed(prog, lp3.diag)
                     return pf3
@@ -1548,7 +1788,7 @@ app DriverSelfHost:
             daemonNames = append(daemonNames, dd.name)
             let mut dctx2 = plctx
             dctx2.lineNos = dd.bodyLineNos
-            let ld = do plLowerDaemonX(dd.name, dd.uses, dd.bodySrc, procNames, procRets, procRetLists, fileNames, fileTypes, filePaths, enumNames, sigNames, sigServer, sigCounts, dd.renameFrom, dd.renameTo, structFieldKeys, structFieldTypes, dctx2)
+            let ld = do plLowerDaemonX(dd.name, dd.uses, dd.bodySrc, procNames, procRets, procRetLists, procParamMaps, fileNames, fileTypes, filePaths, enumNames, sigNames, sigServer, sigCounts, dd.renameFrom, dd.renameTo, structFieldKeys, structFieldTypes, dctx2)
             if ld.diag != "":
                 let fd3 = do driverFailed(prog, ld.diag)
                 return fd3
@@ -1628,8 +1868,23 @@ app DriverSelfHost:
                 if allStates[cei].typeCore == "json":
                     ceJson = append(ceJson, allStates[cei].name)
             cei = cei + 1
-        let callEnv = CallEnv{fnNames: ceFns, fnArities: ceFnArities, procNames: procNames, procArities: procEnvParamCounts, procDerives: builtDerives.procDerives, listNames: ceLists, jsonNames: ceJson, deriveKeys: entityDeriveKeys, inAction: false, inDerive: false, inProc: false, ty: tyEnv, tsc: tyEmptyScope(), actionNames: actionSet, stateNames: stateNames, stateDeclPlacements: stateDeclPlacements}
-        let venv = do driverViewEnv(prog, allStates, enumNames, entityNames, entities, alowPlacements, lowCtx, policyNames, policyParamCounts, callEnv)
+        let callEnv = CallEnv{fnNames: ceFns, fnArities: ceFnArities, procNames: procNames, procAt: progProcAt, procArities: procEnvParamCounts, procDerives: builtDerives.procDerives, listNames: ceLists, jsonNames: ceJson, deriveKeys: entityDeriveKeys, inAction: false, inDerive: false, inProc: false, ty: tyEnv, tsc: tyEmptyScope(), actionNames: actionSet, stateNames: stateNames, stateDeclPlacements: stateDeclPlacements}
+        let mut venv = do driverViewEnv(prog, allStates, enumNames, entityNames, entities, alowPlacements, lowCtx, policyNames, policyParamCounts, callEnv)
+        # what a link may open besides a page (servedGETRoute)
+        let mut servedGets = []
+        let mut lsg = 0
+        loop lsg < len(routesB.apis):
+            if routesB.apis[lsg].method == "GET":
+                servedGets = append(servedGets, vbAPIPattern(routesB.apis[lsg].path))
+            lsg = lsg + 1
+        lsg = 0
+        loop lsg < len(routesB.streams):
+            servedGets = append(servedGets, vbAPIPattern(routesB.streams[lsg].path))
+            lsg = lsg + 1
+        venv.servedGets = servedGets
+        if len(routesB.contract) > 0:
+            venv.contractPath = routesB.contract[0].path
+        venv.composed = composed
         let mut vviews = composedViews
         let mut nvw = len(prog.views)
         if composed:
@@ -1637,7 +1892,7 @@ app DriverSelfHost:
         let mut vwi = 0
         loop vwi < nvw:
             let ve = prog.views[vwi]
-            let vv = do vpParseView(ve.header, ve.bodySrc)
+            let vv = do vpParseView(ve.header, ve.bodySrc, ve.bodyLineNos)
             if ve.private && vv.err == "":
                 vviews = append(vviews, VView{err: "", name: ve.name, path: vv.path, params: vv.params, layout: vv.layout, requires: vv.requires, titleSegs: vv.titleSegs, descSegs: vv.descSegs, root: vv.root, screen: false})
             else:
@@ -1647,14 +1902,14 @@ app DriverSelfHost:
         let ncm = len(prog.components)
         let mut cmi = 0
         loop cmi < ncm:
-            let vc = do vpParseComponent(prog.components[cmi].headerLine, prog.components[cmi].bodySrc)
+            let vc = do vpParseComponent(prog.components[cmi].headerLine, prog.components[cmi].bodySrc, prog.components[cmi].bodyLineNos)
             vcomps = append(vcomps, vc)
             cmi = cmi + 1
         let mut vlayouts = []
         let nlo = len(prog.layouts)
         let mut loi = 0
         loop loi < nlo:
-            let vl = do vpParseLayout(prog.layouts[loi].headerLine, prog.layouts[loi].bodySrc)
+            let vl = do vpParseLayout(prog.layouts[loi].headerLine, prog.layouts[loi].bodySrc, prog.layouts[loi].bodyLineNos)
             if vl.err != "":
                 let lf = do driverFailed(prog, vl.err)
                 return lf
@@ -1688,6 +1943,39 @@ app DriverSelfHost:
         let themesNamed = do driverNamedThemes(prog)
         let g = IRGraph{app: prog.name, auth: prog.hasAuth, entities: stamped.entities, records: records, structs: structs, enums: enums, types: wire.types, messages: wire.messages, states: states, derives: builtDerives.derives, policies: policies, actions: actions, procs: procs, jobs: jobs, daemons: daemons, shareds: irShareds, components: built.components, services: services, files: files, webhooks: webhooks, apis: routesB.apis, contract: routesB.contract, streams: routesB.streams, triggers: triggers, theme: themeBase, themeDark: themeDark, themes: themesNamed, css: prog.css, assets: noneVal, routes: built.routes, pages: built.pages, bindings: topBindings, view: topView, depGraph: depGraph}
         return DriverOut{graph: g, err: ""}
+
+    proc driverIsRecord(prog: Program, name: text) -> bool:
+        let mut i = 0
+        loop i < len(prog.records):
+            if prog.records[i].name == name:
+                return true
+            i = i + 1
+        return false
+
+    # driverParseDerive: parseDerive over a derive's text, its calls of a
+    # same-file private proc then naming the mangled proc.
+    proc driverParseDerive(dv: DeriveDeclFull) -> WDerive:
+        let mut wd = do wParseDerive(dv.line, dv.cont)
+        if len(dv.renameFrom) > 0:
+            wd.expr = exprRenameCalls(wd.expr, dv.renameFrom, dv.renameTo)
+        return wd
+
+    # driverLineMsg: msg as build.go's BuildError spells it at line n — "line
+    # n: msg" — unless the line is unknown (0) or msg already names one.
+    proc driverLineMsg(n: int, msg: text) -> text:
+        let named = do alowNamesLine(msg)
+        if named || n <= 0:
+            return msg
+        return "line " + n + ": " + msg
+
+    # driverActionLine: an action-level refusal as build.go's BuildError
+    # spells it, "line N: …" with the action's header line — unless a
+    # statement of its body already named its own line.
+    proc driverActionLine(prog: Program, ai: int, msg: text) -> text:
+        let named = do alowNamesLine(msg)
+        if named || ai >= len(prog.actionLines):
+            return msg
+        return "line " + prog.actionLines[ai] + ": " + msg
 
     proc driverEmptyOut(p: Program) -> DriverOut:
         let o = do driverFailed(p, "")
@@ -1838,11 +2126,19 @@ app DriverSelfHost:
             ni = ni + 1
         let mut actionNames = []
         let mut actionParamCounts = []
+        let mut actionRequired = []
         let na = len(prog.actions)
         let mut ai = 0
         loop ai < na:
             actionNames = append(actionNames, prog.actions[ai].name)
             actionParamCounts = append(actionParamCounts, len(prog.actions[ai].paramNames))
+            let mut req = 0
+            let mut rq = 0
+            loop rq < len(prog.actions[ai].paramOptionals):
+                if !prog.actions[ai].paramOptionals[rq]:
+                    req = rq + 1
+                rq = rq + 1
+            actionRequired = append(actionRequired, req)
             ai = ai + 1
         if prog.hasAuth:
             let authActs = do driverAuthActions()
@@ -1851,8 +2147,15 @@ app DriverSelfHost:
             loop au < nau:
                 actionNames = append(actionNames, authActs[au].name)
                 actionParamCounts = append(actionParamCounts, len(authActs[au].params))
+                let mut areq = 0
+                let mut aq = 0
+                loop aq < len(authActs[au].params):
+                    if !authActs[au].params[aq].optional:
+                        areq = aq + 1
+                    aq = aq + 1
+                actionRequired = append(actionRequired, areq)
                 au = au + 1
-        return VEnv{stateNames: stateNames, stateClient: stateClient, stateTypes: stateTypes, stateLists: stateLists, privateNames: privateNames, entityNames: entityNames, fieldKeys: fieldKeys, fieldTypes: fieldTypes, deriveKeys: deriveKeys, e2eKeys: e2eKeys, enumFieldKeys: enumFieldKeys, enumFieldEnums: enumFieldEnums, enumNames: enumNames, enumMemberKeys: enumMemberKeys, inlineNames: lowCtx.inlineNames, inlineExprs: lowCtx.inlineExprs, actionNames: actionNames, actionParamCounts: actionParamCounts, policyNames: policyNames, policyParamCounts: policyParamCounts, low: lowCtx, calls: calls, expectedRoutes: prog.expectedRoutes}
+        return VEnv{servedGets: [], contractPath: "", composed: false, stateNames: stateNames, stateClient: stateClient, stateTypes: stateTypes, stateLists: stateLists, privateNames: privateNames, entityNames: entityNames, fieldKeys: fieldKeys, fieldTypes: fieldTypes, deriveKeys: deriveKeys, e2eKeys: e2eKeys, enumFieldKeys: enumFieldKeys, enumFieldEnums: enumFieldEnums, enumNames: enumNames, enumMemberKeys: enumMemberKeys, inlineNames: lowCtx.inlineNames, inlineExprs: lowCtx.inlineExprs, actionNames: actionNames, actionParamCounts: actionParamCounts, actionRequired: actionRequired, policyNames: policyNames, policyParamCounts: policyParamCounts, low: lowCtx, calls: calls, expectedRoutes: prog.expectedRoutes}
 
     struct DriverStamped:
         entities: [IREntity]
@@ -1952,6 +2255,27 @@ app DriverSelfHost:
                 recTypes = append(recTypes, rt)
                 rf = rf + 1
             r = r + 1
+        # the proc structs' fields, for an action that binds one
+        let mut stKeys = []
+        let mut stTypes = []
+        let nst = len(prog.structs)
+        let mut sti = 0
+        loop sti < nst:
+            let sd = prog.structs[sti]
+            let nsf = len(sd.fields)
+            let mut sfi = 0
+            loop sfi < nsf:
+                let sf = sd.fields[sfi]
+                let mut st = sf.typeCore
+                if sf.isMap || sf.depth > 1:
+                    st = ""
+                else:
+                    if sf.isList:
+                        st = "[" + st + "]"
+                stKeys = append(stKeys, sd.name + "." + sf.name)
+                stTypes = append(stTypes, st)
+                sfi = sfi + 1
+            sti = sti + 1
         let mut wireNames = []
         let mut wireKeys = []
         let mut wireTypes = []
@@ -1984,6 +2308,9 @@ app DriverSelfHost:
                 pr = pd.retCore
                 if pd.retIsList:
                     pr = "[" + pr + "]"
+                let prms = do parseProcHeaderRetMapSpec(pd.headerLine)
+                if prms != "":
+                    pr = "map:" + prms
             procRets = append(procRets, pr)
             p = p + 1
         let mut inlineNames = []
@@ -1995,14 +2322,14 @@ app DriverSelfHost:
                 inlineNames = append(inlineNames, prog.policies[po].name)
                 inlineTypes = append(inlineTypes, "bool")
             po = po + 1
-        te = TyEnv{stateNames: stateNames, stateTypes: stateTypes, entityNames: entityNames, fieldKeys: fieldKeys, fieldTypes: fieldTypes, enumNames: enumNames, recordNames: recordNames, recFieldKeys: recKeys, recFieldTypes: recTypes, wireNames: wireNames, wireFieldKeys: wireKeys, wireFieldTypes: wireTypes, procNames: procNames, procRets: procRets, deriveNames: [], deriveRets: [], deriveParams: [], inlineNames: inlineNames, inlineTypes: inlineTypes}
+        te = TyEnv{stateNames: stateNames, stateTypes: stateTypes, entityNames: entityNames, fieldKeys: fieldKeys, fieldTypes: fieldTypes, enumNames: enumNames, recordNames: recordNames, recFieldKeys: recKeys, recFieldTypes: recTypes, wireNames: wireNames, wireFieldKeys: wireKeys, wireFieldTypes: wireTypes, procNames: procNames, procRets: procRets, deriveNames: [], deriveRets: [], deriveParams: [], inlineNames: inlineNames, inlineTypes: inlineTypes, structFieldKeys: stKeys, structFieldTypes: stTypes}
         let mut deriveNames = []
         let mut deriveRets = []
         let mut deriveParams = []
         let nd = len(prog.derives)
         let mut d = 0
         loop d < nd:
-            let wd = do wParseDerive(prog.derives[d].line, prog.derives[d].cont)
+            let wd = do driverParseDerive(prog.derives[d])
             if wd.err == "":
                 if len(wd.params) > 0:
                     let rv = do tyParse(wd.type)
@@ -2028,7 +2355,7 @@ app DriverSelfHost:
                     inlineNames = append(inlineNames, wd.name)
                     inlineTypes = append(inlineTypes, wd.type)
             d = d + 1
-        return TyEnv{stateNames: stateNames, stateTypes: stateTypes, entityNames: entityNames, fieldKeys: fieldKeys, fieldTypes: fieldTypes, enumNames: enumNames, recordNames: recordNames, recFieldKeys: recKeys, recFieldTypes: recTypes, wireNames: wireNames, wireFieldKeys: wireKeys, wireFieldTypes: wireTypes, procNames: procNames, procRets: procRets, deriveNames: deriveNames, deriveRets: deriveRets, deriveParams: deriveParams, inlineNames: inlineNames, inlineTypes: inlineTypes}
+        return TyEnv{stateNames: stateNames, stateTypes: stateTypes, entityNames: entityNames, fieldKeys: fieldKeys, fieldTypes: fieldTypes, enumNames: enumNames, recordNames: recordNames, recFieldKeys: recKeys, recFieldTypes: recTypes, wireNames: wireNames, wireFieldKeys: wireKeys, wireFieldTypes: wireTypes, procNames: procNames, procRets: procRets, deriveNames: deriveNames, deriveRets: deriveRets, deriveParams: deriveParams, inlineNames: inlineNames, inlineTypes: inlineTypes, structFieldKeys: stKeys, structFieldTypes: stTypes}
 
     proc driverBuildDerives(decls: [DeriveDeclFull], entityNames: [text], stateNames: [text], ctx0: LowCtx, procNames: [text]) -> DriverDerivesResult:
         let mut parsed = []
@@ -2036,7 +2363,7 @@ app DriverSelfHost:
         let n = len(decls)
         let mut i = 0
         loop i < n:
-            let wd = do wParseDerive(decls[i].line, decls[i].cont)
+            let wd = do driverParseDerive(decls[i])
             if wd.err != "":
                 return DriverDerivesResult{err: wd.err, derives: [], ctx: ctx0, procDerives: []}
             if wd.name in seen:
@@ -2076,7 +2403,7 @@ app DriverSelfHost:
                 let mut pi = 0
                 loop pi < np:
                     pnames = append(pnames, d.params[pi].name)
-                    iparams = append(iparams, IRParam{name: d.params[pi].name, type: d.params[pi].type, optional: d.params[pi].optional, list: false})
+                    iparams = append(iparams, IRParam{name: d.params[pi].name, type: d.params[pi].type, optional: d.params[pi].optional, list: false, map: false, key: "", depth: 0})
                     pi = pi + 1
                 out = append(out, IRDerive{name: d.name, params: iparams, type: d.type, expr: [lowered], deps: deps})
                 ctx = LowCtx{inlineNames: ctx.inlineNames, inlineExprs: ctx.inlineExprs, enumNames: ctx.enumNames, fns: append(ctx.fns, LowFn{name: d.name, params: pnames, body: lowered, ret: d.type}), textFieldKeys: ctx.textFieldKeys, deriveKeys: ctx.deriveKeys, deriveExprs: ctx.deriveExprs, wireOptKeys: ctx.wireOptKeys, wireNullKeys: ctx.wireNullKeys}
@@ -2102,7 +2429,7 @@ app DriverSelfHost:
             ri = ri + 1
         let out = do compileGraph(src)
         if out.err != "":
-            let q = do jsonQuote(out.err)
+            let q = jsonQuote(out.err)
             return "{\"error\":" + q + "}"
         let j = do irGraphJSON(out.graph)
         return j
@@ -2222,6 +2549,10 @@ app DriverSelfHost:
         if !under:
             return DriverCollect{mods: [], visited: visited0, err: abs + " is outside the data directory " + root}
         let rel = slice(abs, len(pre), len(abs))
+        # compile.go's os.ReadFile refusal for a file that is not there
+        let exists = do driverFileExists(rel)
+        if !exists:
+            return DriverCollect{mods: [], visited: visited0, err: "open " + abs + ": no such file or directory"}
         let src = do driverReadFile(rel)
         let mut mods = [DriverModule{abs: abs, src: src}]
         let mut visited = visited0
@@ -2538,6 +2869,29 @@ app DriverSelfHost:
     proc driverPolicyAt(xs: [PolicyDeclFull], i: int) -> PolicyDeclFull:
         return xs[i]
 
+    # driverActionFits: expect.go's actionFits — the expected parameters
+    # first, in order, same names and types (one the fragment may omit is
+    # optional on the host too), then only optional host parameters; and
+    # the expected reply when the fragment expects one.
+    proc driverActionFits(have: ActionDecl, want: ActionDecl) -> bool:
+        let nw = len(want.paramNames)
+        if len(have.paramNames) < nw:
+            return false
+        let mut i = 0
+        loop i < nw:
+            if have.paramNames[i] != want.paramNames[i] || have.paramTypes[i] != want.paramTypes[i] || have.paramLists[i] != want.paramLists[i]:
+                return false
+            if want.paramOptionals[i] && !have.paramOptionals[i]:
+                return false
+            i = i + 1
+        loop i < len(have.paramNames):
+            if !have.paramOptionals[i]:
+                return false
+            i = i + 1
+        if want.ret == "":
+            return true
+        return have.ret == want.ret && have.retList == want.retList
+
     proc driverEntityFieldAt(e: EntityDecl, name: text) -> int:
         let n = len(e.fields)
         let mut i = 0
@@ -2686,8 +3040,18 @@ app DriverSelfHost:
                 let wantSig = do driverActionSignature(wantA)
                 let haveAtA = do lowerFindName(actionNames, wantA.name)
                 if haveAtA >= 0:
-                    let haveSig = do driverActionSignature(prog.actions[haveAtA])
-                    if haveSig != wantSig:
+                    let haveAct = prog.actions[haveAtA]
+                    let haveSig = do driverActionSignature(haveAct)
+                    let fits = do driverActionFits(haveAct, wantA)
+                    if !fits || haveAct.internal != wantA.internal:
+                        if haveSig == wantSig:
+                            let mut wWord = "client-callable"
+                            if wantA.internal:
+                                wWord = "@internal"
+                            let mut hWord = "client-callable"
+                            if haveAct.internal:
+                                hWord = "@internal"
+                            return DrResolved{prog: out, err: where + " expects action " + wantSig + " to be " + wWord + ", but this app's action (line " + prog.actionLines[haveAtA] + ") is " + hWord}
                         return DrResolved{prog: out, err: where + " expects action " + wantSig + ", but this app's action (line " + prog.actionLines[haveAtA] + ") is " + haveSig + " — the fragment invokes the signature it expected"}
                 else:
                     let synAtA = do lowerFindName(synActionNames, wantA.name)
@@ -2699,6 +3063,7 @@ app DriverSelfHost:
                     else:
                         let mut synA = wantA
                         synA.optimistic = false
+                        synA.standIn = true
                         synActionNames = append(synActionNames, wantA.name)
                         synActions = append(synActions, synA)
                         synActionLines = append(synActionLines, ex.line)
@@ -2996,7 +3361,7 @@ app DriverSelfHost:
         loop vi < nv:
             let v = prog.views[vi]
             if v.private:
-                views = append(views, ViewEntry{name: v.name + "~" + suffix, path: v.path, headerValid: v.headerValid, body: v.body, header: v.header, bodySrc: v.bodySrc, private: true})
+                views = append(views, ViewEntry{name: v.name + "~" + suffix, path: v.path, headerValid: v.headerValid, body: v.body, header: v.header, bodySrc: v.bodySrc, private: true, bodyLineNos: v.bodyLineNos, lineNo: v.lineNo})
             else:
                 views = append(views, v)
             vi = vi + 1
@@ -3011,15 +3376,26 @@ app DriverSelfHost:
             let mut name = pd.name
             if at >= 0:
                 name = to[at]
-            procs = append(procs, ProcDecl{name: name, paramNames: pd.paramNames, paramTypes: pd.paramTypes, paramLists: pd.paramLists, paramOptionals: pd.paramOptionals, hasRet: pd.hasRet, retCore: pd.retCore, retIsList: pd.retIsList, retIsOptional: pd.retIsOptional, uses: pd.uses, headerValid: pd.headerValid, body: pd.body, bodyValid: pd.bodyValid, headerLine: pd.headerLine, bodySrc: pd.bodySrc, renameFrom: from, renameTo: to, bodyLineNos: pd.bodyLineNos})
+            procs = append(procs, ProcDecl{name: name, paramNames: pd.paramNames, paramTypes: pd.paramTypes, paramLists: pd.paramLists, paramOptionals: pd.paramOptionals, hasRet: pd.hasRet, retCore: pd.retCore, retIsList: pd.retIsList, retIsOptional: pd.retIsOptional, uses: pd.uses, headerValid: pd.headerValid, body: pd.body, bodyValid: pd.bodyValid, headerLine: pd.headerLine, bodySrc: pd.bodySrc, renameFrom: from, renameTo: to, bodyLineNos: pd.bodyLineNos, lineNo: pd.lineNo})
             pi = pi + 1
         let mut actions = []
         let na = len(prog.actions)
         let mut ai = 0
         loop ai < na:
             let ad = prog.actions[ai]
-            actions = append(actions, ActionDecl{name: ad.name, paramNames: ad.paramNames, paramTypes: ad.paramTypes, paramOptionals: ad.paramOptionals, optimistic: ad.optimistic, headerValid: ad.headerValid, requires: ad.requires, body: ad.body, bodyValid: ad.bodyValid, bodySrc: ad.bodySrc, renameFrom: from, renameTo: to, paramLists: ad.paramLists, ret: ad.ret, retList: ad.retList, retErr: ad.retErr})
+            actions = append(actions, ActionDecl{name: ad.name, paramNames: ad.paramNames, paramTypes: ad.paramTypes, paramOptionals: ad.paramOptionals, optimistic: ad.optimistic, headerValid: ad.headerValid, requires: ad.requires, body: ad.body, bodyValid: ad.bodyValid, bodySrc: ad.bodySrc, renameFrom: from, renameTo: to, paramLists: ad.paramLists, ret: ad.ret, retList: ad.retList, retErr: ad.retErr, internal: ad.internal, standIn: ad.standIn, bodyLineNos: ad.bodyLineNos})
             ai = ai + 1
+        # a derive's call of a private proc names the mangled proc (the
+        # driver re-reads a derive from its text: renamed after each read)
+        let mut derives = []
+        let mut dvi = 0
+        loop dvi < len(prog.derives):
+            let mut dv = prog.derives[dvi]
+            dv.expr = exprRenameCalls(dv.expr, from, to)
+            dv.renameFrom = from
+            dv.renameTo = to
+            derives = append(derives, dv)
+            dvi = dvi + 1
         let mut daemons = []
         let nd = len(prog.daemons)
         let mut di = 0
@@ -3027,7 +3403,7 @@ app DriverSelfHost:
             let dd = prog.daemons[di]
             daemons = append(daemons, DaemonDecl{name: dd.name, every: dd.every, uses: dd.uses, bodySrc: dd.bodySrc, err: dd.err, renameFrom: from, renameTo: to, bodyLineNos: dd.bodyLineNos})
             di = di + 1
-        return Program{name: prog.name, hasAuth: prog.hasAuth, entities: prog.entities, records: prog.records, structs: prog.structs, enums: prog.enums, states: prog.states, derives: prog.derives, policies: prog.policies, procs: procs, actions: actions, webhooks: prog.webhooks, jobs: prog.jobs, services: prog.services, components: prog.components, triggers: prog.triggers, views: views, themes: prog.themes, css: prog.css, daemons: daemons, privateProcs: [], parseErrors: prog.parseErrors, layouts: prog.layouts, rawDecls: prog.rawDecls, kind: prog.kind, into: prog.into, mounts: prog.mounts, sockets: prog.sockets, hasFrame: prog.hasFrame, frameSrc: prog.frameSrc, hasContent: prog.hasContent, contentSrc: prog.contentSrc, unknownKeywords: prog.unknownKeywords, shareds: prog.shareds, expects: prog.expects, expectedRoutes: prog.expectedRoutes, expectedEventNames: prog.expectedEventNames, expectedEventTypes: prog.expectedEventTypes, entityLines: prog.entityLines, stateLines: prog.stateLines, actionLines: prog.actionLines, policyLines: prog.policyLines}
+        return Program{name: prog.name, hasAuth: prog.hasAuth, entities: prog.entities, records: prog.records, structs: prog.structs, enums: prog.enums, states: prog.states, derives: derives, policies: prog.policies, procs: procs, actions: actions, webhooks: prog.webhooks, jobs: prog.jobs, services: prog.services, components: prog.components, triggers: prog.triggers, views: views, themes: prog.themes, css: prog.css, daemons: daemons, privateProcs: [], parseErrors: prog.parseErrors, layouts: prog.layouts, rawDecls: prog.rawDecls, kind: prog.kind, into: prog.into, mounts: prog.mounts, sockets: prog.sockets, hasFrame: prog.hasFrame, frameSrc: prog.frameSrc, hasContent: prog.hasContent, contentSrc: prog.contentSrc, unknownKeywords: prog.unknownKeywords, shareds: prog.shareds, expects: prog.expects, expectedRoutes: prog.expectedRoutes, expectedEventNames: prog.expectedEventNames, expectedEventTypes: prog.expectedEventTypes, entityLines: prog.entityLines, stateLines: prog.stateLines, actionLines: prog.actionLines, policyLines: prog.policyLines}
 
     # ── layered composition: internal/compile/compose.go ───────────────
     proc driverIsLayered(mods: [Program]) -> bool:
@@ -3337,7 +3713,7 @@ app DriverSelfHost:
                 let mut bv = 0
                 loop bv < nbv:
                     let ve = b3.views[bv]
-                    let v = do vpParseView(ve.header, ve.bodySrc)
+                    let v = do vpParseView(ve.header, ve.bodySrc, ve.bodyLineNos)
                     if v.err != "":
                         let e18 = do driverComposeErr(b3, v.err)
                         return e18
@@ -3439,43 +3815,329 @@ app DriverSelfHost:
         let e = fileExists(path)
         return e
 
+    # ── assets (compile/asset.go) ───────────────────────────────────────────
+    # The bundled binary files: content-addressed name, content type,
+    # standard base64 of the bytes (how encoding/json writes []byte).
+    struct DrAssets:
+        names: [text]
+        types: [text]
+        b64: [text]
+
+    struct DrAssetSrc:
+        src: text
+        assets: DrAssets
+        err: text
+
+    # driverAssetExt: the extension of a path as filepath.Ext has it,
+    # lowercased ("" when the base name has no dot).
+    proc driverAssetExt(p: text) -> text:
+        let base = do driverBaseOf(p)
+        let mut i = len(base) - 1
+        loop i >= 0:
+            if charAt(base, i) == ".":
+                return lower(slice(base, i, len(base)))
+            i = i - 1
+        return ""
+
+    # driverMimeType: mime.TypeByExtension over Go's built-in table — the
+    # machine's own mime.types can add more; an extension outside this
+    # table falls back to the octet-stream answer a binary sniff gives.
+    proc driverMimeType(ext: text) -> text:
+        let exts = [".avif", ".css", ".gif", ".htm", ".html", ".jpeg", ".jpg", ".js", ".json", ".mjs", ".pdf", ".png", ".svg", ".wasm", ".webp", ".xml"]
+        let types = ["image/avif", "text/css; charset=utf-8", "image/gif", "text/html; charset=utf-8", "text/html; charset=utf-8", "image/jpeg", "image/jpeg", "text/javascript; charset=utf-8", "application/json", "text/javascript; charset=utf-8", "application/pdf", "image/png", "image/svg+xml", "application/wasm", "image/webp", "text/xml; charset=utf-8"]
+        let at = do lowerFindName(exts, ext)
+        if at >= 0:
+            return types[at]
+        return "application/octet-stream"
+
+    # driverB64Std: standard, padded base64 (encoding/json's []byte) from
+    # the URL-safe unpadded form base64UrlRaw gives.
+    proc driverB64Std(bs: [int]) -> text:
+        let u = base64UrlRaw(bs)
+        let a = replace(u, "-", "+")
+        let mut b = replace(a, "_", "/")
+        loop len(b) % 4 != 0:
+            b = b + "="
+        return b
+
+    # driverReadBytes: the whole file as a byte buffer.
+    proc driverReadBytes(path: text) -> [int] uses io.file:
+        let n = fileSize(path)
+        let b = readFileAt(path, 0, n)
+        return b
+
+    # driverResolveAssets: compile/asset.go's resolveAssets over one
+    # module's source — every `asset from "path"` (outside comments and
+    # strings), the path relative to the module's own directory, becomes
+    # `asset from "<NUL><value>"`: a text file's contents, or for any other
+    # file the /assets/<hash>.<ext> URL it is bundled under (acc gains it).
+    proc driverResolveAssets(root: text, abs: text, src: text, acc0: DrAssets) -> DrAssetSrc:
+        let mut acc = acc0
+        let dir = do driverDirOf(abs)
+        let base = do driverBaseOf(abs)
+        let nul = bytesToText(bytes(1))
+        let textExt = [".txt", ".md", ".markdown", ".csv", ".tsv", ".xml", ".html", ".htm", ".yaml", ".yml", ".toml", ".ini", ".graphql", ".sql", ".json"]
+        let lines = split(src, "\n")
+        let mut outLines = []
+        let mut li = 0
+        loop li < len(lines):
+            let line = lines[li]
+            if indexOf(line, "asset", 0) < 0 || slice(trim(line), 0, 1) == "#":
+                outLines = append(outLines, line)
+                li = li + 1
+                continue
+            let mut out = ""
+            let mut i = 0
+            let n = len(line)
+            loop i < n:
+                let c = charAt(line, i)
+                if c == "\"":
+                    # a string literal, copied whole
+                    let mut j = i + 1
+                    loop j < n && charAt(line, j) != "\"":
+                        if charAt(line, j) == "\\":
+                            j = j + 1
+                        j = j + 1
+                    out = out + slice(line, i, min(j + 1, n))
+                    i = j + 1
+                    continue
+                if c == "#":
+                    out = out + slice(line, i, n)
+                    i = n
+                    continue
+                let startsWord = i == 0 || !driverIsIdentByte(textToBytes(charAt(line, i - 1))[0])
+                if startsWord && slice(line, i, i + 5) == "asset" && (i + 5 >= n || !driverIsIdentByte(textToBytes(charAt(line, i + 5))[0])):
+                    let mut k = i + 5
+                    loop k < n && charAt(line, k) == " ":
+                        k = k + 1
+                    if slice(line, k, k + 4) == "from":
+                        let mut q = k + 4
+                        loop q < n && charAt(line, q) == " ":
+                            q = q + 1
+                        if q < n && charAt(line, q) == "\"":
+                            let mut e = q + 1
+                            loop e < n && charAt(line, e) != "\"":
+                                if charAt(line, e) == "\\":
+                                    e = e + 1
+                                e = e + 1
+                            let lit = slice(line, q, min(e + 1, n))
+                            let u = do goUnquote(lit)
+                            if u.ok && u.value != "":
+                                let isAbs = do vpHasPrefix(u.value, "/")
+                                let mut full = dir + "/" + u.value
+                                if isAbs:
+                                    full = u.value
+                                let clean = do driverCleanPath(full)
+                                let pre = root + "/"
+                                let under = do vpHasPrefix(clean, pre)
+                                let mut exists = false
+                                if under:
+                                    exists = do driverFileExists(slice(clean, len(pre), len(clean)))
+                                if !exists:
+                                    let pq = do goQuote(u.value)
+                                    return DrAssetSrc{src: src, assets: acc, err: base + ": " + (li + 1) + ": asset from " + pq + ": open " + clean + ": no such file or directory"}
+                                let relp = slice(clean, len(pre), len(clean))
+                                let ext = do driverAssetExt(u.value)
+                                let mut value = ""
+                                if ext in textExt:
+                                    value = do driverReadFile(relp)
+                                else:
+                                    let bs = do driverReadBytes(relp)
+                                    let sum = sha256Bytes(bs)
+                                    let hx = toHex(sum)
+                                    let name = slice(hx, 0, 24) + ext
+                                    if !(name in acc.names):
+                                        acc.names = append(acc.names, name)
+                                        acc.types = append(acc.types, driverMimeType(ext))
+                                        acc.b64 = append(acc.b64, driverB64Std(bs))
+                                    value = "/assets/" + name
+                                let rq = do goQuote(nul + value)
+                                out = out + slice(line, i, q) + rq
+                                i = e + 1
+                                continue
+                out = out + c
+                i = i + 1
+            outLines = append(outLines, out)
+            li = li + 1
+        return DrAssetSrc{src: join(outLines, "\n"), assets: acc, err: ""}
+
+    # driverAssetsJVal: the IR's assets map, keys sorted as encoding/json
+    # writes a map.
+    proc driverAssetsJVal(a: DrAssets) -> JVal:
+        let mut keys = a.names
+        let mut idx = []
+        let mut i = 0
+        loop i < len(keys):
+            idx = append(idx, i)
+            i = i + 1
+        # insertion sort by name (a handful of assets)
+        let mut x = 1
+        loop x < len(idx):
+            let mut y = x
+            loop y > 0 && a.names[idx[y - 1]] > a.names[idx[y]]:
+                let t = idx[y]
+                idx[y] = idx[y - 1]
+                idx[y - 1] = t
+                y = y - 1
+            x = x + 1
+        let mut ks = []
+        let mut vs = []
+        let mut z = 0
+        loop z < len(idx):
+            let at = idx[z]
+            ks = append(ks, a.names[at])
+            let ct = JVal{kind: "str", s: a.types[at], keys: [], vals: []}
+            let bv = JVal{kind: "str", s: a.b64[at], keys: [], vals: []}
+            vs = append(vs, JVal{kind: "obj", s: "", keys: ["contentType", "bytes"], vals: [ct, bv]})
+            z = z + 1
+        return JVal{kind: "obj", s: "", keys: ks, vals: vs}
+
+    # DrModCache: every module this driver process has parsed, by its
+    # path and its whole (asset-resolved) source — the module's parse,
+    # private-proc mangling and expect stamping (driverModule), which are a
+    # function of exactly those two. A program importing a module another
+    # program already imported reuses it instead of parsing it again; a
+    # file whose content changed is a different key, so it is parsed anew.
+    struct DrModCache:
+        at: {text: int}
+        progs: [Program]
+
+    # driverModCache: the process's DrModCache, reset by the on-start job
+    # before any compile reads it.
+    shared driverModCache: DrModCache
+
+    proc driverModCacheReset() -> int:
+        driverModCache = DrModCache{at: {}, progs: []}
+        return 0
+
+    # driverModCacheSize: how many modules the cache holds.
+    proc driverModCacheSize() -> int:
+        let c = driverModCache
+        return len(c.progs)
+
+    action driverModCacheInit @internal:
+        let z = do driverModCacheReset()
+
+    job driverModCacheJob on start -> driverModCacheInit
+
+    # driverModule: one module's per-file front end — parse, mangle its
+    # private procs by its path, stamp its expects with its file name.
+    proc driverModule(abs: text, src: text) -> Program:
+        let p0 = do parseProgramSrc(src)
+        let p1m = do driverMangle(p0, abs)
+        let mut p1 = do driverStampExpects(p1m, driverBaseOf(abs))
+        # parser.go reads every view, component and layout body with the
+        # file: a node it cannot parse is a parse error of the file, at its
+        # line, in source order with the others
+        let mut errs = p1.parseErrors
+        let mut vi = 0
+        loop vi < len(p1.views):
+            let vv = do vpParseView(p1.views[vi].header, p1.views[vi].bodySrc, p1.views[vi].bodyLineNos)
+            if vv.err != "":
+                errs = driverInsertByLine(errs, driverLineMsg(p1.views[vi].lineNo, vv.err))
+            vi = vi + 1
+        let mut ci = 0
+        loop ci < len(p1.components):
+            let vc = do vpParseComponent(p1.components[ci].headerLine, p1.components[ci].bodySrc, p1.components[ci].bodyLineNos)
+            if vc.err != "":
+                errs = driverInsertByLine(errs, driverLineMsg(p1.components[ci].lineNo, vc.err))
+            ci = ci + 1
+        let mut li = 0
+        loop li < len(p1.layouts):
+            let vl = do vpParseLayout(p1.layouts[li].headerLine, p1.layouts[li].bodySrc, p1.layouts[li].bodyLineNos)
+            if vl.err != "":
+                errs = driverInsertByLine(errs, driverLineMsg(p1.layouts[li].lineNo, vl.err))
+            li = li + 1
+        # compile.go names the file a parse error is in: "base: line N: …"
+        let base = do driverBaseOf(abs)
+        let mut pe = []
+        let mut i = 0
+        loop i < len(errs):
+            pe = append(pe, base + ": " + errs[i])
+            i = i + 1
+        p1.parseErrors = pe
+        return p1
+
+    # driverLineOf: the N of a "line N: …" message, 0 when it names none.
+    proc driverLineOf(msg: text) -> int:
+        let named = do alowNamesLine(msg)
+        if !named:
+            return 0
+        let colon = indexOf(msg, ": ", 5)
+        return toInt(slice(msg, 5, colon))
+
+    # driverInsertByLine: errs (in source order) with msg placed after
+    # every error at or before its line.
+    proc driverInsertByLine(errs: [text], msg: text) -> [text]:
+        let at = do driverLineOf(msg)
+        let mut out = []
+        let mut placed = false
+        let mut i = 0
+        loop i < len(errs):
+            if !placed && at > 0 && driverLineOf(errs[i]) > at:
+                out = append(out, msg)
+                placed = true
+            out = append(out, errs[i])
+            i = i + 1
+        if !placed:
+            out = append(out, msg)
+        return out
+
     proc compileFileJSON(root: text, rel: text) -> text:
         let entry = do driverCleanPath(root + "/" + rel)
         let col = do driverCollect(root, entry, [], [])
         if col.err != "":
-            let q0 = do jsonQuote(col.err)
+            let q0 = jsonQuote(col.err)
             return "{\"error\":" + q0 + "}"
         let mut mods = []
         let n = len(col.mods)
+        let mut assets = DrAssets{names: [], types: [], b64: []}
+        let mut cache = driverModCache
+        let mut fresh = false
         let mut i = 0
         loop i < n:
-            let p0 = do parseProgramSrc(col.mods[i].src)
-            let p1m = do driverMangle(p0, col.mods[i].abs)
-            let p1 = do driverStampExpects(p1m, driverBaseOf(col.mods[i].abs))
+            let ras = do driverResolveAssets(root, col.mods[i].abs, col.mods[i].src, assets)
+            if ras.err != "":
+                let qa = jsonQuote(ras.err)
+                return "{\"error\":" + qa + "}"
+            assets = ras.assets
+            let key = col.mods[i].abs + "\n" + ras.src
+            let mut at = -1
+            if key in cache.at:
+                at = cache.at[key]
+            else:
+                let pm = do driverModule(col.mods[i].abs, ras.src)
+                at = len(cache.progs)
+                cache.at[key] = at
+                cache.progs = append(cache.progs, pm)
+                fresh = true
+            let p1 = cache.progs[at]
             if len(p1.parseErrors) > 0:
                 mods = append(mods, p1)
                 i = i + 1
                 continue
             let cf = do driverCSSFrom(root, col.mods[i].abs, p1)
             if cf.err != "":
-                let qf = do jsonQuote(cf.err)
+                let qf = jsonQuote(cf.err)
                 return "{\"error\":" + qf + "}"
             mods = append(mods, cf.prog)
             i = i + 1
+        if fresh:
+            driverModCache = cache
         let layered = do driverIsLayered(mods)
         let mut out = do driverEmptyOut(mods[0])
         if layered:
             let comp = do driverCompose(mods)
             if comp.err != "":
-                let qc = do jsonQuote(comp.err)
+                let qc = jsonQuote(comp.err)
                 return "{\"error\":" + qc + "}"
             let rxc = do driverResolveExpects(comp.prog)
             if rxc.err != "":
-                let qx = do jsonQuote(rxc.err)
+                let qx = jsonQuote(rxc.err)
                 return "{\"error\":" + qx + "}"
             let dupC = do driverCheckDuplicates(rxc.prog)
             if dupC != "":
-                let qd = do jsonQuote(dupC)
+                let qd = jsonQuote(dupC)
                 return "{\"error\":" + qd + "}"
             let o1 = do compileProgramV(rxc.prog, true, comp.views)
             out = o1
@@ -3487,7 +4149,7 @@ app DriverSelfHost:
                 fi = fi + 1
             let rc = do driverRouteCollisions(mods, files)
             if rc != "":
-                let qr = do jsonQuote(rc)
+                let qr = jsonQuote(rc)
                 return "{\"error\":" + qr + "}"
             let mut prog = mods[0]
             let mut k = 1
@@ -3497,25 +4159,33 @@ app DriverSelfHost:
                 k = k + 1
             let rx = do driverResolveExpects(prog)
             if rx.err != "":
-                let qx2 = do jsonQuote(rx.err)
+                let qx2 = jsonQuote(rx.err)
                 return "{\"error\":" + qx2 + "}"
             let dup = do driverCheckDuplicates(rx.prog)
             if dup != "":
-                let qd2 = do jsonQuote(dup)
+                let qd2 = jsonQuote(dup)
                 return "{\"error\":" + qd2 + "}"
             let o2 = do compileProgram(rx.prog)
             out = o2
         if out.err != "":
-            let q = do jsonQuote(out.err)
+            let q = jsonQuote(out.err)
             return "{\"error\":" + q + "}"
-        let j = do irGraphJSON(out.graph)
+        let mut graph = out.graph
+        if len(assets.names) > 0:
+            graph.assets = driverAssetsJVal(assets)
+        let j = do irGraphJSON(graph)
         return j
 
     state compiledOut: text = ""
 
+    # cachedModules: driverModCacheSize after the last runCompileFile.
+    state cachedModules: int = 0
+
     action runCompileFile(root: text, rel: text):
         let out = do compileFileJSON(root, rel)
+        let k = do driverModCacheSize()
         compiledOut = out
+        cachedModules = k
 
     action runCompileSrc(src: text):
         let out = do compileSrc(src)

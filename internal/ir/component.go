@@ -141,6 +141,10 @@ func componentBinders(cm *ast.Component) map[string]bool {
 			if t.Sel != nil {
 				expr(t.Sel)
 			}
+			// `list(… by <expr> limit n)`: the key can hold an aggregate of
+			// its own, whose item variable is a binder like any other.
+			expr(t.OrderExpr)
+			expr(t.Limit)
 		case ast.Call:
 			for _, a := range t.Args {
 				expr(a)
@@ -174,6 +178,7 @@ func componentBinders(cm *ast.Component) map[string]bool {
 			if o.From != nil {
 				out[o.From.Var] = true
 				expr(o.From.Where)
+				expr(o.From.OrderExpr)
 				expr(o.From.Limit)
 			}
 		}
@@ -224,6 +229,8 @@ func componentBinders(cm *ast.Component) map[string]bool {
 				segs(t.Placeholder)
 			case ast.Upload:
 				segs(t.Label)
+			case ast.Camera:
+				segs(t.Label)
 			case ast.Select:
 				options(t.Options)
 			case ast.Form:
@@ -237,6 +244,7 @@ func componentBinders(cm *ast.Component) map[string]bool {
 				if t.Where != nil {
 					expr(t.Where)
 				}
+				expr(t.OrderExpr)
 				if t.Limit != nil {
 					expr(t.Limit)
 				}
@@ -370,6 +378,10 @@ func substNode(n ast.Node, m map[string]string) ast.Node {
 		t.Bind = rename(t.Bind, m)
 		t.Label = substSegs(t.Label, m)
 		return t
+	case ast.Camera:
+		t.Bind = rename(t.Bind, m)
+		t.Label = substSegs(t.Label, m)
+		return t
 	case ast.Typeahead:
 		t.Bind = rename(t.Bind, m)
 		t.Placeholder = substSegs(t.Placeholder, m)
@@ -405,6 +417,7 @@ func substNode(n ast.Node, m map[string]string) ast.Node {
 		t.Var = rename(t.Var, m)
 		t.Coll = rename(t.Coll, m)
 		t.Where = substExpr(t.Where, m)
+		t.OrderExpr = substExpr(t.OrderExpr, m)
 		t.Limit = substExpr(t.Limit, m)
 		t.Body = substNodes(t.Body, m)
 		return t
@@ -446,6 +459,7 @@ func substOptions(in []ast.Option, m map[string]string) []ast.Option {
 			rg.Var = rename(rg.Var, m)
 			rg.Coll = rename(rg.Coll, m)
 			rg.Where = substExpr(rg.Where, m)
+			rg.OrderExpr = substExpr(rg.OrderExpr, m)
 			rg.Limit = substExpr(rg.Limit, m)
 			o.From = &rg
 		}
@@ -501,6 +515,8 @@ func substExpr(ex ast.Expr, m map[string]string) ast.Expr {
 		t.Coll = rename(t.Coll, m)
 		t.Where = substExpr(t.Where, m)
 		t.Sel = substExpr(t.Sel, m)
+		t.OrderExpr = substExpr(t.OrderExpr, m)
+		t.Limit = substExpr(t.Limit, m)
 		return t
 	case ast.Call:
 		t.Args = substExprs(t.Args, m)

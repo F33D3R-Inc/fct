@@ -196,9 +196,14 @@ fn variant(e: &FacetqlError) -> &'static str {
     }
 }
 
-/// `ERR <variant> <implies_unhealthy> <Display>` — fqlErrLine.
+/// `ERR <variant> <implies_unhealthy> <Display>`, and ` retry-after=N` for a
+/// Status that carried one — fqlErrLine.
 fn err_line(e: &FacetqlError) -> String {
-    format!("ERR {} {} {}", variant(e), e.implies_unhealthy(), e)
+    let retry = match e {
+        FacetqlError::Status { retry_after_secs: Some(secs), .. } => format!(" retry-after={secs}"),
+        _ => String::new(),
+    };
+    format!("ERR {} {} {}{retry}", variant(e), e.implies_unhealthy(), e)
 }
 
 fn nodes_json(nodes: &[Node]) -> String {
@@ -641,10 +646,25 @@ pub fn run(mode: &str) {
                     "PreconditionFailed" => FacetqlError::PreconditionFailed(a),
                     "Conflict" => FacetqlError::Conflict(a),
                     "NotFound" => FacetqlError::NotFound(a),
-                    "Status" => FacetqlError::Status { status, body: a },
+                    "Status" => FacetqlError::Status {
+                        status,
+                        body: a,
+                        retry_after_secs: fabric_facetql::client::retry_after_secs((!b.is_empty()).then_some(b.as_str())),
+                    },
                     _ => FacetqlError::Decode { context: a, message: b },
                 };
                 println!("{}", err_line(&e));
+            }
+        }
+        // Each stdin line a Retry-After value (`-`: no header): the
+        // client's delay-seconds, or `-`.
+        "fql-retry-after" => {
+            for line in lines() {
+                let value = (line != "-").then_some(line.as_str());
+                match fabric_facetql::client::retry_after_secs(value) {
+                    Some(secs) => println!("{secs}"),
+                    None => println!("-"),
+                }
             }
         }
         "fql-mover" => {

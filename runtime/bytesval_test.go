@@ -225,3 +225,21 @@ func TestByteLevelBuiltins(t *testing.T) {
 		t.Error("fromHex of non-hex is empty")
 	}
 }
+
+// A byte buffer concatenated with a list of bytes, either side, stays a
+// byte buffer; with a list holding a non-byte it is the plain list.
+func TestBytesConcatStaysNative(t *testing.T) {
+	for _, c := range []struct{ l, r any }{{bytesVal{1}, []any{2, 3}}, {[]any{0}, bytesVal{9}}, {bytesVal{1}, bytesVal{}}} {
+		v := applyBin("+", c.l, c.r)
+		if _, ok := v.(bytesVal); !ok {
+			t.Errorf("%v + %v = %T, want a byte buffer", c.l, c.r, v)
+		}
+	}
+	v := applyBin("+", bytesVal{1}, []any{300})
+	if xs, ok := v.([]any); !ok || len(xs) != 2 || xs[1] != 300 {
+		t.Errorf("a non-byte element keeps the list: %#v", v)
+	}
+	if !equal(applyBin("+", bytesVal{1}, []any{2}), []any{1, 2}) {
+		t.Error("same value either way")
+	}
+}

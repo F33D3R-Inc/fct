@@ -115,7 +115,23 @@ app ActionLowerSelfHost:
     #   action() never copies it into ir.Action, so neither does this port
     #   (see lowerActionSrc's closing note).
     struct ALowEnv:
+        # lineNos: each body line's source line number ([] when unknown) —
+        # what a statement's refusal names (build.go's BuildError line)
+        lineNos: [int]
         stateNames: [text]
+        # curAction: the action being lowered; runNames/…: every declared
+        # action's signature (build.go's e.astActions), what `run` may name.
+        curAction: text
+        # standIn: the action being lowered stands in for an `expect action`
+        # (ast.Action.StandIn) — server-placed, though its body is empty
+        standIn: bool
+        runNames: [text]
+        runParamCounts: [int]
+        # runRequired: each action's required arity (requiredAstArity: up
+        # to its last non-optional parameter) — a run may omit the rest
+        runRequired: [int]
+        runRets: [text]
+        runRetLists: [bool]
         # stateDeclPlacements: the cells' declared placements (see
         # check.fct's CallEnv), parallel to stateNames.
         stateDeclPlacements: [text]
@@ -137,6 +153,8 @@ app ActionLowerSelfHost:
         serviceRets: [text]
         serviceRetLists: [bool]
         procNames: [text]
+        # procAt: proc name -> its (first) index in procNames
+        procAt: {text: int}
         procParamCounts: [int]
         procRets: [text]
         procRetLists: [bool]
@@ -210,7 +228,9 @@ app ActionLowerSelfHost:
     # alowRecordBound: a with `name` bound to a record (locRecords), when
     # ret is one.
     private proc alowRecordBound(a: ALowAcc, name: text, ret: text, retList: bool, env: ALowEnv) -> ALowAcc:
-        if !(ret in env.recordNames):
+        # a record — or a proc struct, which crosses into the action as the
+        # record its fields spell — is read field by field
+        if !(ret in env.recordNames) && !(ret in env.structNames):
             return a
         let mut l = ret
         if retList:
@@ -220,7 +240,7 @@ app ActionLowerSelfHost:
 
     # alowEnvScoped: env with the typed locals of the statement at hand.
     private proc alowEnvScoped(env: ALowEnv, tsc: TyScope) -> ALowEnv:
-        return ALowEnv{stateNames: env.stateNames, stateDeclPlacements: env.stateDeclPlacements, actionNames: env.actionNames, statePlacements: env.statePlacements, entityNames: env.entityNames, entityFields: env.entityFields, entityDerives: env.entityDerives, enumNames: env.enumNames, policyNames: env.policyNames, policyParamCounts: env.policyParamCounts, inlineNames: env.inlineNames, inlineExprs: env.inlineExprs, serviceNames: env.serviceNames, serviceOps: env.serviceOps, serviceArgCounts: env.serviceArgCounts, serviceRets: env.serviceRets, serviceRetLists: env.serviceRetLists, procNames: env.procNames, procParamCounts: env.procParamCounts, procRets: env.procRets, procRetLists: env.procRetLists, structNames: env.structNames, renameFrom: env.renameFrom, renameTo: env.renameTo, e2eFields: env.e2eFields, actionParams: env.actionParams, wireTypes: env.wireTypes, actionName: env.actionName, actionRet: env.actionRet, recordNames: env.recordNames, low: env.low, privateStates: env.privateStates, ty: env.ty, tsc: tsc}
+        return ALowEnv{lineNos: env.lineNos, stateNames: env.stateNames, stateDeclPlacements: env.stateDeclPlacements, actionNames: env.actionNames, statePlacements: env.statePlacements, entityNames: env.entityNames, entityFields: env.entityFields, entityDerives: env.entityDerives, enumNames: env.enumNames, policyNames: env.policyNames, policyParamCounts: env.policyParamCounts, inlineNames: env.inlineNames, inlineExprs: env.inlineExprs, serviceNames: env.serviceNames, serviceOps: env.serviceOps, serviceArgCounts: env.serviceArgCounts, serviceRets: env.serviceRets, serviceRetLists: env.serviceRetLists, procNames: env.procNames, procAt: env.procAt, procParamCounts: env.procParamCounts, procRets: env.procRets, procRetLists: env.procRetLists, structNames: env.structNames, renameFrom: env.renameFrom, renameTo: env.renameTo, e2eFields: env.e2eFields, actionParams: env.actionParams, wireTypes: env.wireTypes, actionName: env.actionName, actionRet: env.actionRet, recordNames: env.recordNames, low: env.low, privateStates: env.privateStates, ty: env.ty, tsc: tsc, curAction: env.curAction, runNames: env.runNames, runParamCounts: env.runParamCounts, runRets: env.runRets, runRetLists: env.runRetLists, standIn: env.standIn, runRequired: env.runRequired}
 
     private proc alowFail(a: ALowAcc, msg: text) -> ALowAcc:
         return ALowAcc{body: a.body, err: msg, writes: a.writes, reads: a.reads, entWrite: a.entWrite, impure: a.impure, usesPrint: a.usesPrint, callsService: a.callsService, callsProc: a.callsProc, establishesID: a.establishesID, locals: a.locals, seal: a.seal, usesSecret: a.usesSecret, emits: a.emits, setsHeader: a.setsHeader, tsc: a.tsc}
@@ -419,7 +439,7 @@ app ActionLowerSelfHost:
             fnNames = append(fnNames, env.low.fns[fi].name)
             fnArities = append(fnArities, len(env.low.fns[fi].params))
             fi = fi + 1
-        let ce = CallEnv{fnNames: fnNames, fnArities: fnArities, procNames: env.procNames, procArities: env.procParamCounts, procDerives: [], listNames: [], jsonNames: [], deriveKeys: env.entityDerives, inAction: true, inDerive: false, inProc: false, ty: env.ty, tsc: env.tsc, actionNames: env.actionNames, stateNames: env.stateNames, stateDeclPlacements: env.stateDeclPlacements}
+        let ce = CallEnv{fnNames: fnNames, fnArities: fnArities, procNames: env.procNames, procAt: env.procAt, procArities: env.procParamCounts, procDerives: [], listNames: [], jsonNames: [], deriveKeys: env.entityDerives, inAction: true, inDerive: false, inProc: false, ty: env.ty, tsc: env.tsc, actionNames: env.actionNames, stateNames: env.stateNames, stateDeclPlacements: env.stateDeclPlacements}
         let sd = do exprStructureDiag(n, env.entityNames, env.entityFields, ce)
         if sd != "":
             return sd
@@ -647,7 +667,7 @@ app ActionLowerSelfHost:
             a = rm
             let km = do alowLow(mx.node, env)
             key = [km]
-        let st = IRStmt{op: st0.op, target: s.target, entity: "", field: "", key: key, value: st0.value, fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: st0.msg, status: s.status, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+        let st = IRStmt{op: st0.op, target: s.target, entity: "", field: "", key: key, value: st0.value, fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", orderBy: [], desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: st0.msg, status: s.status, body: [], elseBody: [], bytesFlag: false, file: "", path: "", retMap: false, retDepth: 0}
         let out = do alowEmit(a, st)
         return out
 
@@ -777,7 +797,7 @@ app ActionLowerSelfHost:
     # alowServerOnlyBuiltins: every builtin internal/parser/builtins.go does
     # not mark SiteEverywhere — the ones the browser has no mirror of.
     private proc alowServerOnlyBuiltins() -> [text]:
-        return ["print", "given", "floatBits", "floatFromBits", "exp", "ln", "sqrt", "verifyPassword", "totpSecret", "totpValid", "randomToken", "fileDigest", "ed25519Verify", "ecdsaP256Verify", "sha256Hex", "canonicalJson", "shuffleOrder", "u64Cmp", "u64Min", "u64Max", "u64SatSub", "u64Div", "u64Rem", "u64Text", "u64Parse", "u64ParseError", "u64ToFloat", "fromLocal", "formatIn", "zoneValid", "append", "bytes", "textToBytes", "bytesToText", "aesGcmSeal", "aesGcmOpen", "aesGcmAuthentic", "randomBytes", "indexOf", "sha256Bytes", "hmacSha256", "base64UrlRaw", "bcryptHash", "bcryptMatches", "readFile", "writeFile", "appendFile", "fileExists", "truncateFile", "fileSize", "fileModTime", "readFileAt", "writeFileAt", "syncFile", "renameFile", "removeFile", "lockFile", "crc32", "listenerPort", "bytesCmp", "bytesCmpRange", "uintLE", "toHex", "fromHex", "httpGet", "httpPost", "listen", "listenOn", "accept", "connect", "connectTls", "readBytes", "writeBytes", "closeConn", "setTimeoutMs", "connError", "pollBytes", "connOpen", "shutdownConn", "closeListener", "listenError", "grantRead", "writeStdout", "writeStderr", "readStdin", "envVar", "envSet", "channel", "send", "recv", "sleepMs", "monoMs", "nowMs", "signals", "awaitAny", "closeChannel", "exitProcess", "processStats", "listenTls", "connPeer"]
+        return ["print", "given", "floatBits", "floatFromBits", "exp", "ln", "sqrt", "sin", "cos", "verifyPassword", "totpSecret", "totpValid", "randomToken", "fileDigest", "ed25519Verify", "ecdsaP256Verify", "sha256Hex", "canonicalJson", "shuffleOrder", "u64Cmp", "u64Min", "u64Max", "u64SatSub", "u64Div", "u64Rem", "u64Text", "u64Parse", "u64ParseError", "u64ToFloat", "fromLocal", "formatIn", "zoneValid", "append", "bytes", "textToBytes", "bytesToText", "aesGcmSeal", "aesGcmOpen", "aesGcmAuthentic", "randomBytes", "p256PrivateKey", "p256PublicKey", "p256Ecdh", "es256Sign", "fromBase64UrlRaw", "httpSend", "uploadBytes", "validUtf8", "jsonQuote", "grantDir", "listDir", "makeDir", "readStdinLine", "sha256Bytes", "hmacSha256", "base64UrlRaw", "bcryptHash", "bcryptMatches", "readFile", "writeFile", "appendFile", "fileExists", "truncateFile", "fileSize", "fileModTime", "readFileAt", "writeFileAt", "syncFile", "renameFile", "removeFile", "lockFile", "crc32", "bytesPut", "listenerPort", "bytesCmp", "bytesCmpRange", "uintLE", "toHex", "fromHex", "httpGet", "httpPost", "listen", "listenOn", "accept", "connect", "connectTls", "readBytes", "writeBytes", "closeConn", "setTimeoutMs", "connError", "pollBytes", "connOpen", "shutdownConn", "closeWrite", "closeListener", "listenError", "grantRead", "writeStdout", "writeStderr", "readStdin", "envVar", "envSet", "channel", "send", "trySend", "recv", "sleepMs", "monoMs", "nowMs", "signals", "awaitAny", "closeChannel", "exitProcess", "processStats", "listenTls", "connPeer"]
 
     # alowExprFirstCall / alowStmtsFirstCall: build.go's stmtsCall — the
     # first call (same walk order) whose name is in names, or "".
@@ -859,7 +879,7 @@ app ActionLowerSelfHost:
         if read.err != "":
             return read
         let v = do alowLow(s.value, env)
-        let st = IRStmt{op: "return", target: "", entity: "", field: "", key: [], value: [v], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: s.status, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+        let st = IRStmt{op: "return", target: "", entity: "", field: "", key: [], value: [v], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", orderBy: [], desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: s.status, body: [], elseBody: [], bytesFlag: false, file: "", path: "", retMap: false, retDepth: 0}
         let out = do alowEmit(read, st)
         return out
 
@@ -909,7 +929,7 @@ app ActionLowerSelfHost:
             onArgs = append(onArgs, ol)
             oi = oi + 1
         let marked = do alowMarkEmits(acc)
-        let st = IRStmt{op: "emit", target: s.event, entity: "", field: typ, key: key, value: [v], fieldNames: [], fieldExprs: [], service: "", args: onArgs, itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+        let st = IRStmt{op: "emit", target: s.event, entity: "", field: typ, key: key, value: [v], fieldNames: [], fieldExprs: [], service: "", args: onArgs, itemVar: "", where: [], order: "", orderBy: [], desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: "", retMap: false, retDepth: 0}
         let out = do alowEmit(marked, st)
         return out
 
@@ -925,7 +945,7 @@ app ActionLowerSelfHost:
             return rr
         let who = do alowLow(s.actor, env)
         let role = do alowLow(s.role, env)
-        let st = IRStmt{op: "restate", target: "", entity: "", field: "", key: [], value: [who], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [role], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+        let st = IRStmt{op: "restate", target: "", entity: "", field: "", key: [], value: [who], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", orderBy: [], desc: false, limit: [], bind: "", ret: "", retList: false, role: [role], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: "", retMap: false, retDepth: 0}
         let out = do alowEmit(rr, st)
         return out
 
@@ -998,7 +1018,7 @@ app ActionLowerSelfHost:
             di = di + 1
         let canon = do alowCanonicalHeader(s.field)
         let marked = ALowAcc{body: rv.body, err: rv.err, writes: rv.writes, reads: rv.reads, entWrite: rv.entWrite, impure: rv.impure, usesPrint: rv.usesPrint, callsService: rv.callsService, callsProc: rv.callsProc, establishesID: rv.establishesID, locals: rv.locals, seal: rv.seal, usesSecret: rv.usesSecret, emits: rv.emits, setsHeader: true, tsc: tyEmptyScope()}
-        let st = IRStmt{op: "header", target: "", entity: "", field: "", key: [], value: [v], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: canon, status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+        let st = IRStmt{op: "header", target: "", entity: "", field: "", key: [], value: [v], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", orderBy: [], desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: canon, status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: "", retMap: false, retDepth: 0}
         let out = do alowEmit(marked, st)
         return out
 
@@ -1008,7 +1028,7 @@ app ActionLowerSelfHost:
         if read.err != "":
             return read
         let v = do alowLow(s.value, env)
-        let st = IRStmt{op: "revoke", target: "", entity: "", field: "", key: [], value: [v], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+        let st = IRStmt{op: "revoke", target: "", entity: "", field: "", key: [], value: [v], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", orderBy: [], desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: "", retMap: false, retDepth: 0}
         let out = do alowEmit(read, st)
         return out
 
@@ -1250,7 +1270,47 @@ app ActionLowerSelfHost:
         if at < 0:
             return s
         let name = env.renameTo[at]
-        return ActionStmt{kind: s.kind, lineIdx: s.lineIdx, cond: s.cond, msg: s.msg, policyName: s.policyName, policyArgs: s.policyArgs, entity: s.entity, key: s.key, field: s.field, value: s.value, itemVar: s.itemVar, fieldNames: s.fieldNames, fieldValues: s.fieldValues, serviceName: s.serviceName, opName: s.opName, callArgs: s.callArgs, procName: name, bindName: s.bindName, actor: s.actor, hasRole: s.hasRole, role: s.role, target: s.target, exprCall: s.exprCall, orderField: s.orderField, orderDesc: s.orderDesc, limit: s.limit, hasLimit: s.hasLimit, body: s.body, elseBody: s.elseBody, valid: s.valid, status: s.status, hasValue: s.hasValue, event: s.event, hasTo: s.hasTo}
+        return ActionStmt{kind: s.kind, lineIdx: s.lineIdx, cond: s.cond, msg: s.msg, policyName: s.policyName, policyArgs: s.policyArgs, entity: s.entity, key: s.key, field: s.field, value: s.value, itemVar: s.itemVar, fieldNames: s.fieldNames, fieldValues: s.fieldValues, serviceName: s.serviceName, opName: s.opName, callArgs: s.callArgs, procName: name, bindName: s.bindName, actor: s.actor, hasRole: s.hasRole, role: s.role, target: s.target, exprCall: s.exprCall, orderField: s.orderField, orderDesc: s.orderDesc, orderExpr: s.orderExpr, limit: s.limit, hasLimit: s.hasLimit, body: s.body, elseBody: s.elseBody, valid: s.valid, status: s.status, hasValue: s.hasValue, event: s.event, hasTo: s.hasTo}
+
+    # alowRun: build.go's ast.RunAction arm — another action inside this
+    # one's transaction; it runs on the authority, so this action does too.
+    private proc alowRun(a: ALowAcc, s: ActionStmt, env: ALowEnv) -> ALowAcc:
+        let name = s.procName
+        let at = do lowerFindName(env.runNames, name)
+        let nq = do goQuote(name)
+        if at < 0:
+            let f1 = do alowFail(a, "run names unknown action " + nq)
+            return f1
+        if name == env.curAction:
+            let f2 = do alowFail(a, "action " + nq + " runs itself — an action cannot run itself")
+            return f2
+        let argc = env.runParamCounts[at]
+        if len(s.callArgs) < env.runRequired[at] || len(s.callArgs) > argc:
+            let f3 = do alowFail(a, "action " + nq + " expects " + argc + " argument(s), got " + len(s.callArgs))
+            return f3
+        let flagged = do alowFlags(a, false, false, false, false, true, false)
+        let readArgs = do alowArgs(flagged, s.callArgs, env)
+        if readArgs.err != "":
+            return readArgs
+        let mut acc = readArgs
+        let mut ret = ""
+        let mut retList = false
+        if s.bindName != "":
+            let calleeRet = env.runRets[at]
+            if calleeRet == "":
+                let f4 = do alowFail(acc, "action " + nq + " returns nothing — declare `-> Type` on it to bind its result")
+                return f4
+            let bound = do alowBindLocal(acc, s.bindName, "the bound result", env)
+            if bound.err != "":
+                return bound
+            ret = calleeRet
+            retList = env.runRetLists[at]
+            acc = do alowRecordBound(bound, s.bindName, ret, retList, env)
+        let args = do alowLowList(s.callArgs, env)
+        let mut st = do irDo(name, args, s.bindName, ret, retList)
+        st.op = "run"
+        let out = do alowEmit(acc, st)
+        return out
 
     private proc alowDo(a: ALowAcc, s0: ActionStmt, env: ALowEnv) -> ALowAcc:
         let s = do alowRenamed(s0, env)
@@ -1274,17 +1334,39 @@ app ActionLowerSelfHost:
             if sigRet == "":
                 let f3 = do alowFail(acc, "proc \"" + s.procName + "\" returns nothing — declare a return type (`proc " + s.procName + "(...) -> Type`) to bind it")
                 return f3
-            if sigRet in env.structNames:
-                let f5 = do alowFail(acc, "proc \"" + s.procName + "\" returns " + sigRet + ", a struct type usable only inside another proc — an action cannot bind it (structs are proc-local values, with no schema/wire representation yet; see LANGUAGE.md's `proc` section). Read its fields inside the proc and give \"" + s.procName + "\" a scalar/list return type instead")
-                return f5
             let bound = do alowBindLocal(acc, s.bindName, "the bound result", env)
             if bound.err != "":
                 return bound
             ret = sigRet
             retList = env.procRetLists[at]
             acc = do alowRecordBound(bound, s.bindName, ret, retList, env)
+            # build.go: actLocalTypes[bind] = {ret, retList} — a list a proc
+            # answered can be ranged by an aggregate
+            let mut bl = ret
+            if len(ret) > 4 && slice(ret, 0, 4) == "map:":
+                let rest0 = slice(ret, 4, len(ret))
+                bl = slice(rest0, indexOf(rest0, ":", 0) + 1, len(rest0))
+            if retList:
+                bl = "[" + bl + "]"
+            acc = do alowTyped(acc, s.bindName, bl)
         let args = do alowLowList(s.callArgs, env)
-        let st = do irDo(s.procName, args, s.bindName, ret, retList)
+        # a `{K: V}` return rides the signature as "map:K:V": the IR records
+        # V and retMap (build.go's ds.Ret / ds.RetMap)
+        let mut retCore = ret
+        let mut retMap = false
+        if len(ret) > 4 && slice(ret, 0, 4) == "map:":
+            let rest = slice(ret, 4, len(ret))
+            retCore = slice(rest, indexOf(rest, ":", 0) + 1, len(rest))
+            retMap = true
+        # a nested list return rides the signature as its element `[T]`:
+        # the IR records T and the depth (build.go's ds.RetDepth)
+        let mut retDepth = 0
+        if retList && len(retCore) > 0 && slice(retCore, 0, 1) == "[":
+            retDepth = nestedDepth(retCore)
+            retCore = nestedBase(retCore)
+        let mut st = do irDo(s.procName, args, s.bindName, retCore, retList)
+        st.retMap = retMap
+        st.retDepth = retDepth
         let out = do alowEmit(acc, st)
         return out
 
@@ -1362,7 +1444,7 @@ app ActionLowerSelfHost:
             # `for x in names:` over a list-valued local or parameter — each
             # element in order, the body run once per element.
             let hasWhere0 = s.cond.kind != "int" || s.cond.text != "0"
-            if hasWhere0 || s.orderField != "" || s.hasLimit:
+            if hasWhere0 || s.orderField != "" || len(s.orderExpr) > 0 || s.hasLimit:
                 let fl = do alowFail(a, "`for " + s.itemVar + " in " + s.entity + "` walks a list value; where/by/limit filter an entity's rows — shape the list before the loop")
                 return fl
             let outer0 = a.body
@@ -1382,7 +1464,7 @@ app ActionLowerSelfHost:
                 return bout0
             let collRef = do irRef(s.entity)
             let fe0 = do irStmt("foreach")
-            let fe = IRStmt{op: "foreach", target: fe0.target, entity: fe0.entity, field: fe0.field, key: fe0.key, value: [collRef], fieldNames: fe0.fieldNames, fieldExprs: fe0.fieldExprs, service: fe0.service, args: fe0.args, itemVar: s.itemVar, where: fe0.where, order: fe0.order, desc: fe0.desc, limit: fe0.limit, bind: fe0.bind, ret: fe0.ret, retList: fe0.retList, role: fe0.role, msg: fe0.msg, status: fe0.status, body: bout0.body, elseBody: fe0.elseBody, bytesFlag: fe0.bytesFlag, file: fe0.file, path: fe0.path}
+            let fe = IRStmt{op: "foreach", target: fe0.target, entity: fe0.entity, field: fe0.field, key: fe0.key, value: [collRef], fieldNames: fe0.fieldNames, fieldExprs: fe0.fieldExprs, service: fe0.service, args: fe0.args, itemVar: s.itemVar, where: fe0.where, order: fe0.order, orderBy: fe0.orderBy, desc: fe0.desc, limit: fe0.limit, bind: fe0.bind, ret: fe0.ret, retList: fe0.retList, role: fe0.role, msg: fe0.msg, status: fe0.status, body: bout0.body, elseBody: fe0.elseBody, bytesFlag: fe0.bytesFlag, file: fe0.file, path: fe0.path, retMap: false, retDepth: 0}
             let fbody = append(outer0, fe)
             let fout = do alowAccWith(bout0, fbody, outerLoc0)
             return fout
@@ -1408,6 +1490,15 @@ app ActionLowerSelfHost:
             where = [lw]
             let readW = do alowReadDeps(acc, lw, env)
             acc = readW
+        # `by <expr>`: a pure key over the loop variable and the locals
+        let mut orderBy = []
+        if len(s.orderExpr) > 0:
+            let od = do alowCheckPureDiag(s.orderExpr[0], wl, env, "a `for … by <expr>` ordering")
+            if od != "":
+                let fo = do alowFail(acc, od)
+                return fo
+            let lo = do alowLow(s.orderExpr[0], env)
+            orderBy = [lo]
         if s.orderField != "":
             let hasField = do alowEntityHasField(s.entity, s.orderField, env)
             if !hasField && s.orderField != "id":
@@ -1425,7 +1516,7 @@ app ActionLowerSelfHost:
         let bodyOut = do alowBlock(s.body, bodyIn, env)
         if bodyOut.err != "":
             return bodyOut
-        let st = do irFor(s.entity, s.itemVar, where, s.orderField, s.orderDesc, limit, bodyOut.body)
+        let st = do irFor(s.entity, s.itemVar, where, s.orderField, orderBy, s.orderDesc, limit, bodyOut.body)
         let body = append(outerBody, st)
         let out = do alowAccWith(bodyOut, body, outerLocals)
         return out
@@ -1458,6 +1549,9 @@ app ActionLowerSelfHost:
             return r
         if s.kind == "do" || s.kind == "letDo":
             let r = do alowDo(a, s, env)
+            return r
+        if s.kind == "run" || s.kind == "letRun":
+            let r = do alowRun(a, s, env)
             return r
         if s.kind == "establish":
             let r = do alowEstablish(a, s, env)
@@ -1492,6 +1586,16 @@ app ActionLowerSelfHost:
         let f = do alowFail(a, "unsupported statement kind \"" + s.kind + "\"")
         return f
 
+    # alowNamesLine: e starts "line <digits>: " (a nested block's
+    # statement already named its line).
+    proc alowNamesLine(e: text) -> bool:
+        if !hasPrefixText(e, "line "):
+            return false
+        let colon = indexOf(e, ": ", 5)
+        if colon <= 5:
+            return false
+        return u64ParseError(slice(e, 5, colon)) == ""
+
     # alowBlock: block — one statement list against the scope in
     # `a.locals`; a `let`/bind widens the scope for the statements after
     # it in this block only (the caller restores its own scope).
@@ -1503,6 +1607,11 @@ app ActionLowerSelfHost:
             let senv = do alowEnvScoped(env, acc.tsc)
             let next = do alowStmt(acc, stmts[i], senv)
             if next.err != "":
+                let named = do alowNamesLine(next.err)
+                if !named && stmts[i].lineIdx >= 0 && stmts[i].lineIdx < len(env.lineNos):
+                    let mut lined = next
+                    lined.err = "line " + env.lineNos[stmts[i].lineIdx] + ": " + next.err
+                    return lined
                 return next
             acc = next
             i = i + 1
@@ -1564,7 +1673,7 @@ app ActionLowerSelfHost:
             if k == "remove":
                 let a8 = do alowCollect(acc, s.key)
                 acc = a8
-            if k == "call" || k == "letCall" || k == "do" || k == "letDo":
+            if k == "call" || k == "letCall" || k == "do" || k == "letDo" || k == "run" || k == "letRun":
                 let a9 = do alowCollectAll(acc, s.callArgs)
                 acc = a9
             if k == "establish":
@@ -1590,7 +1699,7 @@ app ActionLowerSelfHost:
         return acc
 
     private proc alowFailedAction(msg: text) -> IRAction:
-        return IRAction{name: "", params: [], requires: [], optimistic: false, ret: "", retList: false, placement: "", reason: msg, writes: [], reads: [], seal: [], body: [], builtin: false}
+        return IRAction{name: "", params: [], requires: [], optimistic: false, ret: "", retList: false, placement: "", reason: msg, writes: [], reads: [], seal: [], body: [], builtin: false, internal: false}
 
     # lowerActionSrc: action(), end to end. `paramTypes[i]` is the declared
     # type of `paramNames[i]`; `bodySrc` is the action's dedented body
@@ -1604,7 +1713,10 @@ app ActionLowerSelfHost:
             lists = append(lists, false)
             opts = append(opts, false)
             k = k + 1
-        let r = do lowerActionSrcFull(name, paramNames, paramTypes, lists, opts, optimistic, "", false, bodySrc, env)
+        let stmts = do parseActionBodySrc(bodySrc)
+        let reqs = do actionRequiresOnly(stmts)
+        let body = do actionBodyOnly(stmts)
+        let r = do lowerActionSrcFull(name, paramNames, paramTypes, lists, opts, optimistic, "", false, reqs, body, [], env)
         return r
 
     proc alowIsScalarType(t: text, env: ALowEnv) -> bool:
@@ -1612,9 +1724,39 @@ app ActionLowerSelfHost:
             return true
         return t in env.enumNames
 
+    proc alowStmtAt(ss: [ActionStmt], i: int) -> ActionStmt:
+        return ss[i]
+
+    # alowRenameCalls: rewriteInlineCalls over an action body — every call
+    # of a same-file private proc, in every statement's expressions.
+    proc alowRenameCalls(ss: [ActionStmt], from: [text], to: [text]) -> [ActionStmt]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(ss):
+            let o = ss[i]
+            let mut s = alowStmtAt(ss, i)
+            s.cond = exprRenameCalls(o.cond, from, to)
+            s.policyArgs = exprsRenameCalls(o.policyArgs, from, to)
+            s.key = exprRenameCalls(o.key, from, to)
+            s.value = exprRenameCalls(o.value, from, to)
+            s.fieldValues = exprsRenameCalls(o.fieldValues, from, to)
+            s.callArgs = exprsRenameCalls(o.callArgs, from, to)
+            s.actor = exprRenameCalls(o.actor, from, to)
+            s.role = exprRenameCalls(o.role, from, to)
+            s.exprCall = exprRenameCalls(o.exprCall, from, to)
+            s.orderExpr = exprsRenameCalls(o.orderExpr, from, to)
+            s.limit = exprRenameCalls(o.limit, from, to)
+            s.body = alowRenameCalls(o.body, from, to)
+            s.elseBody = alowRenameCalls(o.elseBody, from, to)
+            out = append(out, s)
+            i = i + 1
+        return out
+
     # lowerActionSrcFull: action() with the whole header — list/optional
-    # parameters and the `-> Type` reply.
-    proc lowerActionSrcFull(name: text, paramNames: [text], paramTypes: [text], paramLists: [bool], paramOptionals: [bool], optimistic: bool, ret: text, retList: bool, bodySrc: text, env0: ALowEnv) -> IRAction:
+    # parameters and the `-> Type` reply — over the body already parsed and
+    # split (an ActionDecl's own requires/body: buildActionDecl parsed it
+    # once; it is not parsed again).
+    proc lowerActionSrcFull(name: text, paramNames: [text], paramTypes: [text], paramLists: [bool], paramOptionals: [bool], optimistic: bool, ret: text, retList: bool, reqStmts: [ActionStmt], bodyStmts: [ActionStmt], lineNos: [int], env0: ALowEnv) -> IRAction:
         if ret != "":
             if ret in env0.structNames:
                 let fs = do alowFailedAction("action \"" + name + "\" returns " + ret + ", a proc-only type with no wire form — return a primitive, an entity row, or a wire `type`")
@@ -1636,23 +1778,21 @@ app ActionLowerSelfHost:
                 pl = "[" + pl + "]"
             psc = do tyScopeWith(psc, paramNames[pti], pl)
             pti = pti + 1
-        let env = ALowEnv{stateNames: env0.stateNames, stateDeclPlacements: env0.stateDeclPlacements, actionNames: env0.actionNames, statePlacements: env0.statePlacements, entityNames: env0.entityNames, entityFields: env0.entityFields, entityDerives: env0.entityDerives, enumNames: env0.enumNames, policyNames: env0.policyNames, policyParamCounts: env0.policyParamCounts, inlineNames: env0.inlineNames, inlineExprs: env0.inlineExprs, serviceNames: env0.serviceNames, serviceOps: env0.serviceOps, serviceArgCounts: env0.serviceArgCounts, serviceRets: env0.serviceRets, serviceRetLists: env0.serviceRetLists, procNames: env0.procNames, procParamCounts: env0.procParamCounts, procRets: env0.procRets, procRetLists: env0.procRetLists, structNames: env0.structNames, renameFrom: env0.renameFrom, renameTo: env0.renameTo, e2eFields: env0.e2eFields, actionParams: env0.actionParams, wireTypes: env0.wireTypes, actionName: name, actionRet: ret, recordNames: env0.recordNames, low: env0.low, privateStates: env0.privateStates, ty: env0.ty, tsc: psc}
+        let env = ALowEnv{lineNos: lineNos, stateNames: env0.stateNames, stateDeclPlacements: env0.stateDeclPlacements, actionNames: env0.actionNames, statePlacements: env0.statePlacements, entityNames: env0.entityNames, entityFields: env0.entityFields, entityDerives: env0.entityDerives, enumNames: env0.enumNames, policyNames: env0.policyNames, policyParamCounts: env0.policyParamCounts, inlineNames: env0.inlineNames, inlineExprs: env0.inlineExprs, serviceNames: env0.serviceNames, serviceOps: env0.serviceOps, serviceArgCounts: env0.serviceArgCounts, serviceRets: env0.serviceRets, serviceRetLists: env0.serviceRetLists, procNames: env0.procNames, procAt: env0.procAt, procParamCounts: env0.procParamCounts, procRets: env0.procRets, procRetLists: env0.procRetLists, structNames: env0.structNames, renameFrom: env0.renameFrom, renameTo: env0.renameTo, e2eFields: env0.e2eFields, actionParams: env0.actionParams, wireTypes: env0.wireTypes, actionName: name, actionRet: ret, recordNames: env0.recordNames, low: env0.low, privateStates: env0.privateStates, ty: env0.ty, tsc: psc, curAction: name, runNames: env0.runNames, runParamCounts: env0.runParamCounts, runRets: env0.runRets, runRetLists: env0.runRetLists, standIn: env0.standIn, runRequired: env0.runRequired}
         let mut params = []
         let mut loc = ["actor", "role", "verified", "tenant", "tenantRole", "session", "sessionToken"]
         let pn = len(paramNames)
         let mut i = 0
         loop i < pn:
             if paramLists[i]:
+                # scalars, or wire `type` values (a JSON array of objects)
                 let sc = do alowIsScalarType(paramTypes[i], env)
-                if !sc:
-                    let fl = do alowFailedAction("action \"" + name + "\" parameter \"" + paramNames[i] + "\" is a list of " + paramTypes[i] + " — a list parameter holds scalars (int, text, bool, money, date, float, datetime or an enum), the values a client sends as a JSON array or a comma-separated query")
+                if !sc && !(paramTypes[i] in env.wireTypes):
+                    let fl = do alowFailedAction("action \"" + name + "\" parameter \"" + paramNames[i] + "\" is a list of " + paramTypes[i] + " — a list parameter holds scalars (int, text, bool, money, date, float, datetime or an enum) or wire `type` values, what a client sends as a JSON array or a comma-separated query")
                     return fl
-            params = append(params, IRParam{name: paramNames[i], type: paramTypes[i], optional: paramOptionals[i], list: paramLists[i]})
+            params = append(params, IRParam{name: paramNames[i], type: paramTypes[i], optional: paramOptionals[i], list: paramLists[i], map: false, key: "", depth: 0})
             loc = append(loc, paramNames[i])
             i = i + 1
-        let stmts = do parseActionBodySrc(bodySrc)
-        let reqStmts = do actionRequiresOnly(stmts)
-        let bodyStmts = do actionBodyOnly(stmts)
         # requires: a known policy, the right arity, pure arguments.
         let mut reqs = []
         let rn = len(reqStmts)
@@ -1688,7 +1828,7 @@ app ActionLowerSelfHost:
             reqs = append(reqs, IRRequire{name: rs.policyName, args: args})
             r = r + 1
         # the body (with this action's parameters known, for e2eWrite)
-        let benv = ALowEnv{stateNames: env.stateNames, stateDeclPlacements: env.stateDeclPlacements, actionNames: env.actionNames, statePlacements: env.statePlacements, entityNames: env.entityNames, entityFields: env.entityFields, entityDerives: env.entityDerives, enumNames: env.enumNames, policyNames: env.policyNames, policyParamCounts: env.policyParamCounts, inlineNames: env.inlineNames, inlineExprs: env.inlineExprs, serviceNames: env.serviceNames, serviceOps: env.serviceOps, serviceArgCounts: env.serviceArgCounts, serviceRets: env.serviceRets, serviceRetLists: env.serviceRetLists, procNames: env.procNames, procParamCounts: env.procParamCounts, procRets: env.procRets, procRetLists: env.procRetLists, structNames: env.structNames, renameFrom: env.renameFrom, renameTo: env.renameTo, e2eFields: env.e2eFields, actionParams: paramNames, wireTypes: env.wireTypes, actionName: env.actionName, actionRet: env.actionRet, recordNames: env.recordNames, low: env.low, privateStates: env.privateStates, ty: env.ty, tsc: env.tsc}
+        let benv = ALowEnv{lineNos: env.lineNos, stateNames: env.stateNames, stateDeclPlacements: env.stateDeclPlacements, actionNames: env.actionNames, statePlacements: env.statePlacements, entityNames: env.entityNames, entityFields: env.entityFields, entityDerives: env.entityDerives, enumNames: env.enumNames, policyNames: env.policyNames, policyParamCounts: env.policyParamCounts, inlineNames: env.inlineNames, inlineExprs: env.inlineExprs, serviceNames: env.serviceNames, serviceOps: env.serviceOps, serviceArgCounts: env.serviceArgCounts, serviceRets: env.serviceRets, serviceRetLists: env.serviceRetLists, procNames: env.procNames, procAt: env.procAt, procParamCounts: env.procParamCounts, procRets: env.procRets, procRetLists: env.procRetLists, structNames: env.structNames, renameFrom: env.renameFrom, renameTo: env.renameTo, e2eFields: env.e2eFields, actionParams: paramNames, wireTypes: env.wireTypes, actionName: env.actionName, actionRet: env.actionRet, recordNames: env.recordNames, low: env.low, privateStates: env.privateStates, ty: env.ty, tsc: env.tsc, curAction: env.curAction, runNames: env.runNames, runParamCounts: env.runParamCounts, runRets: env.runRets, runRetLists: env.runRetLists, standIn: env.standIn, runRequired: env.runRequired}
         let accNew = do alowAccNew(loc)
         let acc0 = ALowAcc{body: accNew.body, err: accNew.err, writes: accNew.writes, reads: accNew.reads, entWrite: accNew.entWrite, impure: accNew.impure, usesPrint: accNew.usesPrint, callsService: accNew.callsService, callsProc: accNew.callsProc, establishesID: accNew.establishesID, locals: accNew.locals, seal: accNew.seal, usesSecret: accNew.usesSecret, emits: accNew.emits, setsHeader: accNew.setsHeader, tsc: psc}
         let acc = do alowBlock(bodyStmts, acc0, benv)
@@ -1749,6 +1889,10 @@ app ActionLowerSelfHost:
         if !decided && acc.callsService:
             placement = "server"
             reason = "calls an external service — egress routes through the authority, never the client"
+            decided = true
+        if !decided && env0.standIn:
+            placement = "server"
+            reason = "stands in for a host's server action a fragment expects (`expect action`)"
             decided = true
         if !decided && callsProc:
             placement = "server"
@@ -1814,7 +1958,7 @@ app ActionLowerSelfHost:
         # so `@optimistic` is dropped on the floor there — mirrored here so
         # the JSON stays byte for byte the compiler's.
         let dropped = optimistic && false
-        return IRAction{name: name, params: params, requires: reqs, optimistic: dropped, ret: ret, retList: retList, placement: placement, reason: reason, writes: writes, reads: reads, seal: seal, body: acc.body, builtin: false}
+        return IRAction{name: name, params: params, requires: reqs, optimistic: dropped, ret: ret, retList: retList, placement: placement, reason: reason, writes: writes, reads: reads, seal: seal, body: acc.body, builtin: false, internal: false}
 
     proc lowerActionJSON(name: text, paramNames: [text], paramTypes: [text], optimistic: bool, bodySrc: text, env: ALowEnv) -> text:
         let a = do lowerActionSrc(name, paramNames, paramTypes, optimistic, bodySrc, env)
@@ -1913,7 +2057,7 @@ app ActionLowerSelfHost:
             q = q + 1
         let structNames = do lowerSplitLines(structLines)
         let lowBasicCtx = do lowCtxBasic(inlineNames, inlineExprs, enumNames)
-        return ALowEnv{stateNames: stateNames, stateDeclPlacements: [], actionNames: [], statePlacements: statePlacements, entityNames: entityNames, entityFields: entityFields, entityDerives: entityDerives, enumNames: enumNames, policyNames: policyNames, policyParamCounts: policyParamCounts, inlineNames: inlineNames, inlineExprs: inlineExprs, serviceNames: serviceNames, serviceOps: serviceOps, serviceArgCounts: serviceArgCounts, serviceRets: serviceRets, serviceRetLists: serviceRetLists, procNames: procNames, procParamCounts: procParamCounts, procRets: procRets, procRetLists: procRetLists, structNames: structNames, renameFrom: [], renameTo: [], e2eFields: [], actionParams: [], wireTypes: [], actionName: "", actionRet: "", recordNames: [], low: lowBasicCtx, privateStates: [], ty: tyEmptyEnv(), tsc: tyEmptyScope()}
+        return ALowEnv{lineNos: [], stateNames: stateNames, stateDeclPlacements: [], actionNames: [], statePlacements: statePlacements, entityNames: entityNames, entityFields: entityFields, entityDerives: entityDerives, enumNames: enumNames, policyNames: policyNames, policyParamCounts: policyParamCounts, inlineNames: inlineNames, inlineExprs: inlineExprs, serviceNames: serviceNames, serviceOps: serviceOps, serviceArgCounts: serviceArgCounts, serviceRets: serviceRets, serviceRetLists: serviceRetLists, procNames: procNames, procAt: callProcIndex(procNames), procParamCounts: procParamCounts, procRets: procRets, procRetLists: procRetLists, structNames: structNames, renameFrom: [], renameTo: [], e2eFields: [], actionParams: [], wireTypes: [], actionName: "", actionRet: "", recordNames: [], low: lowBasicCtx, privateStates: [], ty: tyEmptyEnv(), tsc: tyEmptyScope(), curAction: "", runNames: [], runParamCounts: [], runRets: [], runRetLists: [], standIn: false, runRequired: []}
 
     proc lowerActionLinesJSON(name: text, paramLines: text, optimistic: bool, bodySrc: text, stateLines: text, entityLines: text, fieldLines: text, deriveLines: text, enumLines: text, policyLines: text, inlineNameLines: text, inlineJSONLines: text, serviceLines: text, procLines: text, structLines: text) -> text:
         let params = do lowerSplitLines(paramLines)

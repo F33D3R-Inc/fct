@@ -396,6 +396,10 @@ fn admin_case(line: &str) -> String {
                     ),
                     ControlRequest::Abort { id, reply } => (format!("Abort {}", id.0), Some(reply)),
                     ControlRequest::Copy { id, .. } => (format!("Copy {}", id.0), None),
+                    ControlRequest::Migrate { target, destination, reply } => (
+                        format!("Migrate {} {} {} {}", target.shard_id, target.coordinate.x, target.coordinate.y, destination.0),
+                        Some(reply),
+                    ),
                 };
                 *saw.lock().unwrap() = description;
                 if let Some(sender) = sender {
@@ -472,11 +476,15 @@ fn loaded_poll_case(line: &str, stop: &std::sync::atomic::AtomicBool) -> String 
         let mut poller = TelemetryPoller::new(vec![PollTarget::new(endpoint, shard, cell, "us-east")]).unwrap();
         poller.poll_once().await;
         let mut hottest: Option<WorkloadProfile> = None;
+        let mut refused = 0usize;
         let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
         while std::time::Instant::now() < deadline && !stop.load(std::sync::atomic::Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(500)).await;
             for (_, outcome) in poller.poll_once().await {
-                let PollOutcome::Sampled(batch) = outcome else { continue };
+                let PollOutcome::Sampled(batch) = outcome else {
+                    refused += 1;
+                    continue;
+                };
                 for sample in &batch.samples {
                     let profile = WorkloadProfile::from_metrics(shard, cell, sample.metrics());
                     if hottest.as_ref().is_none_or(|h| profile.pressure_score > h.pressure_score) {
@@ -488,11 +496,11 @@ fn loaded_poll_case(line: &str, stop: &std::sync::atomic::AtomicBool) -> String 
                 break;
             }
         }
-        let Some(h) = hottest else { return "no sample".to_string() };
+        let Some(h) = hottest else { return format!("no sample ({refused} poll(s) refused)") };
         let mut registry = TopologyRegistry::new();
         registry.place(fabric_core::DbmsId::new("loaded-instance"), &fabric_core::Shard::new(shard, "us-east"), cell, "us-east");
         let decision = WorkloadOptimizer::default().optimize(&h, &registry);
-        format!("{}|{}|{}|{}|{}|{}|{:?}", h.pressure_score, h.is_hot(), h.cpu_utilization, h.queue_depth, h.write_latency_us, h.write_ratio, decision.action)
+        format!("{}|{}|{}|{}|{}|{}|{:?}|{}", h.pressure_score, h.is_hot(), h.cpu_utilization, h.queue_depth, h.write_latency_us, h.write_ratio, decision.action, refused)
     })
 }
 

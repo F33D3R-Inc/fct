@@ -18,7 +18,7 @@ func startFacetsApp(t *testing.T, e *engine, name string) *app {
 	return startAppFile(t, e, path)
 }
 
-// The library's timeline app renders the f33d3r look on both sides: the shell,
+// The site (f33d3r_com.fct) renders the f33d3r look on both sides: the shell,
 // the rail glyphs, a post card with its engagement bar, and the profile header.
 // This is the one test that compiles the whole social slice of the facets tree —
 // every atom it imports, the look, the icons — and runs the shipped client over
@@ -26,19 +26,22 @@ func startFacetsApp(t *testing.T, e *engine, name string) *app {
 // stamping, fails here rather than in a browser.
 func TestLibraryHomeRendersOnBothSides(t *testing.T) {
 	e := startEngine(t)
-	a := startFacetsApp(t, e, "timeline.fct")
+	a := startFacetsApp(t, e, "f33d3r_com.fct")
 
-	if code, body := a.action("signup", "ada", "pw12345678"); code != 200 {
+	if code, body := a.action("webSignup", "ada", "pw12345678"); code != 200 {
 		t.Fatalf("signup: %d %s", code, body)
 	}
 	if code, body := a.action("post", "hello from the library"); code != 200 {
 		t.Fatalf("post: %d %s", code, body)
 	}
-	if code, body := a.action("postVideo", "a clip", "/m/clip.mp4"); code != 200 {
-		t.Fatalf("postVideo: %d %s", code, body)
+	if code, body := a.action("webPostMedia", "a clip", "/m/clip.mp4", "video"); code != 200 {
+		t.Fatalf("webPostMedia: %d %s", code, body)
 	}
-	if code, body := a.action("quote", "look at #this", 1); code != 200 {
-		t.Fatalf("quote: %d %s", code, body)
+	if code, body := a.action("pinWork", "2"); code != 200 {
+		t.Fatalf("pinWork: %d %s", code, body)
+	}
+	if code, body := a.action("webQuote", "look at #this", 1); code != 200 {
+		t.Fatalf("webQuote: %d %s", code, body)
 	}
 
 	code, page := a.get("/")

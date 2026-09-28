@@ -109,6 +109,24 @@ app FqServerSelfHost:
         let n = do svEnvName(name)
         return envVar(n)
 
+    # svSetting: a `facetql start` setting — its command-line flag (which
+    # `facet facetql` passes as FACETQL_ARG_<NAME>: --data-dir, --port,
+    # --tls-identity, --tls-identity-password), else its variable as svEnv
+    # reads it; clap's order, a flag over the environment.
+    proc svSetting(name: text) -> text uses io.env:
+        let flag = "FACETQL_ARG_" + slice(name, 8, len(name))
+        if envSet(flag):
+            return envVar(flag)
+        let v = do svEnv(name)
+        return v
+
+    proc svSettingSet(name: text) -> bool uses io.env:
+        let flag = "FACETQL_ARG_" + slice(name, 8, len(name))
+        if envSet(flag):
+            return true
+        let v = do svEnvSet(name)
+        return v
+
     proc svAliasWarnings() -> bool uses io.console, io.env:
         let current = ["FACETQL_TOKENS", "FACETQL_MASTER_KEY", "FACETQL_DATA_DIR", "FACETQL_PORT", "FACETQL_TLS_IDENTITY", "FACETQL_TLS_IDENTITY_PASSWORD"]
         let mut i = 0
@@ -219,18 +237,53 @@ app FqServerSelfHost:
     proc svDevToken() -> text:
         return "dev-local-key-change-me"
 
+    # svClapU16: the port as clap's u16 parser reads `--port` (and
+    # FACETQL_PORT, its env fallback, untrimmed): i64::from_str — an
+    # optional sign, then digits — then 0..=65535, each failure in its words.
+    struct SvPort:
+        ok: bool
+        v: int
+        err: text
+
+    proc svClapU16(v: text) -> SvPort:
+        if v == "":
+            return SvPort{ok: false, v: 0, err: "cannot parse integer from empty string"}
+        let bs = textToBytes(v)
+        let mut i = 0
+        let mut neg = false
+        if (bs[0] == 43 || bs[0] == 45) && len(bs) > 1:
+            neg = bs[0] == 45
+            i = 1
+        let mut n = 0
+        loop i < len(bs):
+            if bs[i] < 48 || bs[i] > 57:
+                return SvPort{ok: false, v: 0, err: "invalid digit found in string"}
+            let d = bs[i] - 48
+            if !neg && (n > 922337203685477580 || (n == 922337203685477580 && d > 7)):
+                return SvPort{ok: false, v: 0, err: "number too large to fit in target type"}
+            if neg && (n > 922337203685477580 || (n == 922337203685477580 && d > 8)):
+                return SvPort{ok: false, v: 0, err: "number too small to fit in target type"}
+            n = n * 10 + d
+            i = i + 1
+        if neg:
+            n = 0 - n
+        if n < 0 || n > 65535:
+            return SvPort{ok: false, v: 0, err: "" + n + " is not in 0..=65535"}
+        return SvPort{ok: true, v: n, err: ""}
+
     proc svConfig() -> SvConfig uses io.console, io.env:
         let w = do svAliasWarnings()
-        let mut dir = svEnv("FACETQL_DATA_DIR")
+        let mut dir = svSetting("FACETQL_DATA_DIR")
         if dir == "":
             dir = envVar("HOME") + "/.facetql"
         if charAt(dir, len(dir) - 1) != "/":
             dir = dir + "/"
         let mut port = 8080
-        if svEnvSet("FACETQL_PORT"):
-            let pu = do hParseUint(trim(svEnv("FACETQL_PORT")))
-            if !pu.ok || pu.v > 65535:
-                let e0 = writeStderr("error: invalid value '" + svEnv("FACETQL_PORT") + "' for '--port <PORT>': invalid digit found in string\n")
+        if svSettingSet("FACETQL_PORT"):
+            let raw = do svSetting("FACETQL_PORT")
+            let pu = do svClapU16(raw)
+            if !pu.ok:
+                let e0 = writeStderr("error: invalid value '" + raw + "' for '--port <PORT>': " + pu.err + "\n\nFor more information, try '--help'.\n")
                 return SvConfig{ok: false, dataDir: dir, port: 0, keyHex: "", dev: false, corsAny: false, origins: [], maxBody: 0, rates: [], tokHashes: [], tokOwners: [], tokAdmins: [], interval: 0, rotateBytes: 0, maxSubscribers: 0, maxConcurrent: 0, timeoutSecs: 0, maxConnections: 0, tlsIdentity: "", tlsPassword: "", maxOps: 0, maxScanRows: 0, maxQueryOffset: 0}
             port = pu.v
         let envName = lower(trim(envVar("FACETQL_ENV")))
@@ -293,7 +346,7 @@ app FqServerSelfHost:
         let mq = do hParseUint(envVar("FACETQL_MAX_QUERY_OFFSET"))
         if mq.ok:
             maxQueryOffset = mq.v
-        return SvConfig{ok: true, dataDir: dir, port: port, keyHex: svEnv("FACETQL_MASTER_KEY"), dev: dev, corsAny: corsAny, origins: origins, maxBody: maxBody, rates: rates, tokHashes: toks.hashes, tokOwners: toks.owners, tokAdmins: toks.admins, interval: interval, rotateBytes: rotate, maxSubscribers: maxSubs, maxConcurrent: maxConc, timeoutSecs: tsecs, maxConnections: maxConns, tlsIdentity: svEnv("FACETQL_TLS_IDENTITY"), tlsPassword: svEnv("FACETQL_TLS_IDENTITY_PASSWORD"), maxOps: maxOps, maxScanRows: maxScanRows, maxQueryOffset: maxQueryOffset}
+        return SvConfig{ok: true, dataDir: dir, port: port, keyHex: svEnv("FACETQL_MASTER_KEY"), dev: dev, corsAny: corsAny, origins: origins, maxBody: maxBody, rates: rates, tokHashes: toks.hashes, tokOwners: toks.owners, tokAdmins: toks.admins, interval: interval, rotateBytes: rotate, maxSubscribers: maxSubs, maxConcurrent: maxConc, timeoutSecs: tsecs, maxConnections: maxConns, tlsIdentity: svSetting("FACETQL_TLS_IDENTITY"), tlsPassword: svSetting("FACETQL_TLS_IDENTITY_PASSWORD"), maxOps: maxOps, maxScanRows: maxScanRows, maxQueryOffset: maxQueryOffset}
 
     # ── the deployment posture (main.rs's enforce_deployment_posture) ──
     struct SvKey:
@@ -486,24 +539,44 @@ app FqServerSelfHost:
 
     # svWire: the request's fields between a handler and the loop, each
     # length-prefixed.
+    # (built as parts and joined once: a request body is one of the fields,
+    # and appending to a growing text would copy it once per field after it)
+    # Fields are measured in bytes (byteLen) and cut from the message's
+    # bytes: a field is a request body, and text is indexed by character, so
+    # measuring and cutting it as text walked it from the start each time.
     proc svPack(fields: [text]) -> text:
-        let mut out = ""
+        let mut parts = []
         let mut i = 0
         loop i < len(fields):
-            out = out + len(fields[i]) + ":" + fields[i]
+            parts = append(parts, "" + byteLen(fields[i]) + ":")
+            parts = append(parts, fields[i])
             i = i + 1
-        return out
+        return join(parts, "")
+
+    # svKind: a packed message's first field (its kind), read from its
+    # prefix without unpacking the rest.
+    proc svKind(s: text) -> text:
+        let colon = indexOf(s, ":", 0)
+        let k = toInt(slice(s, 0, colon))
+        return slice(s, colon + 1, colon + 1 + k)
+
+    # svAfterKind: a packed message without its first field — the rest of
+    # its fields, still packed.
+    proc svAfterKind(s: text) -> text:
+        let bs = textToBytes(s)
+        let colon = indexOf(bs, 58, 0)
+        let k = toInt(bytesToText(slice(bs, 0, colon)))
+        return bytesToText(slice(bs, colon + 1 + k, len(bs)))
 
     proc svUnpack(s: text) -> [text]:
         let mut out = []
-        let n = len(s)
+        let bs = textToBytes(s)
+        let n = len(bs)
         let mut p = 0
         loop p < n:
-            let mut q = p
-            loop charAt(s, q) != ":":
-                q = q + 1
-            let k = toInt(slice(s, p, q))
-            out = append(out, slice(s, q + 1, q + 1 + k))
+            let q = indexOf(bs, 58, p)
+            let k = toInt(bytesToText(slice(bs, p, q)))
+            out = append(out, bytesToText(slice(bs, q + 1, q + 1 + k)))
             p = q + 1 + k
         return out
 
@@ -2048,11 +2121,18 @@ app FqServerSelfHost:
             let field = do hStr(b.v, 2)
             let unique = do hBool(b.v, 3)
             let mode = do hStrOr(b.v, 4, "ordered")
-            if lower(mode) == "text":
+            # folded: an inverted index over the field's text lowered
+            let folded = lower(mode) == "folded"
+            if lower(mode) == "text" || folded:
                 if unique:
                     let o1 = do svOut(st, hText(400, "a text index cannot be unique: it stores windows of a value, not the value, so it has nothing to hold unique. Declare an ordered unique index over the same field if that is what you want."))
                     return o1
-                let t = do enCreateTextIndex(st.eng, textIndexDefNew(name, kind, field))
+                let mut tdef = do textIndexDefNew(name, kind, field)
+                let mut shownMode = "text"
+                if folded:
+                    tdef = textIndexDefFolded(tdef)
+                    shownMode = "folded"
+                let t = do enCreateTextIndex(st.eng, tdef)
                 let st1 = do svWithEng(st, t.eng)
                 if !t.ok:
                     let mut s1 = 400
@@ -2060,10 +2140,10 @@ app FqServerSelfHost:
                         s1 = 409
                     let o2 = do svOut(st1, hText(s1, t.err))
                     return o2
-                let o3 = do svOut(st1, hJson(201, jIndexInfo(name, kind, field, false, "text")))
+                let o3 = do svOut(st1, hJson(201, jIndexInfo(name, kind, field, false, shownMode)))
                 return o3
             if lower(mode) != "ordered":
-                let o4 = do svOut(st, hText(400, "unknown index mode " + ckQuote(mode) + "; expected \"ordered\" or \"text\""))
+                let o4 = do svOut(st, hText(400, "unknown index mode " + ckQuote(mode) + "; expected \"ordered\", \"text\" or \"folded\""))
                 return o4
             let c = do enCreateIndex(st.eng, indexDefNew(name, kind, field, unique))
             let st2 = do svWithEng(st, c.eng)
@@ -2255,9 +2335,21 @@ app FqServerSelfHost:
         let none = do svNoRoute()
         return SvAdmit{st: st, final: true, resp: r, id: SvIdent{owner: "", admin: false}, route: none, mclass: 3, observed: false, kind: "", pin: -1}
 
+    # svTelemetry: limits.rs's is_telemetry — GET/HEAD of `/stats` and of
+    # the `/` liveness probe take no in-flight slot, so a supervisor sees a
+    # saturated instance (the moment it most needs to).
+    proc svTelemetry(method: text, path: text) -> bool:
+        return (method == "GET" || method == "HEAD") && (path == "/" || path == "/stats")
+
     proc svAdmit(st0: SvState, req: SvReq) -> SvAdmit uses io.file:
-        if st0.lp.inflight >= st0.cfg.maxConcurrent:
-            let busy = do hWithHeader(hText(503, "server is at its concurrency limit (in-flight requests); the request was not started. Retry shortly."), "retry-after", "1")
+        let telemetry = do svTelemetry(req.method, req.path)
+        if !telemetry && st0.lp.inflight >= st0.cfg.maxConcurrent:
+            let mut busy = do hWithHeader(hText(503, "server is at its concurrency limit (in-flight requests); the request was not started. Retry shortly."), "retry-after", "1")
+            # axum's method router still names the methods a matched route
+            # takes on the response it passes back
+            let r0 = do svMatch(req.path)
+            if r0.pattern != "" && !(req.method in r0.allow):
+                busy = do hWithHeader(busy, "allow", join(r0.allow, ","))
             let f0 = do svFinal(st0, busy)
             return f0
         let route = do svMatch(req.path)
@@ -2317,7 +2409,8 @@ app FqServerSelfHost:
             pin = snap.rd.epoch
             let lpPinned = do svPinTake(st.lp, pin)
             st.lp = lpPinned
-        st.lp.inflight = st.lp.inflight + 1
+        if !telemetry:
+            st.lp.inflight = st.lp.inflight + 1
         return SvAdmit{st: st, final: false, resp: hEmpty(200), id: au.id, route: route, mclass: mclass, observed: observed, kind: kind, pin: pin}
 
     # ── the pin registry the loop holds ────────────────────────────────
@@ -2399,7 +2492,11 @@ app FqServerSelfHost:
     #   K  a TLS connection asking for a connection slot; k one released
     # and SIGINT/SIGTERM: shutdown, handed to the writer (Q) once nothing
     # is in flight.
-    proc svLoop(ch: int, wch: int, sig: int, st0: SvState) uses io.file, io.net.listen, io.console:
+    # pri: the loop's priority inbox — the writer's hand-off (N, C, P, O)
+    # and telemetry admissions — taken before anything waiting on ch, so
+    # the writer is never left idle behind a backlog of admissions, and a
+    # probe waits for at most the one message the loop is handling.
+    proc svLoop(ch: int, pri: int, wch: int, sig: int, lis: int, st0: SvState) uses io.file, io.net.listen, io.console:
         let types = do hTypes()
         let mut st = st0
         svFeedCell = st.feed
@@ -2409,16 +2506,23 @@ app FqServerSelfHost:
                 wait = st.lp.grace - monoMs()
                 if wait < 0:
                     wait = 0
-            let which = awaitAny([ch, sig], wait)
+            let which = awaitAny([pri, ch, sig], wait)
             if which == 0:
+                let pmsg = recv(pri)
+                st = do svOnMessage(st, wch, pmsg, types)
+            if which == 1:
                 let msg = recv(ch)
                 st = do svOnMessage(st, wch, msg, types)
-            if which == 1:
+            if which == 2:
                 let s = recv(sig)
                 st.lp.shutting = true
                 st.lp.grace = monoMs() + 15000
                 svDraining = true
                 let w = writeStdout("FacetQL: shutdown signal received; finishing in-flight requests\n")
+                # with_graceful_shutdown stops accepting: the listener is
+                # closed, so a new connection is refused rather than taken
+                # and dropped
+                let stopped = closeListener(lis)
             if st.lp.shutting && !st.lp.quitting && st.lp.inflight == 0 && st.lp.pending == 0 && st.lp.writerIdle:
                 let open = len(st.subs.chans) > 0
                 if !open || monoMs() >= st.lp.grace:
@@ -2447,8 +2551,18 @@ app FqServerSelfHost:
         # the loop reads the engine — identities for auth, the epoch a
         # reader pins, a loop-run read — as the writer last published it
         st.eng = svSnapshot
+        let k = do svKind(msg)
+        if k == "W":
+            # write_queue: how many mutations the writer holds; contended
+            # when one is already there (Rust: threads waiting on its mutex).
+            # The job is kept packed — the body is the writer's to read.
+            if st.lp.pending > 0:
+                st.lp.contended = st.lp.contended + 1
+            st.lp.pending = st.lp.pending + 1
+            st.lp.jobs = append(st.lp.jobs, msg)
+            let fed = do svFeedWriter(st, wch)
+            return fed
         let f = do svUnpack(msg)
-        let k = f[0]
         if k == "A":
             let req = do svReqAt(f, 1)
             let ad = do svAdmit(st, req)
@@ -2468,14 +2582,6 @@ app FqServerSelfHost:
                 let s2 = send(req2.reply, svPack(["V", "" + req2.reqid, "" + sub.start, "" + sub.notify]))
             else:
                 let s3 = do svRespond(req2.reply, "F", req2.reqid, svCors(st.cfg, req2, sub.resp))
-        if k == "W":
-            # write_queue: how many mutations the writer holds; contended
-            # when one is already there (Rust: threads waiting on its mutex)
-            if st.lp.pending > 0:
-                st.lp.contended = st.lp.contended + 1
-            st.lp.pending = st.lp.pending + 1
-            st.lp.jobs = append(st.lp.jobs, msg)
-            st = do svFeedWriter(st, wch)
         if k == "N":
             st.lp.writerIdle = true
             st = do svFeedWriter(st, wch)
@@ -2505,7 +2611,9 @@ app FqServerSelfHost:
         if k == "X":
             st = do svUnsubscribe(st, toInt(f[1]))
         if k == "E":
-            st.lp.inflight = st.lp.inflight - 1
+            # a telemetry request held no slot (svTelemetry)
+            if f[4] != "1":
+                st.lp.inflight = st.lp.inflight - 1
             let mclass = toInt(f[2])
             if f[3] == "1" && (mclass == 0 || mclass == 1):
                 st.met = svRecord(st.met, mclass, toInt(f[1]))
@@ -2528,12 +2636,13 @@ app FqServerSelfHost:
         let mut st = st0
         if !st.lp.writerIdle || len(st.lp.jobs) == 0:
             return st
-        let job = do svUnpack(st.lp.jobs[0])
+        let job = st.lp.jobs[0]
         st.lp.jobs = slice(st.lp.jobs, 1, len(st.lp.jobs))
         let ds = st.lp.deltas
         st.lp.deltas = []
         st.lp.writerIdle = false
-        let sj = send(wch, svPack(["J", svPinsText(st.lp), "" + len(ds)] + ds + slice(job, 1, len(job))))
+        # the W message's fields after its tag, passed on as they were packed
+        let sj = send(wch, svPack(["J", svPinsText(st.lp), "" + len(ds)] + ds) + svAfterKind(job))
         return st
 
     # svLoopEngine: the engine as the loop reads it — the writer's last
@@ -2561,12 +2670,12 @@ app FqServerSelfHost:
     # decision that needs every reader known: it is taken after the
     # mutation, against the snapshot just published, with the loop's
     # registry fetched for it (O).
-    proc svWriter(wch: int, ch: int, cfg: SvConfig, eng0: FqEngine) uses io.file, io.net.listen, io.console:
+    proc svWriter(wch: int, pri: int, cfg: SvConfig, eng0: FqEngine) uses io.file, io.net.listen, io.console:
         let types = do hTypes()
         let mut eng = eng0
         svSnapshot = eng
         loop true:
-            let idle = send(ch, svPack(["N"]))
+            let idle = send(pri, svPack(["N"]))
             let msg = recv(wch)
             let f = do svUnpack(msg)
             let k = f[0]
@@ -2592,12 +2701,12 @@ app FqServerSelfHost:
                 let fd = out.st.feed
                 let mut i = 0
                 loop i < len(fd.seqs):
-                    let p = send(ch, svPack(["P", "" + fd.seqs[i], svBoolText(fd.everyone[i]), fd.owners[i], fd.payloads[i]]))
+                    let p = send(pri, svPack(["P", "" + fd.seqs[i], svBoolText(fd.everyone[i]), fd.owners[i], fd.payloads[i]]))
                     i = i + 1
-                let c = send(ch, svPack(["C"]))
+                let c = send(pri, svPack(["C"]))
                 let r = do svRespond(req.reply, "R", req.reqid, out.resp)
                 if len(eng.rd.retiredSegs) > 0:
-                    eng = do svWriterRetire(eng, ch)
+                    eng = do svWriterRetire(eng, pri)
             if k == "Q":
                 do svSettle(eng, f[1] == "1")
 
@@ -2605,11 +2714,11 @@ app FqServerSelfHost:
     # could still reach a retired segment is known — the snapshot without
     # it is published first, so a reader admitted from here on never
     # needs it, and the loop's registry (O) then names every earlier one.
-    proc svWriterRetire(eng0: FqEngine, ch: int) -> FqEngine uses io.file:
+    proc svWriterRetire(eng0: FqEngine, pri: int) -> FqEngine uses io.file:
         let mut eng = eng0
         svSnapshot = eng
         let rp = channel()
-        let q = send(ch, svPack(["O", "" + rp]))
+        let q = send(pri, svPack(["O", "" + rp]))
         let pins = recv(rp)
         let closed = closeChannel(rp)
         eng = do enWithReaders(eng, svPinsAt(pins, eng.rd))
@@ -2623,7 +2732,7 @@ app FqServerSelfHost:
     # and its pin to the loop.
     proc svReadTask(ch: int, cfg: SvConfig, req: SvReq, id: SvIdent, pin: int) uses io.file, io.net.listen, io.console:
         let types = do hTypes()
-        let eng = svSnapshot
+        let eng = do enReadOnly(svSnapshot)
         let st = SvState{cfg: cfg, eng: eng, feed: SvFeed{seqs: [], payloads: [], everyone: [], owners: [], earliest: 0, emitted: 0}, subs: SvSubs{chans: []}, buckets: SvBuckets{keys: [], tokens: [], updated: []}, met: svMetricsNew(), lp: svLoopNew()}
         let route = do svMatch(req.path)
         let out = do svDispatch(st, req, route, id, types)
@@ -2664,7 +2773,7 @@ app FqServerSelfHost:
     # as a tokio timeout does not stop a blocking task), and the end of the
     # request back to the loop. A connection that became an event stream
     # stays on this task as the stream.
-    proc svServeConn(c: int, ch: int, cfg: SvConfig, tlsMode: bool) uses io.file, io.net.listen, io.console:
+    proc svServeConn(c: int, ch: int, pri: int, cfg: SvConfig, tlsMode: bool) uses io.file, io.net.listen, io.console:
         let reply = channel()
         let mut reqid = 0
         let mut pending = []
@@ -2678,15 +2787,32 @@ app FqServerSelfHost:
                 if err != "":
                     let w = writeStderr("TLS handshake failed for " + connPeer(c) + ": " + err + "\n")
             first = false
+            # hyper's graceful shutdown serves no new request on a
+            # connection: one that arrives while draining is closed unanswered
+            let drainingNow = svDraining
+            let refuse = hd.state == 1 && drainingNow
+            if refuse:
+                open = false
             if hd.state != 1:
                 if hd.state < 0:
                     let refused = do hRefuseMalformed(c)
                 open = false
-            else:
+            if hd.state == 1 && !refuse:
                 reqid = reqid + 1
                 let head = SvReq{reply: reply, reqid: reqid, conn: c, method: hd.req.method, path: hd.req.path, query: hd.req.query, hasQuery: hd.req.hasQuery, headers: hd.req.headers, body: "", tooLarge: false}
-                let sa = send(ch, svPack(["A"] + svReqFields(head)))
-                let ad = do svAwait(reply, reqid, -1)
+                # The liveness probe's answer is the configuration's alone
+                # (routes.rs:home, under the CORS layer): it is given here,
+                # needing no loop turn. Other telemetry is admitted first.
+                let tele = do svTelemetry(hd.req.method, hd.req.path)
+                let mut ad = SvAnswer{timedOut: false, f: []}
+                if tele && hd.req.path == "/":
+                    ad = SvAnswer{timedOut: false, f: svRespFields("F", reqid, svCors(cfg, head, hText(200, "FacetQL Online")))}
+                else:
+                    let mut inbox = ch
+                    if tele:
+                        inbox = pri
+                    let sa = send(inbox, svPack(["A"] + svReqFields(head)))
+                    ad = do svAwait(reply, reqid, -1)
                 let keep = do httpServerKeepAlive(hd.req)
                 let mut resp = hEmpty(200)
                 let mut bodyRead = false
@@ -2748,7 +2874,7 @@ app FqServerSelfHost:
                                 resync = sk.ok
                                 rest = sk.rest
                     if gone:
-                        let e0 = send(ch, svPack(["E", "" + ((monoMs() - t0) * 1000), mclass, observed]))
+                        let e0 = send(ch, svPack(["E", "" + ((monoMs() - t0) * 1000), mclass, observed, svBoolText(svTelemetry(hd.req.method, hd.req.path))]))
                         open = false
                         done = true
                     else:
@@ -2760,7 +2886,16 @@ app FqServerSelfHost:
                                 let mut tag = "W"
                                 if kind == "loop":
                                     tag = "L"
-                                let sw = send(ch, svPack([tag, id2.owner, svBoolText(id2.admin)] + svReqFields(q)))
+                                # /stats is run by the loop (it reads the loop's
+                                # counters), and on its priority inbox: a
+                                # supervisor's telemetry poll waits for the one
+                                # message the loop is handling, never behind a
+                                # backlog — a fabric daemon judges a node by how
+                                # long that poll takes
+                                let mut inbox2 = ch
+                                if tele:
+                                    inbox2 = pri
+                                let sw = send(inbox2, svPack([tag, id2.owner, svBoolText(id2.admin)] + svReqFields(q)))
                             let an = do svAwait(reply, reqid, deadline)
                             if an.timedOut:
                                 timedOut = true
@@ -2768,16 +2903,24 @@ app FqServerSelfHost:
                                 resp = do svRespAt(an.f)
                         if timedOut:
                             resp = do hEmpty(408)
-                        let e1 = send(ch, svPack(["E", "" + ((monoMs() - t0) * 1000), mclass, observed]))
+                        let e1 = send(ch, svPack(["E", "" + ((monoMs() - t0) * 1000), mclass, observed, svBoolText(svTelemetry(hd.req.method, hd.req.path))]))
                         resp = do svCors(cfg, head, resp)
                 if !stream && open:
-                    if !bodyRead:
+                    # a response written while draining ends its connection
+                    # (`connection: close`), as hyper's does once graceful
+                    # shutdown has begun
+                    let drainAtWrite = svDraining
+                    let persist = keep && resync && !drainAtWrite
+                    let wrote = do hWriteResponse(c, hd.req.method, resp, persist)
+                    # a body the answer did not need: dropped if it is
+                    # already here, else the connection is not reused
+                    let mut carried = true
+                    if !bodyRead && wrote && persist:
                         let dk = do hDiscardBody(c, rest, hd.framing, hd.length)
-                        resync = dk.ok
+                        carried = dk.ok
                         rest = dk.rest
-                    let wrote = do hWriteResponse(c, hd.req.method, resp, keep && resync)
                     pending = rest
-                    open = wrote && keep && resync
+                    open = wrote && persist && carried
         if !stream:
             let closed = closeConn(c)
         let freed = closeChannel(reply)
@@ -2896,7 +3039,7 @@ app FqServerSelfHost:
         svDraining = false
         let mut l = 0
         if tls:
-            let pw = do svEnvSet("FACETQL_TLS_IDENTITY_PASSWORD")
+            let pw = do svSettingSet("FACETQL_TLS_IDENTITY_PASSWORD")
             if !pw:
                 let wp = writeStderr("warning: --tls-identity was set without --tls-identity-password — trying an empty password. This will fail for any real PKCS#12 file.\n")
             l = listenTls(cfg.port, cfg.tlsIdentity, cfg.tlsPassword)
@@ -2917,23 +3060,28 @@ app FqServerSelfHost:
         svSnapshot = opened.st.eng
         svFeedCell = opened.st.feed
         let wch = channel()
-        detach svWriter(wch, ch, opened.st.cfg, opened.st.eng)
-        detach svLoop(ch, wch, sig, opened.st)
+        let pri = channel()
+        detach svWriter(wch, pri, opened.st.cfg, opened.st.eng)
+        detach svLoop(ch, pri, wch, sig, l, opened.st)
         let permit = channel()
+        # parked: where the accept loop waits once the listener is closed,
+        # until the loop's settle ends the process
+        let parked = channel()
         loop true:
             let c = accept(l)
             let draining = svDraining
             if draining:
                 let shut = closeConn(c)
+                let never = recv(parked)
             else:
                 if tls:
                     let askMsg = do svPack(["K", "" + permit])
                     let ask = send(ch, askMsg)
                     let granted = recv(permit)
                     if granted == "1":
-                        detach svServeConn(c, ch, cfg, true)
+                        detach svServeConn(c, ch, pri, cfg, true)
                     else:
                         let wc = writeStderr("warning: refusing a connection from " + connPeer(c) + ": at the concurrent-connection limit\n")
                         let refused = closeConn(c)
                 else:
-                    detach svServeConn(c, ch, cfg, false)
+                    detach svServeConn(c, ch, pri, cfg, false)

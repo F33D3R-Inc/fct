@@ -47,6 +47,7 @@ app AuthActions:
             ses.verified = do valTruthy(ver)
             ses.pendingMFA = ""
             w.sessions[i] = ses
+            w = do rtSesDirty(w, sid)
         return w
 
     proc rtJSONWith(status: int, keys: [text], raws: [text], cookie: HttpHeader) -> HttpServerResponse:
@@ -138,6 +139,7 @@ app AuthActions:
             w = do rtDurSave(w, "FacetUser", row)
             let rot = do rtRotateSession(w, sid)
             w = do rtSignIn(rot.w, rot.sid, row)
+            w = do rtRecordAudit(w, username, "signup", true, "")
             let tok0 = do rtSignValue(w, rot.sid)
             let r = do rtJSONWith(200, ["reload", "verifyToken", "token"], ["true", jsonQuote(verifyToken), jsonQuote(tok0)], rot.cookie)
             return RtHandled{resp: r, w: w}
@@ -146,6 +148,7 @@ app AuthActions:
             let password = do rtArgStr(args, 1)
             let locked = do rtLocked(w, username)
             if locked:
+                w = do rtRecordAudit(w, username, "login", false, "locked out")
                 let e = do rtErrWith(429, "account temporarily locked after too many attempts", ck)
                 return RtHandled{resp: e, w: w}
             let ui = do rtFindUserIndex(w, username)
@@ -159,6 +162,7 @@ app AuthActions:
                 ok = hash != "" && bcryptMatches(hash, password)
             if !ok:
                 w = do rtLockFail(w, username)
+                w = do rtRecordAudit(w, username, "login", false, "bad credentials")
                 let e2 = do rtErrWith(401, "invalid username or password", ck)
                 return RtHandled{resp: e2, w: w}
             w = do rtLockReset(w, username)
@@ -170,10 +174,13 @@ app AuthActions:
                     let mut ses = w.sessions[si]
                     ses.pendingMFA = username
                     w.sessions[si] = ses
+                    w = do rtSesDirty(w, sid)
+                w = do rtRecordAudit(w, username, "login", true, "mfa required")
                 let r2 = do rtJSONWith(200, ["mfa"], ["true"], ck)
                 return RtHandled{resp: r2, w: w}
             let rot = do rtRotateSession(w, sid)
             w = do rtSignIn(rot.w, rot.sid, u)
+            w = do rtRecordAudit(w, username, "login", true, "")
             let tok = do rtSignValue(w, rot.sid)
             let r3 = do rtJSONWith(200, ["reload", "token"], ["true", jsonQuote(tok)], rot.cookie)
             return RtHandled{resp: r3, w: w}
@@ -200,16 +207,20 @@ app AuthActions:
                 ok = enabled && totpValid(valToStr(sec), code)
             if !ok:
                 w = do rtLockFail(w, username)
+                w = do rtRecordAudit(w, username, "loginMFA", false, "bad code")
                 let e2 = do rtErrWith(401, "invalid code", ck)
                 return RtHandled{resp: e2, w: w}
             w = do rtLockReset(w, username)
             let rot = do rtRotateSession(w, sid)
             w = do rtSignIn(rot.w, rot.sid, u)
+            w = do rtRecordAudit(w, username, "loginMFA", true, "")
             let r = do rtJSONWith(200, ["reload"], ["true"], rot.cookie)
             return RtHandled{resp: r, w: w}
         if action == "logout":
             let si = do rtSessionIndex(w, sid)
+            let mut outActor = ""
             if si >= 0:
+                outActor = w.sessions[si].actor
                 let mut ses = w.sessions[si]
                 ses.actor = "guest"
                 ses.role = "guest"
@@ -217,7 +228,7 @@ app AuthActions:
                 ses.pendingMFA = ""
                 w.sessions[si] = ses
             let rot = do rtRotateSession(w, sid)
-            w = rot.w
+            w = do rtRecordAudit(rot.w, outActor, "logout", true, "")
             let r = do rtJSONWith(200, ["reload"], ["true"], rot.cookie)
             return RtHandled{resp: r, w: w}
         if action == "setRole":
@@ -228,9 +239,12 @@ app AuthActions:
                 return RtHandled{resp: e, w: w}
             let si = do rtSessionIndex(w, sid)
             let mut isAdmin = false
+            let mut callerActor = ""
             if si >= 0:
                 isAdmin = w.sessions[si].role == "admin"
+                callerActor = w.sessions[si].actor
             if !isAdmin:
+                w = do rtRecordAudit(w, callerActor, "setRole", false, "not admin")
                 let e2 = do rtErrWith(403, "forbidden: admin only", ck)
                 return RtHandled{resp: e2, w: w}
             let ui = do rtFindUserIndex(w, username)
@@ -247,6 +261,7 @@ app AuthActions:
                     ses2.role = role
                     w.sessions[k] = ses2
                 k = k + 1
+            w = do rtRecordAudit(w, callerActor, "setRole", true, username + " -> " + role)
             let r = do rtJSONWith(200, ["ok"], ["true"], ck)
             return RtHandled{resp: r, w: w}
         if action == "requestReset":
@@ -263,6 +278,7 @@ app AuthActions:
                 w = do rtSaveUser(w, ui, u)
                 keys = append(keys, "resetToken")
                 raws = append(raws, jsonQuote(token))
+            w = do rtRecordAudit(w, username, "requestReset", ui >= 0, "")
             let r = do rtJSONWith(200, keys, raws, none)
             return RtHandled{resp: r, w: w}
         if action == "resetPassword":
@@ -292,6 +308,7 @@ app AuthActions:
                     u2 = do valSet(u2, "resetToken", textVal(""))
                     u2 = do valSet(u2, "resetExpires", intVal(0))
                     w = do rtSaveUser(w, ui, u2)
+            w = do rtRecordAudit(w, username, "resetPassword", ok, "")
             if !ok:
                 let e3 = do rtErrWith(400, "invalid or expired reset token", none)
                 return RtHandled{resp: e3, w: w}
@@ -310,6 +327,7 @@ app AuthActions:
                     found = i
                 i = i + 1
             if found < 0:
+                w = do rtRecordAudit(w, "", "verifyEmail", false, "invalid token")
                 let e = do rtErrWith(400, "invalid verification token", ck)
                 return RtHandled{resp: e, w: w}
             let mut u = do valSet(rows[found], "verified", boolVal(true))
@@ -324,6 +342,7 @@ app AuthActions:
                     ses3.verified = true
                     w.sessions[k] = ses3
                 k = k + 1
+            w = do rtRecordAudit(w, uname, "verifyEmail", true, "")
             let r = do rtJSONWith(200, ["ok", "reload"], ["true", "true"], ck)
             return RtHandled{resp: r, w: w}
         if action == "enableMFA":
@@ -343,6 +362,7 @@ app AuthActions:
             let mut u = do valSet(rows[ui], "mfaSecret", textVal(secret))
             u = do valSet(u, "mfaEnabled", boolVal(false))
             w = do rtSaveUser(w, ui, u)
+            w = do rtRecordAudit(w, actor, "enableMFA", true, "")
             let uri = "otpauth://totp/" + rtPathSegment(w.g.app) + ":" + rtPathSegment(actor) + "?secret=" + secret + "&issuer=" + rtPathSegment(w.g.app)
             let r = do rtJSONWith(200, ["ok", "secret", "otpauth"], ["true", jsonQuote(secret), jsonQuote(uri)], ck)
             return RtHandled{resp: r, w: w}
@@ -364,6 +384,7 @@ app AuthActions:
                 if ok:
                     let u = do valSet(rows[ui], "mfaEnabled", boolVal(true))
                     w = do rtSaveUser(w, ui, u)
+            w = do rtRecordAudit(w, actor, "confirmMFA", ok, "")
             if !ok:
                 let e2 = do rtErrWith(400, "invalid code", ck)
                 return RtHandled{resp: e2, w: w}

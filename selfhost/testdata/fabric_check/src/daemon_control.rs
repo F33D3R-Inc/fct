@@ -2,14 +2,16 @@
 //!
 //! `ControlPlane` owns sockets and reads the wall clock inside every step,
 //! and its steps are private, so a scripted run cannot call it. This is its
-//! body, copied step for step (`cycle`, `probe`, `poll`, `decide`,
+//! body, copied step for step (`cycle`, `probe`, `ingest`, `decide`,
 //! `cooling`, `measure`, `publish_routing`, `drive_movers`,
 //! `mover_endpoint`, `record_transfer`, `record_copy`, `abort`, `drain`,
 //! `publish_status`), over the real FabricRuntime, the real
 //! MoverSupervisor (whose copy tasks are spawned onto a runtime nothing
 //! drives, so a started copy is recorded and never runs) and the real
-//! Status types — with "now", the sweep's probes and the telemetry sample
-//! taken from the script instead of the clock and the network, and the
+//! Status types — with "now" and the sweep's probes taken from the script
+//! instead of the clock and the network, a telemetry sample arriving as a
+//! step of its own (the pump samples beside the cycle, never inside it),
+//! and the
 //! front door reduced to the routing table it was last handed. No
 //! placement store (that path is I/O end to end).
 //!
@@ -58,7 +60,6 @@ struct Plane {
     cycles: u64,
     draining: bool,
     next_probe_ms: u64,
-    next_poll_ms: u64,
     decisions: DecisionCounters,
     probes: BTreeMap<String, (String, u64)>,
     samples: BTreeMap<String, String>,
@@ -150,7 +151,6 @@ impl Plane {
             cycles: 0,
             draining: false,
             next_probe_ms: 0,
-            next_poll_ms: 0,
             decisions: DecisionCounters::default(),
             probes: BTreeMap::new(),
             samples: BTreeMap::new(),
@@ -168,11 +168,6 @@ impl Plane {
                 .unwrap_or_default();
             self.probe(now, swept);
             self.next_probe_ms = now + self.settings.cadence.liveness_probe_ms;
-        }
-
-        if now >= self.next_poll_ms {
-            self.poll(&step["sample"]);
-            self.next_poll_ms = now + self.settings.cadence.telemetry_poll_ms;
         }
 
         if !self.draining {
@@ -203,7 +198,7 @@ impl Plane {
         }
     }
 
-    fn poll(&mut self, sample: &Value) {
+    fn ingest(&mut self, sample: &Value) {
         if let Some(notes) = sample["notes"].as_array() {
             for note in notes {
                 self.samples.insert(text(&note[0]), text(&note[1]));
@@ -519,6 +514,49 @@ impl Plane {
             report.applied_writes,
             report.verdict.label()
         ))
+    }
+
+    /// control.rs `migrate`, copied: an operator's move.
+    fn migrate(
+        &mut self,
+        target: fabric_controller::ActionTarget,
+        destination: DbmsId,
+    ) -> Result<String, String> {
+        if self.draining {
+            return Err("fabricd is draining: it admits no new action".to_string());
+        }
+
+        let baseline = self
+            .runtime
+            .analyzer()
+            .profiles()
+            .find(|profile| {
+                profile.shard_id == target.shard_id && profile.coordinate == target.coordinate
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                fabric_workload::WorkloadProfile::from_metrics(
+                    target.shard_id,
+                    target.coordinate,
+                    fabric_telemetry::WorkloadMetrics::default(),
+                )
+            });
+
+        let envelope = DecisionEnvelope::requested_by_operator(
+            target,
+            fabric_optimizer::OptimizationAction::Move {
+                target: destination.clone(),
+            },
+            self.runtime.clock_ms(),
+            self.runtime.fleet_view().generation(),
+        );
+
+        let id = self
+            .runtime
+            .submit(envelope, &baseline)
+            .map_err(|error| error.to_string())?;
+
+        Ok(format!("{id}: admitted, move {target} to '{}'", destination.0))
     }
 
     fn abort(&mut self, id: ActionId) -> Result<String, String> {
@@ -976,6 +1014,12 @@ fn control_case(line: &str) -> String {
                 out.push(p.status_json());
             }
 
+            "sample" => {
+                let p = plane.as_mut().unwrap();
+                p.ingest(&step["sample"]);
+                out.push("sampled".to_string());
+            }
+
             "transfer" => {
                 let p = plane.as_mut().unwrap();
                 let id = ActionId(u(&step["id"]));
@@ -1009,6 +1053,20 @@ fn control_case(line: &str) -> String {
             "abort" => {
                 let p = plane.as_mut().unwrap();
                 let result = p.abort(ActionId(u(&step["id"])));
+                p.publish_routing();
+                p.publish_status(now);
+                out.push(format!("{}|{}", answer(result), p.status_json()));
+            }
+
+            "migrate" => {
+                let p = plane.as_mut().unwrap();
+                let result = p.migrate(
+                    fabric_controller::ActionTarget::new(
+                        u(&step["shard"]),
+                        Coordinate::new(u(&step["x"]) as u8, u(&step["y"]) as u8),
+                    ),
+                    DbmsId::new(text(&step["destination"])),
+                );
                 p.publish_routing();
                 p.publish_status(now);
                 out.push(format!("{}|{}", answer(result), p.status_json()));

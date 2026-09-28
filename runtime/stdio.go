@@ -77,6 +77,34 @@ func (s *Server) ioReadStdin() (any, error) {
 	return string(b), nil
 }
 
+// ioReadStdinLine implements `readStdinLine() -> text`: one line of
+// standard input, its "\n" included — what an interactive prompt reads,
+// where readStdin would wait for the end of input. "" at end of input. It
+// reads a byte at a time so nothing past the line is consumed: a later
+// readStdinLine or readStdin sees exactly what followed it.
+func (s *Server) ioReadStdinLine() (any, error) {
+	s.console.mu.Lock()
+	defer s.console.mu.Unlock()
+	var line []byte
+	b := make([]byte, 1)
+	for {
+		n, err := s.console.in.Read(b)
+		if n == 1 {
+			line = append(line, b[0])
+			if b[0] == '\n' {
+				break
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("readStdinLine: %v", err)
+		}
+	}
+	return string(line), nil
+}
+
 // SetDataDir moves the io.file sandbox root. `facet exec` roots it at the
 // directory the command was run from (unless FACET_DATA_DIR says otherwise),
 // because a command's file arguments are relative to where its operator is.

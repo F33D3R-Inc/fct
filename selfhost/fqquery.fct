@@ -272,9 +272,45 @@ app FqQuerySelfHost:
                 return rv2
             let res = do prBinOp(op2.s, lv2.v, rv2.v)
             return res
+        # the one function a predicate may call: `lower(x)`, as the fct
+        # language's lower (predicate.rs's go_lower is Go's strings.ToLower;
+        # here it is the builtin itself)
+        if kind == "call":
+            let nm = do pjText(e, "name")
+            if nm.has && nm.s == "lower":
+                let a = do pjMember(e, "args")
+                let mut args = []
+                if a.ok && a.v.kind == "arr":
+                    args = a.v.items
+                if len(args) != 1:
+                    let ea = do prErr("lower takes exactly one argument")
+                    return ea
+                let av = do prEval(args[0], itemVar, data, depth + 1)
+                if !av.ok:
+                    return av
+                let lt = do prLowerText(av.v)
+                let o8 = do prOk(FqJ{kind: "str", b: false, s: lt, f: 0.0, items: [], keys: []})
+                return o8
+            let nd = do prDebugOptStr(nm)
+            let ec = do prErr("cannot evaluate a call to " + nd + ": the only function a predicate may call is lower")
+            return ec
         let kq = do ckQuote(kind)
         let e9 = do prErr("cannot evaluate " + kq + " expression")
         return e9
+
+    # prLowerText: lower_text — a string lowered, null as "", a bool or a
+    # number (any other value) as the text serde_json writes it, lowered.
+    proc prLowerText(v: FqJ) -> text:
+        if v.kind == "str":
+            return lower(v.s)
+        if v.kind == "null":
+            return ""
+        if v.kind == "bool":
+            if v.b:
+                return "true"
+            return "false"
+        let t = do fjText(v)
+        return lower(t)
 
     proc prNumericPairErr(op: text, l: FqJ, r: FqJ) -> PredR:
         let oq = do ckQuote(op)
@@ -554,9 +590,23 @@ app FqQuerySelfHost:
                 return PjText{has: true, s: v.s}
         return none
 
+    # prIsLoweredField: `lower(item.field)`.
+    proc prIsLoweredField(e: FqJ, itemVar: text, field: text) -> bool:
+        let k = do pjKind(e)
+        let nm = do pjText(e, "name")
+        if k != "call" || !nm.has || nm.s != "lower":
+            return false
+        let a = do pjMember(e, "args")
+        if !a.ok || a.v.kind != "arr" || len(a.v.items) != 1:
+            return false
+        let f = do prIsFieldAccess(a.v.items[0], itemVar, field)
+        return f
+
     # prSubstringLiterals: substring_literals — every contains/starts_with/
-    # ends_with literal on the field among the conjuncts.
-    proc prSubstringLiterals(e: FqJ, itemVar: text, field: text, depth: int, acc: [text]) -> [text]:
+    # ends_with literal on the field among the conjuncts; lowered: on
+    # `lower(field)` instead (lowered_substring_literals, what a folded
+    # index serves).
+    proc prSubstringLiterals(e: FqJ, itemVar: text, field: text, depth: int, acc: [text], lowered: bool) -> [text]:
         if depth >= 64:
             return acc
         let k = do pjKind(e)
@@ -568,12 +618,16 @@ app FqQuerySelfHost:
             return acc
         let op = do pjText(e, "op")
         if op.has && op.s == "&&":
-            let a = do prSubstringLiterals(l.v, itemVar, field, depth + 1, acc)
-            let b = do prSubstringLiterals(r.v, itemVar, field, depth + 1, a)
+            let a = do prSubstringLiterals(l.v, itemVar, field, depth + 1, acc, lowered)
+            let b = do prSubstringLiterals(r.v, itemVar, field, depth + 1, a, lowered)
             return b
         if op.has && (op.s == "contains" || op.s == "starts_with" || op.s == "ends_with"):
             let rk = do pjKind(r.v)
-            let fa = do prIsFieldAccess(l.v, itemVar, field)
+            let mut fa = false
+            if lowered:
+                fa = prIsLoweredField(l.v, itemVar, field)
+            else:
+                fa = prIsFieldAccess(l.v, itemVar, field)
             if rk != "lit" || !fa:
                 return acc
             let v = do prLitValue(r.v)
@@ -1187,7 +1241,7 @@ app FqQuerySelfHost:
             let at = order[oi]
             let def = e.st.ix.text[at].def
             if def.kind == q.kind:
-                let lits = do prSubstringLiterals(q.predicate, q.itemVar, def.field, 0, [])
+                let lits = do prSubstringLiterals(q.predicate, q.itemVar, def.field, 0, [], def.folded)
                 if len(lits) > 0:
                     let mut gs = []
                     let nl = len(lits)

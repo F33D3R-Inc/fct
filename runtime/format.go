@@ -159,6 +159,18 @@ func ed25519Verify(pubB64, message, sigB64 string) bool {
 // canonicalJSON is a value's canonical JSON text: object keys sorted, no HTML
 // escaping, no trailing newline — the bytes a content id is hashed from, the
 // same JSON.stringify of a key-sorted object gives.
+// jsonQuote is the jsonQuote(s) builtin: s as a JSON string literal,
+// exactly as json.Marshal writes a string — `"` and `\` escaped, \n \r \t
+// \b \f by name, every other control character as \u00xx, each invalid
+// UTF-8 byte as the character U+FFFD, and HTML-safe (<, >, &, U+2028 and
+// U+2029 as \u escapes) — the spelling of every string in a compiled IR
+// and an API reply. (canonicalJson is the one place the runtime writes JSON
+// without the HTML escaping.)
+func jsonQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
 func canonicalJSON(v any) string {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)

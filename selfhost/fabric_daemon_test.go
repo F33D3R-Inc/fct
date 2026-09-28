@@ -384,6 +384,17 @@ func fdtConfigCorpus(t *testing.T) []string {
 		`"policy": {"max_decision_age_ms": 1, "min_confidence": 0.5, "min_replicas": 3, "max_node_utilization": 1, "max_concurrent_actions": 0, "max_actions_per_node": 18446744073709551615, "phase_timeout_ms": 2, "measurement_settle_ms": 3, "measurement_deadline_ms": 4, "outcome_noise_floor": -0.0}`,
 		`"policy": {"min_confidence": 1e-7, "outcome_noise_floor": 12345678.9}`,
 		`"data_listen": "[::1]:7710", "admin_listen": "[fe80::1%2]:7711"`,
+		// the probe timeout against the silence budget (config.rs
+		// a_probe_timeout_not_shorter_than_the_silence_budget_is_refused and
+		// its edges): equal, one either side, the default timeout against a
+		// derived budget, a zero timeout (read as 1) and the largest.
+		`"cadence": {"liveness_probe_ms": 1000}, "silence_budget_ms": 3000, "probe_timeout_ms": 3000`,
+		`"silence_budget_ms": 3000, "probe_timeout_ms": 2999`, `"silence_budget_ms": 3000, "probe_timeout_ms": 3001`,
+		`"silence_budget_ms": 2000`, `"silence_budget_ms": 2001`, `"cadence": {"liveness_probe_ms": 667}`, `"cadence": {"liveness_probe_ms": 666}`,
+		`"cadence": {"liveness_probe_ms": 1}, "silence_budget_ms": 1, "probe_timeout_ms": 0`,
+		`"cadence": {"liveness_probe_ms": 1}, "silence_budget_ms": 2, "probe_timeout_ms": 0`,
+		`"silence_budget_ms": 18446744073709551615, "probe_timeout_ms": 18446744073709551615`,
+		`"silence_budget_ms": 18446744073709551615, "probe_timeout_ms": 18446744073709551614`,
 	} {
 		add(fdtWith(extra))
 	}
@@ -851,8 +862,9 @@ type fdtScript struct {
 func (s *fdtScript) add(step map[string]any) { s.steps = append(s.steps, step) }
 
 // cycle at `now`, both instances answering as `dest` says for the
-// destination, the hot sample when `hot`.
-func fdtCycleStep(now int64, dest string, hot bool) map[string]any {
+// destination. Telemetry is not part of a cycle (the daemon's pump samples
+// beside it): see fdtSampleStep and (*fdtScript).cycle.
+func fdtCycleStep(now int64, dest string) map[string]any {
 	destProbe := []any{fdtDestination, "Serving", 200, ""}
 	switch dest {
 	case "answering":
@@ -860,17 +872,28 @@ func fdtCycleStep(now int64, dest string, hot bool) map[string]any {
 	case "gone":
 		destProbe = []any{fdtDestination, "Unreachable", 0, "connection refused or unresolvable"}
 	}
-	messages := []any{}
-	notes := []any{}
-	if hot {
-		messages = append(messages, fdtDuress(now))
-		notes = append(notes, []any{fdtSource, "sampled"})
-	}
 	return map[string]any{
 		"op": "cycle", "now": now,
 		"probes": []any{[]any{fdtSource, "Serving", 200, ""}, destProbe},
-		"sample": map[string]any{"messages": messages, "notes": notes},
 	}
+}
+
+// fdtSampleStep: the pump's finished sweep arriving at the loop, the hot
+// cell's observation stamped `at` (the wall time the sweep came back).
+func fdtSampleStep(now, at int64) map[string]any {
+	return map[string]any{
+		"op": "sample", "now": now,
+		"sample": map[string]any{"messages": []any{fdtDuress(at)}, "notes": []any{[]any{fdtSource, "sampled"}}},
+	}
+}
+
+// cycle: a cycle at `now`, preceded when `hot` by a sample that arrived at
+// that instant.
+func (s *fdtScript) cycle(now int64, dest string, hot bool) {
+	if hot {
+		s.add(fdtSampleStep(now, now))
+	}
+	s.add(fdtCycleStep(now, dest))
 }
 
 func fdtScriptLine(tokens bool, s fdtScript) string {
@@ -904,24 +927,24 @@ func fdtControlCorpus() []string {
 		s.add(map[string]any{"op": "boot", "now": t0})
 		now := t0 + 5
 		for i := 0; i < 8; i++ {
-			s.add(fdtCycleStep(now, "serving", true))
+			s.cycle(now, "serving", true)
 			now += 50
 		}
 		s.add(map[string]any{"op": "transfer", "id": 1, "atoms": 1, "bytes": 4096, "resident": 4096, "now": now})
 		for i := 0; i < 8; i++ {
 			now += 50
-			s.add(fdtCycleStep(now, "serving", true))
+			s.cycle(now, "serving", true)
 		}
 		s.add(map[string]any{"op": "abort", "id": 1, "now": now + 1})
 		for i := 0; i < 4; i++ {
 			now += 50
-			s.add(fdtCycleStep(now, "answering", true))
+			s.cycle(now, "answering", true)
 		}
 		for i := 0; i < 6; i++ {
 			now += 1500
-			s.add(fdtCycleStep(now, "gone", true))
+			s.cycle(now, "gone", true)
 		}
-		s.add(map[string]any{"op": "drain", "now": now + 10, "cycles": []any{fdtCycleStep(now+60, "gone", true)}})
+		s.add(map[string]any{"op": "drain", "now": now + 10, "cycles": []any{fdtCycleStep(now+60, "gone")}})
 		out = append(out, fdtScriptLine(false, s))
 	}
 
@@ -931,10 +954,10 @@ func fdtControlCorpus() []string {
 		s.add(map[string]any{"op": "boot", "now": t0})
 		now := t0 + 5
 		for i := 0; i < 5; i++ {
-			s.add(fdtCycleStep(now, "serving", true))
+			s.cycle(now, "serving", true)
 			now += 50
 		}
-		s.add(map[string]any{"op": "drain", "now": now, "cycles": []any{fdtCycleStep(now+20, "serving", true), fdtCycleStep(now+40, "serving", true)}})
+		s.add(map[string]any{"op": "drain", "now": now, "cycles": []any{fdtCycleStep(now+20, "serving"), fdtCycleStep(now+40, "serving")}})
 		out = append(out, fdtScriptLine(false, s))
 	}
 
@@ -943,13 +966,13 @@ func fdtControlCorpus() []string {
 	{
 		var s fdtScript
 		s.add(map[string]any{"op": "boot", "now": t0})
-		s.add(fdtCycleStep(t0, "serving", false))
+		s.cycle(t0, "serving", false)
 		s.add(map[string]any{"op": "transfer", "id": 99, "atoms": 1, "bytes": 1, "resident": nil, "now": t0 + 1})
 		s.add(map[string]any{"op": "abort", "id": 99, "now": t0 + 2})
 		s.add(map[string]any{"op": "copy", "id": 99, "now": t0 + 3, "report": map[string]any{"rows": 0, "bytes": 0, "resident": nil, "snapshot_complete": false, "observed": 0, "applied": 0, "verdict": map[string]any{"kind": "Pending"}}})
 		now := t0 + 5
 		for i := 0; i < 5; i++ {
-			s.add(fdtCycleStep(now, "serving", true))
+			s.cycle(now, "serving", true)
 			now += 50
 		}
 		s.add(map[string]any{"op": "abort", "id": 1, "now": now})
@@ -957,9 +980,9 @@ func fdtControlCorpus() []string {
 		s.add(map[string]any{"op": "transfer", "id": 1, "atoms": 5, "bytes": uint64(18446744073709551615), "resident": nil, "now": now + 2})
 		for i := 0; i < 4; i++ {
 			now += 50
-			s.add(fdtCycleStep(now, "serving", true))
+			s.cycle(now, "serving", true)
 		}
-		s.add(map[string]any{"op": "drain", "now": now, "cycles": []any{fdtCycleStep(now+20, "serving", false), fdtCycleStep(now+6000, "serving", false)}})
+		s.add(map[string]any{"op": "drain", "now": now, "cycles": []any{fdtCycleStep(now+20, "serving"), fdtCycleStep(now+6000, "serving")}})
 		out = append(out, fdtScriptLine(false, s))
 	}
 
@@ -971,7 +994,7 @@ func fdtControlCorpus() []string {
 		s.add(map[string]any{"op": "boot", "now": t0})
 		now := t0 + 5
 		for i := 0; i < 5; i++ {
-			s.add(fdtCycleStep(now, "serving", true))
+			s.cycle(now, "serving", true)
 			now += 50
 		}
 		rep := func(rows, bytes int64, resident any, done bool, observed, applied int64, verdict map[string]any) map[string]any {
@@ -979,14 +1002,14 @@ func fdtControlCorpus() []string {
 		}
 		s.add(map[string]any{"op": "copy", "id": 1, "now": now, "report": rep(10, 2048, nil, false, 3, 0, map[string]any{"kind": "Pending"})})
 		s.add(map[string]any{"op": "copy", "id": 1, "now": now + 1, "report": rep(20, 4096, 8192, true, 5, 7, map[string]any{"kind": "Failed", "reason": "row Post:1 differs in `owner`", "at_ms": now + 1})})
-		s.add(fdtCycleStep(now+50, "serving", true))
+		s.cycle(now+50, "serving", true)
 		s.add(map[string]any{"op": "copy", "id": 1, "now": now + 60, "report": rep(20, 4096, 8192, true, 5, 5, fdtVerified(20, now+60))})
 		for i := 0; i < 6; i++ {
 			now += 50
-			s.add(fdtCycleStep(now+60, "serving", true))
+			s.cycle(now+60, "serving", true)
 		}
 		s.add(map[string]any{"op": "copy", "id": 1, "now": now + 70, "report": rep(20, 4096, 8192, true, 6, 6, fdtVerified(20, now+70))})
-		s.add(map[string]any{"op": "drain", "now": now + 80, "cycles": []any{fdtCycleStep(now+6000, "serving", false)}})
+		s.add(map[string]any{"op": "drain", "now": now + 80, "cycles": []any{fdtCycleStep(now+6000, "serving")}})
 		out = append(out, fdtScriptLine(true, s))
 	}
 
@@ -998,15 +1021,64 @@ func fdtControlCorpus() []string {
 		s.add(map[string]any{"op": "boot", "now": t0})
 		now := t0 + 5
 		for i := 0; i < 8; i++ {
-			s.add(fdtCycleStep(now, "serving", true))
+			s.cycle(now, "serving", true)
 			now += 50
 		}
 		s.add(map[string]any{"op": "transfer", "id": 1, "atoms": 1, "bytes": 4096, "resident": 4096, "now": now})
 		for i := 0; i < k; i++ {
 			now += 50
-			s.add(fdtCycleStep(now, "serving", true))
+			s.cycle(now, "serving", true)
 		}
-		s.add(map[string]any{"op": "drain", "now": now + 1, "cycles": []any{fdtCycleStep(now+9000, "serving", true)}})
+		s.add(map[string]any{"op": "drain", "now": now + 1, "cycles": []any{fdtCycleStep(now+9000, "serving")}})
+		out = append(out, fdtScriptLine(false, s))
+	}
+
+	// A slow /stats: samples arrive between cycles stamped with the time
+	// they came back, one of them a whole silence budget after the probes
+	// before it. The probes never waited for it, so the cycle that follows
+	// has probed at that instant too, and nothing is judged lost.
+	{
+		var s fdtScript
+		s.add(map[string]any{"op": "boot", "now": t0})
+		now := t0 + 5
+		for i := 0; i < 3; i++ {
+			s.cycle(now, "serving", false)
+			now += 100
+		}
+		s.add(fdtSampleStep(now-50, now-50))
+		s.cycle(now, "serving", false)
+		now += 6000
+		s.add(fdtSampleStep(now, now))
+		s.cycle(now, "serving", false)
+		s.cycle(now+100, "serving", false)
+		out = append(out, fdtScriptLine(false, s))
+	}
+
+	// An operator's moves (POST /actions; control.rs `migrate`), with no
+	// telemetry pressure so the loop decides nothing itself: admitted and
+	// run to its transfer; the same cell again, an unknown destination, the
+	// source itself and a cell off the grid, refused by the controller; an
+	// abort; and a request after the drain began.
+	{
+		var s fdtScript
+		s.add(map[string]any{"op": "boot", "now": t0})
+		now := t0 + 5
+		for i := 0; i < 3; i++ {
+			s.cycle(now, "serving", false)
+			now += 50
+		}
+		s.add(map[string]any{"op": "migrate", "shard": 1, "x": 0, "y": 0, "destination": fdtDestination, "now": now})
+		s.add(map[string]any{"op": "migrate", "shard": 1, "x": 0, "y": 0, "destination": fdtDestination, "now": now + 1})
+		s.add(map[string]any{"op": "migrate", "shard": 1, "x": 0, "y": 0, "destination": "nowhere", "now": now + 2})
+		s.add(map[string]any{"op": "migrate", "shard": 1, "x": 0, "y": 0, "destination": fdtSource, "now": now + 3})
+		s.add(map[string]any{"op": "migrate", "shard": 1, "x": 200, "y": 0, "destination": fdtDestination, "now": now + 4})
+		for i := 0; i < 4; i++ {
+			now += 50
+			s.cycle(now, "serving", false)
+		}
+		s.add(map[string]any{"op": "abort", "id": 1, "now": now + 1})
+		s.add(map[string]any{"op": "drain", "now": now + 10, "cycles": []any{fdtCycleStep(now+60, "serving")}})
+		s.add(map[string]any{"op": "migrate", "shard": 1, "x": 0, "y": 0, "destination": fdtDestination, "now": now + 100})
 		out = append(out, fdtScriptLine(false, s))
 	}
 	return out
@@ -1089,6 +1161,20 @@ func fdtAdminCorpus(t *testing.T) []string {
 		{"GET", "/fleet", [][]string{{"x-api-key", "other"}, {"x-api-key", "secret"}}, "", ok},
 		{"GET", "/fleet", [][]string{{"x-api-key", "secret"}, {"x-api-key", "other"}}, "", ok},
 		{"OPTIONS", "/fleet", key, "", ok},
+		// POST /actions: an operator asking for a move (admin.rs `migrate`).
+		{"POST", "/actions", key, `{"shard":1,"x":0,"y":0,"destination":"us-west-db-0"}`, map[string]any{"ok": "action-1: admitted, move shard 1 (0,0) to 'us-west-db-0'"}},
+		{"POST", "/actions", key, `{"shard":1,"x":0,"y":0,"destination":"us-west-db-0"}`, map[string]any{"err": "shard 1 (0,0) already has action-1 (move) in flight"}},
+		{"POST", "/actions", key, `{"shard":1,"x":0,"y":0,"destination":"us-west-db-0"}`, "stopped"},
+		{"POST", "/actions", key, `{"shard":1,"x":0,"y":0,"destination":"us-west-db-0"}`, "dropped"},
+		{"POST", "/actions", nil, `{"shard":1,"x":0,"y":0,"destination":"us-west-db-0"}`, ok},
+		{"POST", "/actions", key, `{"shard":1,"x":0,"y":0}`, ok},
+		{"POST", "/actions", key, `{"shard":1,"x":0,"y":0,"destination":"d","why":"x"}`, ok},
+		{"POST", "/actions", key, `{"shard":1,"x":300,"y":0,"destination":"d"}`, ok},
+		{"POST", "/actions", key, `{"shard":-1,"x":0,"y":0,"destination":"d"}`, ok},
+		{"POST", "/actions", key, `{"shard":18446744073709551615,"x":255,"y":0,"destination":""}`, ok},
+		{"POST", "/actions", key, `{"shard":"1","x":0,"y":0,"destination":"d"}`, ok},
+		{"POST", "/actions", key, `not json`, ok}, {"POST", "/actions", key, ``, ok},
+		{"PUT", "/actions", key, ``, ok}, {"DELETE", "/actions", nil, ``, ok},
 	}
 	var out []string
 	line := func(token, st string, cs c) {
@@ -1301,6 +1387,12 @@ func TestFabricDaemonProcess(t *testing.T) {
 	if got := status["placements"].([]any)[0].(map[string]any)["holder"]; got != fdtSource {
 		t.Errorf("holder %v", got)
 	}
+	// The declaration asked for port 0 on both: every status names the ports
+	// actually bound, as the banner does (tests/daemon.rs
+	// the_status_names_the_ports_actually_bound).
+	if status["data_listen"] != fmt.Sprintf("127.0.0.1:%d", dataPort) || status["admin_listen"] != fmt.Sprintf("127.0.0.1:%d", adminPort) {
+		t.Errorf("the status names %v and %v; the daemon is serving on %d and %d", status["data_listen"], status["admin_listen"], dataPort, adminPort)
+	}
 	if g, _ := status["routing_generation"].(float64); g <= 0 {
 		t.Errorf("routing_generation %v", status["routing_generation"])
 	}
@@ -1370,53 +1462,14 @@ func (l fdtLockedWriter) Write(p []byte) (int, error) {
 
 // ---------------------------------------------------------------- main.rs, against the real binary
 
-var (
-	fdtBinOnce                 sync.Once
-	fdtFabricdBin, fdtFacetBin string
-	fdtBinErr                  string
-)
+var fdtFabricdBin, fdtFacetBin string
 
-// fdtBinaries builds the real `fabricd` (cargo build --locked into a
-// temporary target directory; fabric/ is untouched) and this tree's
-// `facet`, once, or skips when cargo is not installed.
+// fdtBinaries: the real `fabricd` (fabricWorkspaceBinary) and this tree's
+// `facet` (fqServerFacet), each built once per package run.
 func fdtBinaries(t *testing.T) (string, string) {
 	t.Helper()
-	fdtBinOnce.Do(func() {
-		cargo, err := exec.LookPath("cargo")
-		if err != nil {
-			fdtBinErr = "skip: cargo is not installed"
-			return
-		}
-		target := os.Getenv("FCT_FABRICD_TARGET")
-		if target == "" {
-			target = filepath.Join(os.TempDir(), "fct-fabricd-target")
-		}
-		cmd := exec.Command(cargo, "build", "--locked", "--quiet", "-p", "fabric-daemon", "--bin", "fabricd")
-		cmd.Dir = "../../fabric"
-		cmd.Env = append(os.Environ(), "CARGO_TARGET_DIR="+target)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			fdtBinErr = "cargo build fabricd failed: " + err.Error() + "\n" + string(out)
-			return
-		}
-		fdtFabricdBin = filepath.Join(target, "debug", "fabricd")
-		dir, err := os.MkdirTemp("", "fdt-facet")
-		if err != nil {
-			fdtBinErr = err.Error()
-			return
-		}
-		fdtFacetBin = filepath.Join(dir, "facet")
-		build := exec.Command("go", "build", "-o", fdtFacetBin, "./cmd/facet")
-		build.Dir = ".."
-		if out, err := build.CombinedOutput(); err != nil {
-			fdtBinErr = "go build facet failed: " + err.Error() + "\n" + string(out)
-		}
-	})
-	if strings.HasPrefix(fdtBinErr, "skip: ") {
-		t.Skip(fdtBinErr)
-	}
-	if fdtBinErr != "" {
-		t.Fatal(fdtBinErr)
-	}
+	fdtFabricdBin = fabricWorkspaceBinary(t, "fabricd")
+	fdtFacetBin = fqServerFacet(t)
 	return fdtFabricdBin, fdtFacetBin
 }
 
@@ -1454,7 +1507,9 @@ func fdtRunCommand(t *testing.T, cmd *exec.Cmd) fdtRunResult {
 	if err != nil {
 		ee, ok := err.(*exec.ExitError)
 		if !ok {
-			t.Fatal(err)
+			// Error, not Fatal: callers run commands from goroutines.
+			t.Errorf("%v: %v", cmd.Args, err)
+			return fdtRunResult{out.String(), errOut.String(), -1}
 		}
 		code = ee.ExitCode()
 	}
@@ -1505,10 +1560,25 @@ func TestFabricDaemonMainMatchesRust(t *testing.T) {
 		{[]string{"FABRIC_CONFIG="}, nil}, {[]string{"FABRIC_CONFIG=bad.json"}, []string{"--config"}},
 		{[]string{"FABRIC_CONFIG=good.json", "FABRIC_ADMIN_TOKEN="}, nil},
 	}
-	for _, c := range cases {
-		rust := fdtRunCommand(t, fdtCommand(false, dir, c.env, c.args...))
-		port := fdtRunCommand(t, fdtCommand(true, dir, c.env, c.args...))
-		if rust != port {
+	// Every case is its own pair of short-lived processes that only read
+	// the directory, so they run side by side; answers are compared in
+	// case order.
+	type pair struct{ rust, port fdtRunResult }
+	got := make([]pair, len(cases))
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 8)
+	for i, c := range cases {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			got[i] = pair{fdtRunCommand(t, fdtCommand(false, dir, c.env, c.args...)), fdtRunCommand(t, fdtCommand(true, dir, c.env, c.args...))}
+		}()
+	}
+	wg.Wait()
+	for i, c := range cases {
+		if rust, port := got[i].rust, got[i].port; rust != port {
 			t.Errorf("fabricd %q (env %q):\n rust exit=%d stdout=%q stderr=%q\n port exit=%d stdout=%q stderr=%q",
 				c.args, c.env, rust.code, rust.stdout, rust.stderr, port.code, port.stdout, port.stderr)
 		}
@@ -1530,7 +1600,8 @@ func TestFabricDaemonSigtermMatchesRust(t *testing.T) {
 		config := fmt.Sprintf(`{"data_listen": "127.0.0.1:%d", "admin_listen": "127.0.0.1:%d",
 			"backends": [{"id": "db-a", "url": %q, "placements": [{"shard": 1, "x": 0, "y": 0}]}],
 			"keyspace": {"fallback": {"shard": 1, "x": 0, "y": 0}},
-			"cadence": {"liveness_probe_ms": 100, "telemetry_poll_ms": 100, "control_cycle_ms": 50}}`, dataPort, adminPort, upstream.URL)
+			"cadence": {"liveness_probe_ms": 100, "telemetry_poll_ms": 100, "control_cycle_ms": 50},
+			"silence_budget_ms": 5000, "probe_timeout_ms": 300}`, dataPort, adminPort, upstream.URL)
 		if err := os.WriteFile(filepath.Join(dir, "fabric.json"), []byte(config), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -2168,17 +2239,28 @@ func TestFabricDaemonGracefulShutdownMatchesRust(t *testing.T) {
 // fdtLoadedFacetql starts a FacetQL pinned to one CPU core with a small
 // admission cap (tests/mover.rs start_with(..., FACETQL_MAX_CONCURRENT_REQUESTS
 // = 6, taskset)).
-func fdtLoadedFacetql(t *testing.T, taskset string) (string, func()) {
+func fdtLoadedFacetql(t *testing.T, taskset, engine string) (string, func()) {
 	t.Helper()
-	bin := fqlLiveServerBin(t)
 	var log fdtSyncBuffer
-	cmd := exec.Command(taskset, "-c", "0", bin, "start")
+	var cmd *exec.Cmd
+	dataDir := t.TempDir()
+	if engine == "rust" {
+		cmd = exec.Command(taskset, "-c", "0", fqlLiveServerBin(t), "start")
+	} else {
+		// fqserver.fct's files live in its data directory, which is its
+		// whole file sandbox (FACET_DATA_DIR).
+		fdtBinaries(t)
+		server, _ := filepath.Abs("fqserver.fct")
+		cmd = exec.Command(taskset, "-c", "0", fdtFacetBin, "exec", server)
+		cmd.Dir = dataDir
+		cmd.Env = append(cmd.Env, "FACET_DATA_DIR="+dataDir)
+	}
 	// Exactly the crate's Instance::start_with environment: development
 	// posture (its dev master key), one token that is both owner and
 	// admin, the admission cap, and nothing else.
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(append(os.Environ(), cmd.Env...),
 		"FACETQL_ENV=development",
-		"ENOCHIAN_DATA_DIR="+t.TempDir(),
+		"ENOCHIAN_DATA_DIR="+dataDir,
 		"ENOCHIAN_PORT=0",
 		"ENOCHIAN_TOKENS=app-secret:app:admin",
 		"FACETQL_MAX_CONCURRENT_REQUESTS=6",
@@ -2258,9 +2340,9 @@ func fdtPostJSON(ts *httptest.Server, action string, args ...any) (map[string]an
 // the test goroutine (a t.Fatal on the sampling goroutine would end that
 // goroutine alone and leave this one blocked on the channel, the instance
 // leaked and the run hung until go test's timeout).
-func fdtLoadedWindow(t *testing.T, ts *httptest.Server, checkBin, taskset string) (port, crate string) {
+func fdtLoadedWindow(t *testing.T, ts *httptest.Server, checkBin, taskset, engine string) (port, crate string) {
 	t.Helper()
-	base, stop := fdtLoadedFacetql(t, taskset)
+	base, stop := fdtLoadedFacetql(t, taskset, engine)
 	defer stop()
 	// The poller's baseline is taken before any load, as in the crate's
 	// test: the load starts once dcaLoadedCell is under way.
@@ -2342,9 +2424,17 @@ func fdtLoadedWindow(t *testing.T, ts *httptest.Server, checkBin, taskset string
 // facetql_stats, input for input: a real FacetQL pinned to one core with an
 // admission cap of 6, loaded by 60 concurrent writers of 20-insert, 9 KB
 // transactions; the port's production poller samples it every 500 ms for up
-// to 20 s (dcaLoadedCell) and the port's optimizer decides. Pressure must
-// leave 0.0, and within 8 fresh attempts the optimizer must propose an
-// action for a cell it saw only through GET /stats.
+// to 20 s (dcaLoadedCell) and the port's optimizer decides, beside the
+// crate's own poller over the same window. Pressure must leave 0.0, and
+// within 8 fresh attempts the optimizer must propose an action for a cell it
+// saw only through GET /stats.
+//
+// GET /stats is exempt from the admission cap (facetql's limits.rs
+// is_telemetry): a saturated instance is exactly the one the control plane
+// must be able to see. So every poll of every window is answered — by both
+// pollers — and a window that is refused even once fails the test. (Before
+// the exemption, 60 writers holding all six permits refused every /stats of
+// most windows, and the attempts ran out on refusals, not on pressure.)
 func TestFabricDaemonLoadedCellCrossesThreshold(t *testing.T) {
 	taskset, err := exec.LookPath("taskset")
 	if err != nil {
@@ -2359,25 +2449,16 @@ func TestFabricDaemonLoadedCellCrossesThreshold(t *testing.T) {
 	var last string
 	for attempt := 1; attempt <= 8; attempt++ {
 		var crateSaw string
-		last, crateSaw = fdtLoadedWindow(t, ts, checkBin, taskset)
-		t.Logf("attempt %d/8: pressure|hot|cpu|queue|write_latency_us|write_ratio|action = %s (the crate's poller, same instance and window: %s)", attempt, last, crateSaw)
-		fields := strings.Split(last, "|")
-		if len(fields) != 7 {
-			// Every /stats of the window refused at the admission cap (a
-			// permit is try_acquire'd, and 60 writers hold all six nearly
-			// always): a property of the load — the crate's own poller,
-			// polling the same instance in the same window, has come away
-			// empty too — so a fresh attempt, as for any unlucky window.
-			continue
-		}
-		// Where both pollers sampled the same window, they read the same
-		// cell: the port's pressure is the crate's within sampling noise.
-		if crateFields := strings.Split(crateSaw, "|"); len(crateFields) == 7 {
-			portP, _ := strconv.ParseFloat(fields[0], 64)
-			crateP, _ := strconv.ParseFloat(crateFields[0], 64)
-			if portP-crateP > 0.15 || crateP-portP > 0.15 {
-				t.Errorf("attempt %d: the port read pressure %v where the crate's poller read %v in the same window", attempt, portP, crateP)
-			}
+		last, crateSaw = fdtLoadedWindow(t, ts, checkBin, taskset, "rust")
+		t.Logf("attempt %d/8: pressure|hot|cpu|queue|write_latency_us|write_ratio|action|refused = %s (the crate's poller, same instance and window: %s)", attempt, last, crateSaw)
+		fields := fdtAnsweredEveryPoll(t, "the port's poller", last)
+		crateFields := fdtAnsweredEveryPoll(t, "the crate's poller", crateSaw)
+		// Both pollers sampled the same window and read the same cell: the
+		// port's pressure is the crate's within sampling noise.
+		portP, _ := strconv.ParseFloat(fields[0], 64)
+		crateP, _ := strconv.ParseFloat(crateFields[0], 64)
+		if portP-crateP > 0.15 || crateP-portP > 0.15 {
+			t.Errorf("attempt %d: the port read pressure %v where the crate's poller read %v in the same window", attempt, portP, crateP)
 		}
 		if fields[0] == "0" || fields[0] == "0.0" {
 			t.Fatalf("pressure stayed at exactly 0.0 under real, heavy, concurrent load: %s", last)
@@ -2387,6 +2468,49 @@ func TestFabricDaemonLoadedCellCrossesThreshold(t *testing.T) {
 		}
 	}
 	t.Fatalf("a real, heavily loaded cell produced no decision in 8 attempts — last %s", last)
+}
+
+// fdtAnsweredEveryPoll: a poller's window, `pressure|hot|cpu|queue|
+// write_latency_us|write_ratio|action|refused`, with every poll answered.
+func fdtAnsweredEveryPoll(t *testing.T, who, window string) []string {
+	t.Helper()
+	fields := strings.Split(window, "|")
+	if len(fields) != 8 {
+		t.Fatalf("%s sampled nothing under saturation — GET /stats must answer however saturated the instance is: %s", who, window)
+	}
+	if fields[7] != "0" {
+		t.Fatalf("%s was refused %s poll(s) under saturation — GET /stats is exempt from the admission cap: %s", who, fields[7], window)
+	}
+	return fields
+}
+
+// The same saturation against the FacetQL written in fct (fqserver.fct's
+// svTelemetry is the same exemption): pinned to one core, admission cap 6,
+// 60 writers — every poll of both pollers answered, the load measured
+// (pressure above 0), and the two pollers agreeing on it. fqserver.fct
+// applies a 20-insert, 9 KB transaction far more slowly than the Rust
+// engine, so how high that pressure climbs is its own, and no decision is
+// required of it; what is required is that the control plane can see it.
+func TestFabricDaemonStatsAnswerUnderSaturationFctEngine(t *testing.T) {
+	taskset, err := exec.LookPath("taskset")
+	if err != nil {
+		t.Skip("no taskset on PATH to pin the instance to one core")
+	}
+	ts := fdtServer(t)
+	checkBin := laCheck(t)
+	defer goruntime.GOMAXPROCS(goruntime.GOMAXPROCS(4))
+	port, crate := fdtLoadedWindow(t, ts, checkBin, taskset, "fct")
+	t.Logf("fqserver.fct: pressure|hot|cpu|queue|write_latency_us|write_ratio|action|refused = %s (the crate's poller: %s)", port, crate)
+	fields := fdtAnsweredEveryPoll(t, "the port's poller", port)
+	crateFields := fdtAnsweredEveryPoll(t, "the crate's poller", crate)
+	portP, _ := strconv.ParseFloat(fields[0], 64)
+	crateP, _ := strconv.ParseFloat(crateFields[0], 64)
+	if portP <= 0 || crateP <= 0 {
+		t.Fatalf("the load on fqserver.fct was not measured: port %v, crate %v", portP, crateP)
+	}
+	if portP-crateP > 0.15 || crateP-portP > 0.15 {
+		t.Errorf("the port read pressure %v where the crate's poller read %v in the same window", portP, crateP)
+	}
 }
 
 // TestFabricStandaloneDoorFollowsTheDaemon: fabric_frontdoor_main.fct as its
@@ -2406,9 +2530,15 @@ func TestFabricDaemonLoadedCellCrossesThreshold(t *testing.T) {
 //     503, retryable, saying why, and never a request routed by a table
 //     that may be stale.
 func TestFabricStandaloneDoorFollowsTheDaemon(t *testing.T) {
+	for _, engine := range fqlEngines() {
+		t.Run(engine, func(t *testing.T) { fdtStandaloneDoorScenario(t, engine) })
+	}
+}
+
+func fdtStandaloneDoorScenario(t *testing.T, engine string) {
 	fdtBinaries(t)
 	const token = "fabtok"
-	source, destination := fqlLiveStart(t), fqlLiveStart(t)
+	source, destination := fqlLiveStartOn(t, engine), fqlLiveStartOn(t, engine)
 	var ops []any
 	for i := 0; i < 200; i++ {
 		ops = append(ops, fdtInsert(i, 1))
@@ -2581,4 +2711,206 @@ func TestFabricStandaloneDoorFollowsTheDaemon(t *testing.T) {
 	if !strings.Contains(doorOut.String(), "the routing feed did not answer") {
 		t.Errorf("the door did not say its feed stopped answering: %s", doorOut.String())
 	}
+}
+
+// tests/daemon.rs an_operator_can_ask_for_a_move_and_is_held_to_the_
+// controllers_checks, against the crate's binary and the port, each over the
+// same two stand-in instances: POST /actions without the token, with a body
+// that is not the request, with an unknown destination, admitted, asked
+// again for the same cell, and the admitted action shown and aborted. Every
+// answer must be the crate's, status and body.
+func TestFabricDaemonOperatorMigrate(t *testing.T) {
+	fdtBinaries(t)
+	up := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("FacetQL Online")) }))
+	}
+	source, destination := up(), up()
+	defer source.Close()
+	defer destination.Close()
+	type answer struct {
+		status int
+		body   string
+	}
+	run := func(port bool) []answer {
+		dir := t.TempDir()
+		config := fmt.Sprintf(`{"data_listen": "127.0.0.1:0", "admin_listen": "127.0.0.1:0",
+			"backends": [
+				{"id": %q, "url": %q, "region": "us-east", "placements": [{"shard": 1, "x": 0, "y": 0}]},
+				{"id": %q, "url": %q, "region": "us-west", "placements": [{"shard": 2, "x": 0, "y": 0}]}],
+			"keyspace": {"rules": [{"kind": "Post", "address_prefix": "Post:", "shard": 1, "x": 0, "y": 0}], "fallback": {"shard": 1, "x": 0, "y": 0}},
+			"cadence": {"liveness_probe_ms": 100, "telemetry_poll_ms": 100, "control_cycle_ms": 50},
+			"silence_budget_ms": 5000, "probe_timeout_ms": 300,
+			"policy": {"measurement_settle_ms": 0, "phase_timeout_ms": 60000}}`, fdtSource, source.URL, fdtDestination, destination.URL)
+		if err := os.WriteFile(filepath.Join(dir, "fabric.json"), []byte(config), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cmd := fdtCommand(port, dir, []string{"FABRIC_ADMIN_TOKEN=operator-secret"}, "--config", "fabric.json")
+		var errOut fdtSyncBuffer
+		cmd.Stdout, cmd.Stderr = io.Discard, &errOut
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			cmd.Process.Signal(syscall.SIGTERM)
+			cmd.Wait()
+		}()
+		_, adminPort := fdtBanner(t, errOut.String)
+		admin := fmt.Sprintf("http://127.0.0.1:%d", adminPort)
+		for end := time.Now().Add(20 * time.Second); ; time.Sleep(25 * time.Millisecond) {
+			fleet, _ := fdtAdminJSON(admin, "/fleet").([]any)
+			serviceable := len(fleet) == 2
+			for _, b := range fleet {
+				if b.(map[string]any)["availability"] != "serviceable" {
+					serviceable = false
+				}
+			}
+			if serviceable {
+				break
+			}
+			if time.Now().After(end) {
+				t.Fatalf("port=%v: the fleet never became serviceable: %s", port, errOut.String())
+			}
+		}
+		ask := func(method, path, body, token string) answer {
+			req, _ := http.NewRequest(method, admin+path, strings.NewReader(body))
+			if token != "" {
+				req.Header.Set("x-api-key", token)
+			}
+			resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+			if err != nil {
+				t.Fatalf("port=%v: %s %s: %v", port, method, path, err)
+			}
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(resp.Body)
+			return answer{resp.StatusCode, string(b)}
+		}
+		moveIt := `{"shard":1,"x":0,"y":0,"destination":"` + fdtDestination + `"}`
+		out := []answer{
+			ask("POST", "/actions", moveIt, ""),
+			ask("POST", "/actions", `{"shard":1,"x":0,"y":0}`, "operator-secret"),
+			ask("POST", "/actions", `{"shard":1,"x":0,"y":0,"destination":"`+fdtDestination+`","why":"x"}`, "operator-secret"),
+			ask("POST", "/actions", `{"shard":1,"x":0,"y":0,"destination":"nowhere"}`, "operator-secret"),
+			ask("POST", "/actions", moveIt, "operator-secret"),
+		}
+		actions, _ := fdtAdminJSON(admin, "/actions").([]any)
+		shown := "no action"
+		if len(actions) == 1 {
+			a := actions[0].(map[string]any)
+			shown = fmt.Sprintf("%v %v %v -> %v", a["id"], a["action"], a["source"], a["destination"])
+		}
+		out = append(out, answer{0, shown},
+			ask("POST", "/actions", moveIt, "operator-secret"),
+			ask("POST", "/actions/1/abort", "", "operator-secret"))
+		return out
+	}
+	rust, port := run(false), run(true)
+	for i := range rust {
+		if rust[i] != port[i] {
+			t.Errorf("step %d:\n rust %d %q\n port %d %q", i, rust[i].status, rust[i].body, port[i].status, port[i].body)
+		}
+	}
+	// And they are the crate test's own expectations.
+	if rust[0].status != 401 || rust[1].status != 400 || rust[2].status != 400 || !strings.Contains(rust[2].body, "unknown field") ||
+		rust[3].status != 409 || !strings.Contains(rust[3].body, "nowhere") ||
+		rust[4] != (answer{200, "action-1: admitted, move shard 1 (0,0) to '" + fdtDestination + "'\n"}) ||
+		rust[5].body != "1 move "+fdtSource+" -> "+fdtDestination ||
+		rust[6].status != 409 || !strings.Contains(rust[6].body, "action-1") || rust[7].status != 200 {
+		t.Errorf("the crate's answers are not its test's: %+v", rust)
+	}
+}
+
+// ---------------------------------------------------------------- a slow /stats is not a lost node
+
+// TestFabricDaemonSlowStatsKeepsNodesLive: tests/daemon.rs's
+// a_slow_stats_read_does_not_lose_nodes_that_answer_their_probes against
+// both daemons as processes. Two instances answer every `GET /` at once and
+// every `GET /stats` only after longer than the silence budget. Liveness is
+// the prober's alone and the /stats sweep runs beside the cycle, so the
+// probes keep their cadence, every instance stays healthy and routable, and
+// no read through the data port is refused.
+func TestFabricDaemonSlowStatsKeepsNodesLive(t *testing.T) {
+	fdtBinaries(t)
+	for _, port := range []bool{false, true} {
+		name := "rust"
+		if port {
+			name = "fct"
+		}
+		t.Run(name, func(t *testing.T) { fdtSlowStatsScenario(t, port) })
+	}
+}
+
+func fdtSlowStatsScenario(t *testing.T, port bool) {
+	const statsDelay = 1500 * time.Millisecond
+	slow := func() *httptest.Server {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/stats" {
+				select {
+				case <-time.After(statsDelay):
+				case <-r.Context().Done():
+					return
+				}
+				w.Header().Set("content-type", "application/json")
+				io.WriteString(w, `{}`)
+				return
+			}
+			w.Header().Set("content-type", "application/json")
+			io.WriteString(w, `{"nodes":[]}`)
+		}))
+		t.Cleanup(ts.Close)
+		return ts
+	}
+	source, destination := slow(), slow()
+
+	dir := t.TempDir()
+	config := strings.Replace(fdtDaemonConfig(0, 0, source.URL, destination.URL),
+		`"silence_budget_ms": 5000, "probe_timeout_ms": 500`,
+		`"silence_budget_ms": 1000, "probe_timeout_ms": 300`, 1)
+	if err := os.WriteFile(filepath.Join(dir, "fabric.json"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := fdtCommand(port, dir, []string{"FABRIC_ADMIN_TOKEN=operator-secret", "FABRIC_TEST_DB_TOKEN=fabtok"}, "--config", "fabric.json")
+	var stderr fdtSyncBuffer
+	cmd.Stdout, cmd.Stderr = io.Discard, &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+	dataPort, adminPort := fdtBanner(t, stderr.String)
+	admin := fmt.Sprintf("http://127.0.0.1:%d", adminPort)
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Three slow sweeps' worth.
+	reads, statuses := 0, 0
+	for end := time.Now().Add(5 * time.Second); time.Now().Before(end); time.Sleep(25 * time.Millisecond) {
+		req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/nodes?kind=Post", dataPort), nil)
+		req.Header.Set("x-api-key", "client-secret")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("read %d: %v; stderr: %s", reads, err, stderr.String())
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("read %d: the front door answered %d while /stats was slow: %s", reads, resp.StatusCode, body)
+		}
+		reads++
+
+		status, _ := fdtAdminJSON(admin, "/status").(map[string]any)
+		if status == nil {
+			t.Fatalf("status %d: the operator surface did not answer; stderr: %s", statuses, stderr.String())
+		}
+		wall := uint64(time.Now().UnixMilli())
+		for _, b := range status["backends"].([]any) {
+			backend := b.(map[string]any)
+			if backend["health"] != "healthy" || backend["availability"] != "serviceable" {
+				t.Fatalf("status %d: a node answering its probes was judged %v/%v: %v", statuses, backend["health"], backend["availability"], backend)
+			}
+			probed, _ := backend["last_probe_at_ms"].(float64)
+			if age := int64(wall) - int64(probed); age > 1000 {
+				t.Fatalf("status %d: the last probe of %v is %d ms old: probes stalled behind /stats: %v", statuses, backend["id"], age, backend)
+			}
+		}
+		statuses++
+	}
+	t.Logf("%d reads answered 200 and %d statuses all healthy with fresh probes while every /stats took %v", reads, statuses, statsDelay)
 }

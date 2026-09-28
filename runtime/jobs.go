@@ -72,7 +72,7 @@ func (s *Server) StartJobs() {
 	// Nothing periodic and no durable queue to drain on a single-process dev run:
 	// skip the worker pool entirely so a `facet run` with only on-start jobs adds
 	// no background goroutines.
-	if !hasPeriodic && !clusterEnabled() {
+	if !hasPeriodic && s.cluster == nil {
 		return
 	}
 

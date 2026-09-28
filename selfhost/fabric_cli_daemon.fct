@@ -1,0 +1,217 @@
+import "http_client.fct"
+import "fabric_json.fct"
+import "fabric_fmt.fct"
+
+app FabricCliDaemon:
+    # Port of fabric/crates/fabric-cli/src/daemon.rs: `fabric daemon ...`, a
+    # running fabricd over its operator port — GET /status, GET /placements,
+    # POST /actions — on http_client.fct. The token is FABRIC_ADMIN_TOKEN and
+    # nowhere else; the port is --admin or FABRIC_ADMIN_URL. Output, messages
+    # and exit statuses are the crate's, byte for byte
+    # (fabric_cli_test.go's TestFabricCliDaemon*). Names are prefixed `cld`.
+
+    # What `fabric daemon` was asked (args.rs DaemonCommand): op "help",
+    # "status", "placements" or "migrate".
+    struct CliDaemon:
+        op: text
+        hasAdmin: bool
+        admin: text
+        json: bool
+        shard: int
+        x: int
+        y: int
+        destination: text
+
+    struct CliDaemonOutcome:
+        stdout: text
+        stderr: text
+        code: int
+
+    proc cldHelp() -> text:
+        return "fabric daemon -- a running fabricd, over its operator port\n\nUSAGE:\n    fabric daemon status      [--admin <url>] [--json]\n    fabric daemon placements  [--admin <url>] [--json]\n    fabric daemon migrate <shard> <x> <y> <destination> [--admin <url>]\n\nCOMMANDS:\n    status      The daemon's snapshot: its backends, placements, the actions\n                in flight and what its control loop decided\n    placements  Which instance holds each cell, and any migration under way\n    migrate     Ask for a cell to move to the instance <destination>; the\n                daemon admits it through the same checks as its own decisions,\n                or says why not\n\nOPTIONS:\n        --admin <url>  The operator port, http://host:port (default:\n                       FABRIC_ADMIN_URL)\n        --json         Print the daemon's JSON instead of a table\n    -h, --help         Show help\n\nThe token is FABRIC_ADMIN_TOKEN, read from nowhere else: it never appears on\na command line.\n"
+
+    proc cldUsage(message: text) -> CliDaemonOutcome:
+        return CliDaemonOutcome{stdout: "", stderr: "error: " + message + "\ntry 'fabric daemon --help'\n", code: 2}
+
+    proc cldFailed(message: text) -> CliDaemonOutcome:
+        return CliDaemonOutcome{stdout: "", stderr: "error: " + message + "\n", code: 1}
+
+    proc cldPrinted(stdout: text) -> CliDaemonOutcome:
+        return CliDaemonOutcome{stdout: stdout, stderr: "", code: 0}
+
+    # str::trim_end: the trailing whitespace off.
+    proc cldTrimEnd(s: text) -> text:
+        let bs = textToBytes(s)
+        let mut n = len(bs)
+        loop n > 0 && (bs[n - 1] == 32 || bs[n - 1] == 9 || bs[n - 1] == 10 || bs[n - 1] == 13 || bs[n - 1] == 11 || bs[n - 1] == 12):
+            n = n - 1
+        return bytesToText(slice(bs, 0, n))
+
+    proc cldHasPrefix(s: text, p: text) -> bool:
+        return len(s) >= len(p) && slice(s, 0, len(p)) == p
+
+    # `authority`: host:port of an http://host:port URL (one trailing `/`
+    # allowed), or "" — the operator port has no TLS and no path.
+    proc cldAuthority(url: text) -> text:
+        let https = do cldHasPrefix(url, "http://")
+        if !https:
+            return ""
+        let mut rest = slice(url, 7, len(url))
+        if len(rest) > 0 && charAt(rest, len(rest) - 1) == "/":
+            rest = slice(rest, 0, len(rest) - 1)
+        let mut colon = -1
+        let mut i = len(rest) - 1
+        loop i >= 0 && colon < 0:
+            if charAt(rest, i) == ":":
+                colon = i
+            i = i - 1
+        if colon < 0:
+            return ""
+        let host = slice(rest, 0, colon)
+        let port = slice(rest, colon + 1, len(rest))
+        let slash = do routingIndexOf(rest, "/")
+        if host == "" || slash >= 0 || u64ParseError(port) != "" || u64Cmp(u64Parse(port), 65535) > 0:
+            return ""
+        return rest
+
+    # `text`: a field as the table shows it — a string as itself, null (or
+    # absent) as "-", anything else as its JSON.
+    proc cldText(v: SjV, key: text) -> text:
+        let got = do sjGet(v, key)
+        if !got.has || got.v.kind == "null" || got.v.kind == "absent":
+            return "-"
+        if got.v.kind == "str":
+            return got.v.s
+        return sjValueText(got.v)
+
+    proc cldField(v: SjV, key: text) -> SjV:
+        let got = do sjGet(v, key)
+        if !got.has:
+            return sjNull()
+        return got.v
+
+    proc cldItems(v: SjV) -> [SjV]:
+        if v.kind != "arr":
+            return []
+        return v.items
+
+    proc cldPad(s: text, width: int) -> text:
+        let padded = do fmtPadRight(s, width)
+        return padded
+
+    # `render_placements`.
+    proc cldRenderPlacements(placements: [SjV]) -> text:
+        if len(placements) == 0:
+            return "no placements\n"
+        let mut out = cldPad("SHARD", 8) + cldPad("CELL", 10) + cldPad("HOLDER", 18) + cldPad("REGION", 12) + "MIGRATION\n"
+        let mut i = 0
+        loop i < len(placements):
+            let p = placements[i]
+            let m = do cldField(p, "migration")
+            let mut migration = "-"
+            if m.kind == "obj":
+                migration = cldText(m, "phase") + " " + cldText(m, "source") + " -> " + cldText(m, "destination")
+                let fenced = do cldField(m, "write_fenced")
+                if fenced.kind == "bool" && fenced.b:
+                    migration = migration + " (writes fenced)"
+            out = out + cldPad(cldText(p, "shard"), 8) + cldPad("(" + cldText(p, "x") + "," + cldText(p, "y") + ")", 10) + cldPad(cldText(p, "holder"), 18) + cldPad(cldText(p, "region"), 12) + migration + "\n"
+            i = i + 1
+        return out
+
+    # `render_status`.
+    proc cldRenderStatus(status: SjV) -> text:
+        let draining = do cldField(status, "draining")
+        let mut tail = ""
+        if draining.kind == "bool" && draining.b:
+            tail = ", draining"
+        let mut out = "fabricd " + cldText(status, "version") + ": data " + cldText(status, "data_listen") + ", operator " + cldText(status, "admin_listen") + tail + "\n"
+        out = out + "control loop: " + cldText(status, "cycles") + " cycle(s), routing generation " + cldText(status, "routing_generation") + ", placement generation " + cldText(status, "placement_generation") + "\n"
+        out = out + "telemetry: " + cldText(status, "telemetry_source") + "\n\n"
+        let backends = do cldItems(cldField(status, "backends"))
+        out = out + cldPad("BACKEND", 18) + cldPad("REGION", 12) + cldPad("AVAILABILITY", 14) + cldPad("HEALTH", 11) + "LAST PROBE\n"
+        let mut i = 0
+        loop i < len(backends):
+            let b = backends[i]
+            out = out + cldPad(cldText(b, "id"), 18) + cldPad(cldText(b, "region"), 12) + cldPad(cldText(b, "availability"), 14) + cldPad(cldText(b, "health"), 11) + cldText(b, "last_probe") + "\n"
+            i = i + 1
+        if len(backends) == 0:
+            out = out + "no backends\n"
+        out = out + "\n" + cldRenderPlacements(cldItems(cldField(status, "placements")))
+        out = out + "\n"
+        let inFlight = do cldItems(cldField(status, "in_flight"))
+        if len(inFlight) == 0:
+            out = out + "no action in flight\n"
+        else:
+            out = out + cldPad("ACTION", 12) + cldPad("KIND", 11) + cldPad("TARGET", 16) + cldPad("FROM -> TO", 34) + cldPad("STATE", 12) + "PHASE\n"
+            let mut k = 0
+            loop k < len(inFlight):
+                let a = inFlight[k]
+                out = out + cldPad("action-" + cldText(a, "id"), 12) + cldPad(cldText(a, "action"), 11) + cldPad("shard " + cldText(a, "shard") + " (" + cldText(a, "x") + "," + cldText(a, "y") + ")", 16) + cldPad(cldText(a, "source") + " -> " + cldText(a, "destination"), 34) + cldPad(cldText(a, "state"), 12) + cldText(a, "phase") + "\n"
+                k = k + 1
+        let d = do cldField(status, "decisions")
+        out = out + "decisions: " + cldText(d, "proposed") + " proposed, " + cldText(d, "admitted") + " admitted, " + cldText(d, "refused") + " refused\n"
+        return out
+
+    # `run`: one `fabric daemon` command against the environment it was
+    # given (hasAdminEnv/adminEnv: FABRIC_ADMIN_URL; hasTokenEnv/tokenEnv:
+    # FABRIC_ADMIN_TOKEN).
+    proc cldRun(c: CliDaemon, hasAdminEnv: bool, adminEnv: text, hasTokenEnv: bool, tokenEnv: text) -> CliDaemonOutcome uses io.net:
+        if c.op == "help":
+            let h = do cldPrinted(cldHelp())
+            return h
+        let mut url = ""
+        if c.hasAdmin:
+            url = c.admin
+        else:
+            if hasAdminEnv:
+                url = adminEnv
+        if url == "":
+            let u = do cldUsage("no operator port: pass --admin <url> or set FABRIC_ADMIN_URL")
+            return u
+        let authority = do cldAuthority(url)
+        if authority == "":
+            let u2 = do cldUsage("the operator port must be http://host:port, got '" + url + "'")
+            return u2
+        if !hasTokenEnv || tokenEnv == "":
+            let f = do cldFailed("FABRIC_ADMIN_TOKEN is not set: the operator port is never used without its token")
+            return f
+        let mut method = "GET"
+        let mut path = "/status"
+        let mut body = ""
+        let mut headers = [HttpHeader{name: "x-api-key", value: tokenEnv}]
+        if c.op == "placements":
+            path = "/placements"
+        if c.op == "migrate":
+            method = "POST"
+            path = "/actions"
+            # serde_json::json!'s object: a BTreeMap, so its keys in order.
+            body = "{\"destination\":" + sjQuote(c.destination) + ",\"shard\":" + sjU64Text(c.shard) + ",\"x\":" + c.x + ",\"y\":" + c.y + "}"
+            headers = append(headers, HttpHeader{name: "content-type", value: "application/json"})
+        let r = do httpExchange(HttpRequest{method: method, url: "http://" + authority + path, headers: headers, body: body, timeoutMs: 30000})
+        if !r.ok:
+            let f2 = do cldFailed("could not reach the operator port at " + url)
+            return f2
+        if r.status == 401:
+            let f3 = do cldFailed("the operator port refused FABRIC_ADMIN_TOKEN")
+            return f3
+        if r.status == 200 && c.op == "migrate":
+            let p = do cldPrinted(r.body)
+            return p
+        if r.status == 409 && c.op == "migrate":
+            return CliDaemonOutcome{stdout: "", stderr: "refused: " + r.body, code: 1}
+        if r.status == 200:
+            let parsed = do sjDecode([sjVecType("Vec<Value>", "value")], r.body, "value")
+            if !parsed.ok:
+                let f4 = do cldFailed("the operator port answered something that is not its JSON")
+                return f4
+            if c.json:
+                let pretty = do sjPretty(sjValueText(parsed.v))
+                let pj = do cldPrinted(pretty + "\n")
+                return pj
+            if c.op == "status":
+                let ps = do cldPrinted(cldRenderStatus(parsed.v))
+                return ps
+            let pp = do cldPrinted(cldRenderPlacements(cldItems(parsed.v)))
+            return pp
+        let f5 = do cldFailed("the operator port answered " + r.status + ": " + cldTrimEnd(r.body))
+        return f5

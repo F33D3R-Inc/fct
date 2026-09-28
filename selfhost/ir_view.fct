@@ -38,6 +38,8 @@ app IRViewSelfHost:
         coll: text
         where: [IRExpr]
         order: text
+        # orderBy: a list's computed sort key (`for … by <expr>`), per row
+        orderBy: [IRExpr]
         desc: bool
         limit: [IRExpr]
         more: text
@@ -47,6 +49,8 @@ app IRViewSelfHost:
         level: [IRExpr]
         bind: text
         placeholder: [IRSeg]
+        # multiple: an upload bound to a `[text]` cell takes many files
+        multiple: bool
         alt: [IRSeg]
         poster: [IRSeg]
         autoplay: bool
@@ -191,6 +195,7 @@ app IRViewSelfHost:
         let f_coll = do jStr(v, "coll")
         let f_where = do jExprOptV(v, "where")
         let f_order = do jStr(v, "order")
+        let f_orderBy = do jExprOptV(v, "orderBy")
         let f_desc = do jBool(v, "desc")
         let f_limit = do jExprOptV(v, "limit")
         let f_more = do jStr(v, "more")
@@ -200,6 +205,7 @@ app IRViewSelfHost:
         let f_level = do jExprOptV(v, "level")
         let f_bind = do jStr(v, "bind")
         let f_placeholder = do irSegsFromJVal(v, "placeholder")
+        let f_multiple = do jBool(v, "multiple")
         let f_alt = do irSegsFromJVal(v, "alt")
         let f_poster = do irSegsFromJVal(v, "poster")
         let f_autoplay = do jBool(v, "autoplay")
@@ -224,7 +230,7 @@ app IRViewSelfHost:
         let f_y = do jExprOptV(v, "y")
         let f_facing = do jExprOptV(v, "facing")
         let f_image = do jExprOptV(v, "image")
-        return IRNode{kind: f_kind, children: f_children, segs: f_segs, label: f_label, action: f_action, args: f_args, debounce: f_debounce, id: f_id, itemVar: f_itemVar, coll: f_coll, where: f_where, order: f_order, desc: f_desc, limit: f_limit, more: f_more, cond: f_cond, seconds: f_seconds, body: f_body, level: f_level, bind: f_bind, placeholder: f_placeholder, alt: f_alt, poster: f_poster, autoplay: f_autoplay, loopFlag: f_loopFlag, muted: f_muted, path: f_path, pathSegs: f_pathSegs, route: f_route, external: f_external, name: f_name, options: f_options, value: f_value, val: f_val, class: f_class, style: f_style, classSegs: f_classSegs, anchor: f_anchor, width: f_width, height: f_height, tiles: f_tiles, x: f_x, y: f_y, facing: f_facing, image: f_image}
+        return IRNode{kind: f_kind, children: f_children, segs: f_segs, label: f_label, action: f_action, args: f_args, debounce: f_debounce, id: f_id, itemVar: f_itemVar, coll: f_coll, where: f_where, order: f_order, orderBy: f_orderBy, desc: f_desc, limit: f_limit, more: f_more, cond: f_cond, seconds: f_seconds, body: f_body, level: f_level, bind: f_bind, placeholder: f_placeholder, multiple: f_multiple, alt: f_alt, poster: f_poster, autoplay: f_autoplay, loopFlag: f_loopFlag, muted: f_muted, path: f_path, pathSegs: f_pathSegs, route: f_route, external: f_external, name: f_name, options: f_options, value: f_value, val: f_val, class: f_class, style: f_style, classSegs: f_classSegs, anchor: f_anchor, width: f_width, height: f_height, tiles: f_tiles, x: f_x, y: f_y, facing: f_facing, image: f_image}
 
     proc irBindingFromJVal(v: JVal) -> IRBinding:
         let id = do jStr(v, "id")
@@ -275,7 +281,7 @@ app IRViewSelfHost:
         loop i < n:
             if i > 0:
                 out = out + ","
-            let q = do jsonQuote(x.vals[i].s)
+            let q = jsonQuote(x.vals[i].s)
             out = out + q
             i = i + 1
         return out + "]"
@@ -285,13 +291,13 @@ app IRViewSelfHost:
         let mut out = "{"
         let mut first = true
         if s.lit != "":
-            let q = do jsonQuote(s.lit)
+            let q = jsonQuote(s.lit)
             out = out + "\"lit\":" + q
             first = false
         if s.bind != "":
             if !first:
                 out = out + ","
-            let q = do jsonQuote(s.bind)
+            let q = jsonQuote(s.bind)
             out = out + "\"bind\":" + q
             first = false
         if len(s.expr) > 0:
@@ -326,7 +332,7 @@ app IRViewSelfHost:
             if i > 0:
                 out = out + ","
             let lj = do irSegsJSON(xs[i].label)
-            let vq = do jsonQuote(xs[i].value)
+            let vq = jsonQuote(xs[i].value)
             out = out + "{\"label\":" + lj + ",\"value\":" + vq + "}"
             i = i + 1
         return out + "]"
@@ -344,7 +350,7 @@ app IRViewSelfHost:
         return out + "]"
 
     proc irNodeJSON(n: IRNode) -> text:
-        let kq = do jsonQuote(n.kind)
+        let kq = jsonQuote(n.kind)
         let mut out = "{\"kind\":" + kq
         if len(n.children) > 0:
             let j_children = do irNodesJSON(n.children)
@@ -356,7 +362,7 @@ app IRViewSelfHost:
             let j_label = do irSegsJSON(n.label)
             out = out + ",\"label\":" + j_label
         if n.action != "":
-            let q_action = do jsonQuote(n.action)
+            let q_action = jsonQuote(n.action)
             out = out + ",\"action\":" + q_action
         if len(n.args) > 0:
             let j_args = do irListJSON(n.args)
@@ -364,27 +370,30 @@ app IRViewSelfHost:
         if n.debounce != 0:
             out = out + ",\"debounce\":" + n.debounce
         if n.id != "":
-            let q_id = do jsonQuote(n.id)
+            let q_id = jsonQuote(n.id)
             out = out + ",\"id\":" + q_id
         if n.itemVar != "":
-            let q_itemVar = do jsonQuote(n.itemVar)
+            let q_itemVar = jsonQuote(n.itemVar)
             out = out + ",\"var\":" + q_itemVar
         if n.coll != "":
-            let q_coll = do jsonQuote(n.coll)
+            let q_coll = jsonQuote(n.coll)
             out = out + ",\"coll\":" + q_coll
         if len(n.where) > 0:
             let j_where = do irExprJSON(n.where[0])
             out = out + ",\"where\":" + j_where
         if n.order != "":
-            let q_order = do jsonQuote(n.order)
+            let q_order = jsonQuote(n.order)
             out = out + ",\"order\":" + q_order
+        if len(n.orderBy) > 0:
+            let j_orderBy = do irExprJSON(n.orderBy[0])
+            out = out + ",\"orderBy\":" + j_orderBy
         if n.desc:
             out = out + ",\"desc\":true"
         if len(n.limit) > 0:
             let j_limit = do irExprJSON(n.limit[0])
             out = out + ",\"limit\":" + j_limit
         if n.more != "":
-            let q_more = do jsonQuote(n.more)
+            let q_more = jsonQuote(n.more)
             out = out + ",\"more\":" + q_more
         if len(n.cond) > 0:
             let j_cond = do irExprJSON(n.cond[0])
@@ -398,11 +407,13 @@ app IRViewSelfHost:
             let j_level = do irExprJSON(n.level[0])
             out = out + ",\"level\":" + j_level
         if n.bind != "":
-            let q_bind = do jsonQuote(n.bind)
+            let q_bind = jsonQuote(n.bind)
             out = out + ",\"bind\":" + q_bind
         if len(n.placeholder) > 0:
             let j_placeholder = do irSegsJSON(n.placeholder)
             out = out + ",\"placeholder\":" + j_placeholder
+        if n.multiple:
+            out = out + ",\"multiple\":true"
         if len(n.alt) > 0:
             let j_alt = do irSegsJSON(n.alt)
             out = out + ",\"alt\":" + j_alt
@@ -416,7 +427,7 @@ app IRViewSelfHost:
         if n.muted:
             out = out + ",\"muted\":true"
         if n.path != "":
-            let q_path = do jsonQuote(n.path)
+            let q_path = jsonQuote(n.path)
             out = out + ",\"path\":" + q_path
         if len(n.pathSegs) > 0:
             let j_pathSegs = do irSegsJSON(n.pathSegs)
@@ -426,28 +437,28 @@ app IRViewSelfHost:
         if n.external:
             out = out + ",\"external\":true"
         if n.name != "":
-            let q_name = do jsonQuote(n.name)
+            let q_name = jsonQuote(n.name)
             out = out + ",\"name\":" + q_name
         if len(n.options) > 0:
             let j_options = do irOptionsJSON(n.options)
             out = out + ",\"options\":" + j_options
         if n.value != "":
-            let q_value = do jsonQuote(n.value)
+            let q_value = jsonQuote(n.value)
             out = out + ",\"value\":" + q_value
         if len(n.val) > 0:
             let j_val = do irExprJSON(n.val[0])
             out = out + ",\"val\":" + j_val
         if n.class != "":
-            let q_class = do jsonQuote(n.class)
+            let q_class = jsonQuote(n.class)
             out = out + ",\"class\":" + q_class
         if n.style != "":
-            let q_style = do jsonQuote(n.style)
+            let q_style = jsonQuote(n.style)
             out = out + ",\"style\":" + q_style
         if len(n.classSegs) > 0:
             let j_classSegs = do irSegsJSON(n.classSegs)
             out = out + ",\"classSegs\":" + j_classSegs
         if n.anchor != "":
-            let q_anchor = do jsonQuote(n.anchor)
+            let q_anchor = jsonQuote(n.anchor)
             out = out + ",\"anchor\":" + q_anchor
         if n.width != 0:
             out = out + ",\"width\":" + n.width
@@ -471,7 +482,7 @@ app IRViewSelfHost:
         return out + "}"
 
     proc irBindingJSON(b: IRBinding) -> text:
-        let iq = do jsonQuote(b.id)
+        let iq = jsonQuote(b.id)
         let mut out = "{\"id\":" + iq + ",\"expr\":"
         if len(b.expr) > 0:
             let ej = do irExprJSON(b.expr[0])
@@ -482,22 +493,22 @@ app IRViewSelfHost:
         return out + ",\"deps\":" + dj + "}"
 
     proc irRouteJSON(r: IRRoute) -> text:
-        let pq = do jsonQuote(r.path)
+        let pq = jsonQuote(r.path)
         let mut out = "{\"path\":" + pq
         if r.requires != "":
-            let rq = do jsonQuote(r.requires)
+            let rq = jsonQuote(r.requires)
             out = out + ",\"requires\":" + rq
         return out + "}"
 
     proc irPageJSON(p: IRPage) -> text:
-        let nq = do jsonQuote(p.name)
-        let pq = do jsonQuote(p.path)
+        let nq = jsonQuote(p.name)
+        let pq = jsonQuote(p.path)
         let mut out = "{\"name\":" + nq + ",\"path\":" + pq
         if len(p.params) > 0:
             let prj = do textListJSON(p.params)
             out = out + ",\"params\":" + prj
         if p.requires != "":
-            let rq = do jsonQuote(p.requires)
+            let rq = jsonQuote(p.requires)
             out = out + ",\"requires\":" + rq
         if p.screen:
             out = out + ",\"screen\":true"
@@ -522,7 +533,7 @@ app IRViewSelfHost:
         loop j < dn:
             if j > 0:
                 out = out + ","
-            let kq = do jsonQuote(p.depKeys[j])
+            let kq = jsonQuote(p.depKeys[j])
             out = out + kq + ":" + p.depVals[j]
             j = j + 1
         out = out + "}"

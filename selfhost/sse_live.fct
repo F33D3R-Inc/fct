@@ -15,8 +15,30 @@ app SSELive:
         w: RtWorld
         chan: int
 
+    # The entities (and fields) any page's client reads as collections —
+    # a function of the graph alone, so found once at boot (rtIndexStream)
+    # rather than by walking every page on every broadcast.
+    struct RtCollsCache:
+        ok: bool
+        pages: int
+        colls: RtColls
+
+    shared rtCollsCache: RtCollsCache
+
+    proc rtIndexStream(g: IRGraph) -> int:
+        let c = do rtStreamCollsOf(g)
+        rtCollsCache = RtCollsCache{ok: true, pages: len(g.pages), colls: c}
+        return 0
+
     proc rtStreamColls(g: IRGraph) -> RtColls:
-        let mut c = RtColls{names: [], all: [], fields: []}
+        let cache = rtCollsCache
+        if cache.ok && cache.pages == len(g.pages):
+            return cache.colls
+        let c = do rtStreamCollsOf(g)
+        return c
+
+    proc rtStreamCollsOf(g: IRGraph) -> RtColls:
+        let mut c = RtColls{names: [], all: [], fields: [], logOps: false, ops: []}
         let mut i = 0
         loop i < len(g.pages):
             let pc = do rtClientColls(g, g.pages[i])
@@ -83,7 +105,8 @@ app SSELive:
         let role = do rtGet(sc, "role")
         let verified = do rtGet(sc, "verified")
         let session = do rtGet(sc, "session")
-        let ch = channel()
+        # a client's outbox: 16 frames, as Go buffers a /live subscriber
+        let ch = channel(16)
         let sub = RtSub{ch: ch, actor: valToStr(actor), role: valToStr(role), verified: valTruthy(verified), tenant: 0, tenantRole: "", session: valToStr(session)}
         w.subs = append(w.subs, sub)
         let subSc = do rtSubScope(w, sub)
@@ -116,7 +139,16 @@ app SSELive:
 
     # rtBroadcast: broadcast — the write sequence advances and one frame
     # reaches every subscriber.
-    proc rtBroadcast(w0: RtWorld, changed0: [text]) -> RtWorld:
+    # rtBroadcast: broadcast — the change fans out here and, clustered, is
+    # announced to every peer (which fans it out to its own subscribers).
+    proc rtBroadcast(w0: RtWorld, changed0: [text]) -> RtWorld uses io.net:
+        let w1 = do rtFanoutChanged(w0, changed0)
+        let w2 = do rtClusterPublishEntities(w1, changed0)
+        return w2
+
+    # rtFanoutChanged: fanout — this instance's subscribers only (a peer's
+    # change arriving over the bus comes in here, never re-announced).
+    proc rtFanoutChanged(w0: RtWorld, changed0: [text]) -> RtWorld:
         let mut w = w0
         if len(changed0) == 0:
             return w
@@ -139,6 +171,9 @@ app SSELive:
             let deltas = do rtDeltasJSON(w, changed, subSc)
             let media = do rtMediaGrantsJSON(w.mediaTTL, w.signKey, rtJValToVal(jsonParse(deltas)))
             let frame = "data: " + rtObjectJSONRaw(["deltas", "media", "changed", "seq"], [deltas, media, cj, "" + w.writeSeq]) + "\n\n"
-            let sent = send(w.subs[s].ch, frame)
+            # a subscriber that cannot keep up misses this frame rather
+            # than stalling the loop every connection is served by (Go's
+            # select … default); its next frame carries the current seq
+            let sent = trySend(w.subs[s].ch, frame)
             s = s + 1
         return w

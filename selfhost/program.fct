@@ -336,6 +336,12 @@ app ProgramSelfHost:
         # parseDerive (parameters, joinOpenBrackets).
         line: text
         cont: text
+        # lineNo: the declaration's source line (0 when unknown)
+        lineNo: int
+        # renameFrom/renameTo: the file's private procs and their mangled
+        # names (the driver's manglePrivate), for calls in the definition
+        renameFrom: [text]
+        renameTo: [text]
 
     struct StateDecl:
         name: text
@@ -435,6 +441,13 @@ app ProgramSelfHost:
         paramTypes: [text]
         paramOptionals: [bool]
         optimistic: bool
+        # internal: `@internal` — reached only from the authority (run, job,
+        # trigger), never a client or an HTTP route.
+        internal: bool
+        # standIn: synthesized for an `expect action` no host declares
+        standIn: bool
+        # bodyLineNos: each body line's source line number ([] when unknown)
+        bodyLineNos: [int]
         headerValid: bool
         requires: [ActionStmt]
         body: [ActionStmt]
@@ -469,6 +482,10 @@ app ProgramSelfHost:
         # headerLine/bodySrc: the raw text, for view_parse.fct's full grammar.
         headerLine: text
         bodySrc: text
+        # bodyLineNos: each kept body line's source line ([] when unknown);
+        # lineNo: the header's (0 when unknown)
+        bodyLineNos: [int]
+        lineNo: int
 
     # LayoutEntry: `layout Name:` and its raw body (parser.go parseLayout).
     # Layered-facet parts (parser.go parsePlayground/parseWireframe/
@@ -499,6 +516,10 @@ app ProgramSelfHost:
     struct LayoutEntry:
         headerLine: text
         bodySrc: text
+        # bodyLineNos: each kept body line's source line ([] when unknown);
+        # lineNo: the header's (0 when unknown)
+        bodyLineNos: [int]
+        lineNo: int
 
     struct ViewEntry:
         name: text
@@ -512,6 +533,10 @@ app ProgramSelfHost:
         # private: declared `private view` (a file-local name, mangled per
         # module by the driver exactly as internal/compile's manglePrivate).
         private: bool
+        # bodyLineNos: each kept body line's source line ([] when unknown);
+        # lineNo: the header's (0 when unknown)
+        bodyLineNos: [int]
+        lineNo: int
 
     # DaemonDecl: parser.go's parseDaemon — `daemon Name [every <dur>]
     # [uses cap, …]:` plus its proc-shaped body (kept raw for
@@ -645,7 +670,7 @@ app ProgramSelfHost:
         if exprSrc != "":
             let parsed = do parseExprTree(exprSrc)
             ex = parsed
-        return DeriveDeclFull{name: name, typeCore: core, headerValid: hv, exprSrc: exprSrc, expr: ex, line: lineText, cont: ""}
+        return DeriveDeclFull{name: name, typeCore: core, headerValid: hv, exprSrc: exprSrc, expr: ex, line: lineText, cont: "", lineNo: 0, renameFrom: [], renameTo: []}
 
     # sigDiag: parser.go's parseSignature refusals over a header's
     # signature (`name(params)`, the `-> Type`/`uses` tail already set
@@ -686,8 +711,26 @@ app ProgramSelfHost:
             if !pnOk:
                 return "invalid parameter " + pq
             let pt = do paramTypeRawOf(p)
-            let core = do typeCore(pt)
+            # `{K: V}`: a map parameter, where a list parameter is allowed
+            let ms = do mapTypeSpec(pt)
+            if ms != "" && allowList:
+                let mk = do mapSpecKey(ms)
+                let mv = do mapSpecVal(ms)
+                if mk != "int" && mk != "text":
+                    let mkq = do goQuote(mk)
+                    return "parameter " + pn + ": a map key must be int or text, got " + mkq
+                let mvOk = do isTypeNameToken(mv)
+                if !mvOk:
+                    let mvq = do goQuote(mv)
+                    return "parameter " + pn + ": unknown map value type " + mvq + " (use a scalar or a struct name; a map holds no lists or maps)"
+                i = i + 1
+                continue
+            let core0 = do typeCore(pt)
             let isList = do hasPrefixText(pt, "[")
+            # `[[T]]`: a nested list, where a map parameter is allowed
+            let mut core = core0
+            if isList && allowList:
+                core = do nestedBase(core0)
             if isList && !allowList:
                 let pnq = do goQuote(pn)
                 return "parameter " + pnq + " cannot be a list"
@@ -695,6 +738,94 @@ app ProgramSelfHost:
             if !typeOk && !(core == "json" && !isList):
                 return "invalid parameter " + pq
             i = i + 1
+        return ""
+
+    # structFieldSpecDiag: parseStruct's `add` over one field spec — ""
+    # when it declares a field (or is blank), else the refusal.
+    proc structFieldSpecDiag(spec0: text) -> text:
+        let spec = trim(spec0)
+        if spec == "" || slice(spec, 0, 1) == "#":
+            return ""
+        let colon = indexOf(spec, ":", 0)
+        if colon < 0:
+            let sq = do goQuote(spec)
+            return "struct field " + sq + " must be `name: type`"
+        let fn = trim(slice(spec, 0, colon))
+        let ft = trim(slice(spec, colon + 1, len(spec)))
+        let fnq = do goQuote(fn)
+        let fnOk = do isIdentToken(fn)
+        if !fnOk:
+            return "invalid struct field name " + fnq
+        let ms = do mapTypeSpec(ft)
+        if ms != "":
+            let mk = do mapSpecKey(ms)
+            let mv = do mapSpecVal(ms)
+            if mk != "int" && mk != "text":
+                let mkq = do goQuote(mk)
+                return "struct field " + fn + ": a map key must be int or text, got " + mkq
+            let mvOk = do isTypeNameToken(mv)
+            if !mvOk:
+                let mvq = do goQuote(mv)
+                return "struct field " + fn + ": unknown map value type " + mvq + " (use a scalar or a struct name; a map holds no lists or maps)"
+            if mv == "money" || mv == "date":
+                return "struct field " + fnq + ": " + mv + " is not usable inside a proc's own struct type"
+            return ""
+        let opt = do typeIsOptional(ft)
+        if opt:
+            return "struct field " + fnq + " cannot be optional (?) — a struct literal must set every field"
+        let core0 = do typeCore(ft)
+        let core = do nestedBase(core0)
+        if core == "money" || core == "date":
+            return "struct field " + fnq + ": " + core + " is not usable inside a proc's own struct type — use int/text/bool/float, another struct, or a list of those"
+        let coreOk = do isTypeNameToken(core)
+        if !coreOk:
+            let cq = do goQuote(core)
+            return "unknown type " + cq + " in struct field " + fnq + " (use int/text/bool/float, another struct, or a list of those)"
+        return ""
+
+    # structDeclDiag: parser.go's parseStruct refusals, in its order, as
+    # "line N: …" ("" when the declaration parses).
+    proc structDeclDiag(header: text, bodyLines: [text], headerNo: int, bodyNos: [int]) -> text:
+        let head0 = do trimPrefixText(trim(header), "struct")
+        let head1 = trim(head0)
+        let head = do trimSuffixText(head1, ":")
+        let mut name = head
+        let mut inline = ""
+        let colon = indexOf(head, ":", 0)
+        if colon >= 0:
+            name = trim(slice(head, 0, colon))
+            inline = trim(slice(head, colon + 1, len(head)))
+        let nameOk = do isIdentToken(name)
+        let upOk = do isUpperName(name)
+        let nq = do goQuote(name)
+        if !nameOk || !upOk:
+            return "line " + headerNo + ": struct name " + nq + " must be capitalized"
+        let mut count = 0
+        if inline != "":
+            let specs = split(inline, ",")
+            let mut i = 0
+            loop i < len(specs):
+                let d = do structFieldSpecDiag(specs[i])
+                if d != "":
+                    return "line " + headerNo + ": " + d
+                let t = trim(specs[i])
+                if t != "" && slice(t, 0, 1) != "#":
+                    count = count + 1
+                i = i + 1
+        let mut j = 0
+        loop j < len(bodyLines):
+            let d2 = do structFieldSpecDiag(bodyLines[j])
+            if d2 != "":
+                let mut no = headerNo
+                if j < len(bodyNos):
+                    no = bodyNos[j]
+                return "line " + no + ": " + d2
+            let t2 = trim(bodyLines[j])
+            if t2 != "" && slice(t2, 0, 1) != "#":
+                count = count + 1
+            j = j + 1
+        if count == 0:
+            return "line " + headerNo + ": struct " + nq + " has no fields"
         return ""
 
     proc emptyExpectDecl() -> ExpectDecl:
@@ -920,7 +1051,7 @@ app ProgramSelfHost:
         loop di < nd:
             let d0 = derives[di]
             let qd = do qualifyRowRefs(d0.expr, fieldNames)
-            qderives = append(qderives, DeriveDeclFull{name: d0.name, typeCore: d0.typeCore, headerValid: d0.headerValid, exprSrc: d0.exprSrc, expr: qd, line: d0.line, cont: d0.cont})
+            qderives = append(qderives, DeriveDeclFull{name: d0.name, typeCore: d0.typeCore, headerValid: d0.headerValid, exprSrc: d0.exprSrc, expr: qd, line: d0.line, cont: d0.cont, lineNo: 0, renameFrom: [], renameTo: []})
             di = di + 1
         derives = qderives
         let fieldsOk = do entityFieldsAllValid(fields)
@@ -1088,6 +1219,7 @@ app ProgramSelfHost:
     proc buildActionDecl(header: text, bodySrc: text) -> ActionDecl:
         let rawHead = do actionHeadOf(header)
         let optimistic = do actionIsOptimistic(rawHead)
+        let internal = do actionIsInternal(rawHead)
         let head = do actionHeadStripOptimistic(rawHead)
         let name = do headerName(head)
         let paramNames = do headerParamNames(head)
@@ -1099,7 +1231,9 @@ app ProgramSelfHost:
         let mut ret = ""
         let mut retList = false
         let mut retErr = ""
-        if hasRet:
+        if optimistic && internal:
+            retErr = "an @internal action runs only on the authority, so it has nothing for a client to predict — drop @optimistic"
+        if hasRet && retErr == "":
             let rc = do headerRetCore(head)
             let rl = do headerRetIsList(head)
             let ropt = do headerRetIsOptional(head)
@@ -1113,12 +1247,12 @@ app ProgramSelfHost:
         let body = do actionBodyOnly(allStmts)
         let requiresList = do actionRequiresOnly(allStmts)
         let bodyValid = len(body) > 0
-        return ActionDecl{name: name, paramNames: paramNames, paramTypes: paramTypes, paramOptionals: paramOptionals, optimistic: optimistic, headerValid: headerValid, requires: requiresList, body: body, bodyValid: bodyValid, bodySrc: bodySrc, renameFrom: [], renameTo: [], paramLists: paramLists, ret: ret, retList: retList, retErr: retErr}
+        return ActionDecl{name: name, paramNames: paramNames, paramTypes: paramTypes, paramOptionals: paramOptionals, optimistic: optimistic, internal: internal, headerValid: headerValid, requires: requiresList, body: body, bodyValid: bodyValid, bodySrc: bodySrc, renameFrom: [], renameTo: [], paramLists: paramLists, ret: ret, retList: retList, retErr: retErr, standIn: false, bodyLineNos: []}
 
     proc buildComponentEntry(header: text, bodySrc: text) -> ComponentEntry:
         let cd = do buildComponentDecl(header)
         let body = do nodeTreeSrc(bodySrc)
-        return ComponentEntry{header: cd, body: body, headerLine: header, bodySrc: bodySrc}
+        return ComponentEntry{header: cd, body: body, headerLine: header, bodySrc: bodySrc, bodyLineNos: [], lineNo: 0}
 
     # progViewHeadOf/progViewAtIndex: the trivial header-only restatement of
     # nodes.fct's own `viewHeadOf`/`viewAtMarkerIndex` (the body itself is
@@ -1335,7 +1469,7 @@ app ProgramSelfHost:
             let idOk = do isIdentToken(name)
             headerValid = idOk
         let body = do nodeTreeSrc(bodySrc)
-        return ViewEntry{name: name, path: path, headerValid: headerValid, body: body, header: header, bodySrc: bodySrc, private: false}
+        return ViewEntry{name: name, path: path, headerValid: headerValid, body: body, header: header, bodySrc: bodySrc, private: false, bodyLineNos: [], lineNo: 0}
 
     # ============================================================
     # STAGE 5: the dispatch keyword set this file actually wires, restated
@@ -1537,8 +1671,28 @@ app ProgramSelfHost:
                     let rd = do parseRecordDeclSrc(combined)
                     records = append(records, rd)
                 if kw == "struct":
+                    let mut stNos = []
+                    let mut sbn = bodyStart
+                    loop sbn < bodyEnd:
+                        stNos = append(stNos, lineNos[sbn])
+                        sbn = sbn + 1
+                    let sdiag = do structDeclDiag(header, bodyLines, lineNos[headerIndex], stNos)
+                    if sdiag != "":
+                        parseErrors = append(parseErrors, sdiag)
                     let combined = do combineHeaderBody(header, bodySrc)
-                    let sd = do parseStructDeclSrc(combined)
+                    let mut sd = do parseStructDeclSrc(combined)
+                    # each field's line: its body line, or the header's for
+                    # fields written on it (`struct W: a: int, b: text`)
+                    let mut sfl = []
+                    let mut sfk = 0
+                    loop sfk < len(sd.fields):
+                        let mut f = sd.fields[sfk]
+                        f.line = lineNos[headerIndex]
+                        if len(stNos) == len(sd.fields):
+                            f.line = stNos[sfk]
+                        sfl = append(sfl, f)
+                        sfk = sfk + 1
+                    sd.fields = sfl
                     structs = append(structs, sd)
                 if kw == "enum":
                     let combined = do combineHeaderBody(header, bodySrc)
@@ -1550,7 +1704,12 @@ app ProgramSelfHost:
                     stateLines = append(stateLines, lineNos[headerIndex])
                 if kw == "derive":
                     let dv0 = do buildDeriveDeclFull(header)
-                    let dv = DeriveDeclFull{name: dv0.name, typeCore: dv0.typeCore, headerValid: dv0.headerValid, exprSrc: dv0.exprSrc, expr: dv0.expr, line: header, cont: bodySrc}
+                    let dv = DeriveDeclFull{name: dv0.name, typeCore: dv0.typeCore, headerValid: dv0.headerValid, exprSrc: dv0.exprSrc, expr: dv0.expr, line: header, cont: bodySrc, lineNo: lineNos[headerIndex], renameFrom: [], renameTo: []}
+                    # parser.go parses the definition with the file: an
+                    # expression it cannot read is a parse error of the file
+                    let dpe = do epParseError(dv0.exprSrc)
+                    if dpe != "" && trim(bodySrc) == "":
+                        parseErrors = append(parseErrors, "line " + lineNos[headerIndex] + ": " + dpe)
                     derives = append(derives, dv)
                 if kw == "policy":
                     let dph = do policyHeadOf(header)
@@ -1574,6 +1733,7 @@ app ProgramSelfHost:
                         parseErrors = append(parseErrors, "line " + lineNos[headerIndex] + ": " + dprsd)
                     let mut pcd = do parseProcDecl(header, bodySrc)
                     pcd.bodyLineNos = bodyNos0
+                    pcd.lineNo = lineNos[headerIndex]
                     procs = append(procs, pcd)
                     if isPrivate:
                         privateProcs = append(privateProcs, pcd.name)
@@ -1583,7 +1743,11 @@ app ProgramSelfHost:
                     let dasd = do sigDiag(dah, true)
                     if dasd != "":
                         parseErrors = append(parseErrors, "line " + lineNos[headerIndex] + ": " + dasd)
-                    let ad = do buildActionDecl(header, bodySrc)
+                    let mut ad = do buildActionDecl(header, bodySrc)
+                    ad.bodyLineNos = bodyNos0
+                    # parser.go's parseAction refusals: a parse error of the file
+                    if ad.retErr != "":
+                        parseErrors = append(parseErrors, "line " + lineNos[headerIndex] + ": " + ad.retErr)
                     actions = append(actions, ad)
                     actionLines = append(actionLines, lineNos[headerIndex])
                 if kw == "webhook":
@@ -1598,14 +1762,16 @@ app ProgramSelfHost:
                     if sv.err != "":
                         parseErrors = append(parseErrors, "line " + lineNos[headerIndex] + ": " + sv.err)
                 if kw == "component":
-                    let ce = do buildComponentEntry(header, bodySrc)
+                    let mut ce = do buildComponentEntry(header, bodySrc)
+                    ce.bodyLineNos = bodyNos0
+                    ce.lineNo = lineNos[headerIndex]
                     components = append(components, ce)
                 if kw == "on":
                     let tr = do buildTriggerDecl(header)
                     triggers = append(triggers, tr)
                 if kw == "view":
                     let ve = do buildViewEntry(header, bodySrc)
-                    views = append(views, ViewEntry{name: ve.name, path: ve.path, headerValid: ve.headerValid, body: ve.body, header: ve.header, bodySrc: ve.bodySrc, private: isPrivate})
+                    views = append(views, ViewEntry{name: ve.name, path: ve.path, headerValid: ve.headerValid, body: ve.body, header: ve.header, bodySrc: ve.bodySrc, private: isPrivate, bodyLineNos: bodyNos0, lineNo: lineNos[headerIndex]})
                 let isApi = do hasPrefixText(header, "api ")
                 let isContract = do hasPrefixText(header, "contract ")
                 let isStream = do hasPrefixText(header, "stream ")
@@ -1647,7 +1813,7 @@ app ProgramSelfHost:
                     hasContent = true
                     contentSrc = bodySrc
                 if kw == "layout":
-                    layouts = append(layouts, LayoutEntry{headerLine: header, bodySrc: bodySrc})
+                    layouts = append(layouts, LayoutEntry{headerLine: header, bodySrc: bodySrc, bodyLineNos: bodyNos0, lineNo: lineNos[headerIndex]})
                 if kw == "daemon":
                     let mut dm = do buildDaemonDecl(header, bodySrc)
                     dm.bodyLineNos = bodyNos0

@@ -409,6 +409,46 @@ app APIDecl:
             headers = append(headers, HttpHeader{name: "retry-after", value: "" + retry})
         return RtRateOut{w: w, allowed: allowed, headers: headers}
 
+    # rtGuardRate: guardMutation's limiter — a token bucket per client ip
+    # over every state-changing endpoint: FACET_RATE_LIMIT per minute (600
+    # by default), the whole minute's budget as its burst.
+    proc rtGuardRate(w0: RtWorld, req: HttpServerRequest) -> RtRateOut:
+        let mut w = w0
+        let peer = do rtHeaderValue(req.headers, "x-facet-peer")
+        let ip = do rtClientIP(req, peer)
+        let mut per = w.rateDefault
+        if per <= 0:
+            per = 600
+        let burst = toFloat(per)
+        let rate = toFloat(per) / 60.0
+        let key = "\x00mutation\n" + ip
+        let now = monoMs()
+        let mut at = -1
+        let mut i = 0
+        loop i < len(w.rateKeys):
+            if w.rateKeys[i] == key:
+                at = i
+            i = i + 1
+        let mut tokens = burst
+        let mut last = now
+        if at >= 0:
+            tokens = w.rateTokens[at]
+            last = w.rateLast[at]
+        tokens = tokens + toFloat(now - last) / 1000.0 * rate
+        if tokens > burst:
+            tokens = burst
+        let allowed = tokens >= 1.0
+        if allowed:
+            tokens = tokens - 1.0
+        if at >= 0:
+            w.rateTokens[at] = tokens
+            w.rateLast[at] = now
+        else:
+            w.rateKeys = append(w.rateKeys, key)
+            w.rateTokens = append(w.rateTokens, tokens)
+            w.rateLast = append(w.rateLast, now)
+        return RtRateOut{w: w, allowed: allowed, headers: []}
+
     proc rtClientIP(req: HttpServerRequest, peer: text) -> text:
         let xff = do rtHeaderValue(req.headers, "x-forwarded-for")
         if xff != "":
@@ -452,7 +492,9 @@ app APIDecl:
                 n = n + 1
                 found = act.params[i].name
                 let wire = do rtIsWireTypeOrMessage(g, act.params[i].type)
-                if !wire:
+                # a list of them (`events: [Event]`) is a named field of the
+                # body, not the body
+                if !wire || act.params[i].list:
                     found = "\x00"
             i = i + 1
         if n != 1 || found == "\x00":
@@ -754,7 +796,7 @@ app APIDecl:
                 args = append(args, noneVal())
             else:
                 let raw = do rtBoundGet(bound, p2.name)
-                let cv = do rtParamArg(raw, p2)
+                let cv = do rtArgFor(w.g, raw, p2)
                 if !cv.ok:
                     let bad = do rtAPIError(400, "parameter \"" + p2.name + "\" expects " + rtParamTypeName(p2))
                     let badr = do rtWithHeaders(bad, rate.headers)
@@ -933,7 +975,7 @@ app APIDecl:
                         let decoded = do jsonParse(raw.s)
                         if decoded.kind != "none":
                             rv = do rtJValToVal(decoded)
-                    let cv = do rtParamArg(rv, p)
+                    let cv = do rtArgFor(w0.g, rv, p)
                     if !cv.ok:
                         let e4 = do rtAPIError(400, tag + ": \"" + p.name + "\" expects " + rtParamTypeName(p))
                         return RtHandled{resp: e4, w: w}

@@ -74,6 +74,9 @@ func indexName(entity, field string) string { return "idx_" + entity + "_" + fie
 // store once did: one definition of at-rest coercion, so the two backends
 // store equivalent values.
 func colValue(f ir.Field, v any) any {
+	if v == nil && f.Optional {
+		return nil // a nullable column's nothing is stored as nothing (columnValue)
+	}
 	switch {
 	case f.IsRelation() || f.Type == "int":
 		return int64(toInt(v))
@@ -183,6 +186,9 @@ func litSQLValue(e *ir.Expr) any {
 	switch e.VType {
 	case "int":
 		return int64(toInt(e.Val))
+	case "float":
+		f, _ := e.Val.(float64)
+		return f
 	case "bool":
 		b, _ := e.Val.(bool)
 		return b

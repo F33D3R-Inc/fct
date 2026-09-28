@@ -69,6 +69,11 @@ func (s *Server) resolveDataPath(reqPath string) (string, error) {
 		full = filepath.Clean(filepath.Join(root, reqPath))
 	}
 	if full != root && !strings.HasPrefix(full, root+string(os.PathSeparator)) {
+		// A directory its operator granted (grantDir) is the one other
+		// place a path may name.
+		if s.grants.coversDir(full) {
+			return full, nil
+		}
 		return "", fmt.Errorf("path %q escapes the sandboxed data directory", reqPath)
 	}
 	return full, nil

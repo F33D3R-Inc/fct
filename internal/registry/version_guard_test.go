@@ -56,21 +56,22 @@ func TestToolchainVersionCoversControls(t *testing.T) {
 func TestToolchainVersionCoversBuiltins(t *testing.T) {
 	known := map[string]parser.BuiltinSite{}
 	for _, n := range strings.Fields(`abs ago byteLen charAt commas compact contains day first floor fromIso fromJson
-		iso join len lower max min money month now rand replace round slice slug split take toFloat toInt toMoney trim upper year`) {
+		iso join len lower max min money month now rand replace round slice slug split take toFloat toInt toMoney trim upper year indexOf`) {
 		known[n] = parser.SiteEverywhere
 	}
 	for _, n := range strings.Fields(`canonicalJson ecdsaP256Verify ed25519Verify fileDigest floatBits floatFromBits formatIn
-		fromLocal given print randomToken sha256Hex shuffleOrder totpSecret totpValid verifyPassword zoneValid exp ln sqrt
+		fromLocal given print randomToken sha256Hex shuffleOrder totpSecret totpValid verifyPassword zoneValid exp ln sqrt sin cos
 		u64Cmp u64Min u64Max u64SatSub u64Div u64Rem u64Text u64Parse u64ParseError u64ToFloat`) {
 		known[n] = parser.SiteAuthority
 	}
 	for _, n := range strings.Fields(`accept aesGcmAuthentic aesGcmOpen aesGcmSeal append appendFile bytes bytesToText channel
 		closeConn connError connOpen connect envSet envVar fileExists fileSize httpGet httpPost listen listenOn monoMs nowMs signals
 		awaitAny closeChannel exitProcess processStats listenTls connPeer connectTls
-		closeListener listenError listenerPort grantRead
-		pollBytes randomBytes readBytes readFile readFileAt readStdin recv removeFile renameFile lockFile crc32 bytesCmp bytesCmpRange uintLE toHex fromHex send setTimeoutMs
-		shutdownConn sleepMs syncFile textToBytes truncateFile writeBytes writeFile writeFileAt writeStderr writeStdout
-		sha256Bytes hmacSha256 base64UrlRaw bcryptHash bcryptMatches fileModTime indexOf`) {
+		closeListener listenError listenerPort grantRead grantDir listDir makeDir readStdinLine bytesPut
+		pollBytes randomBytes readBytes readFile readFileAt readStdin recv removeFile renameFile lockFile crc32 bytesCmp bytesCmpRange uintLE toHex fromHex send trySend setTimeoutMs
+		shutdownConn closeWrite sleepMs syncFile textToBytes truncateFile writeBytes writeFile writeFileAt writeStderr writeStdout
+		sha256Bytes hmacSha256 base64UrlRaw bcryptHash bcryptMatches fileModTime
+		p256PrivateKey p256PublicKey p256Ecdh es256Sign fromBase64UrlRaw httpSend uploadBytes validUtf8 jsonQuote`) {
 		known[n] = parser.SiteProc
 	}
 	var changed []string

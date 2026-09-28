@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"facet/internal/compile"
 )
 
 // notifyStore records what a server publishes on the cluster bus and which
@@ -154,5 +156,148 @@ func TestBearerSlidesSession(t *testing.T) {
 	}
 	if len(srv.sessions) != count {
 		t.Fatalf("unauthenticated reads created %d sessions", len(srv.sessions)-count)
+	}
+}
+
+// A session ended between resolving a request and running its action (a
+// peer's revoke evicting it here) is not minted back as a guest under the same
+// id: that request runs as a transient guest, and the id stays dead — the next
+// request with the same token is unauthenticated, not a signed-in-looking guest.
+func TestEndedSessionIsNotMintedBackByAnAction(t *testing.T) {
+	srv, ts := credentialServer(t)
+	anon := &apiClient{t: t, base: ts.URL}
+	_, body, _ := anon.do("POST", "/api/accounts", `{"handle":"ada","password":"correct horse"}`)
+	token := toStr(body["token"])
+	sid, _ := verifySigned(token)
+	me := &apiClient{t: t, base: ts.URL, token: token}
+	if code, _, _ := me.do("GET", "/api/me", ""); code != http.StatusOK {
+		t.Fatalf("GET /api/me before the revoke = %d", code)
+	}
+
+	// The request resolved sid; the peer's revoke lands before its action runs.
+	srv.store.DeleteSession(sid)
+	srv.evictCachedSessions([]string{sid})
+	_, _, status, _, _ := srv.runActionReply(sid, srv.byAction["whoami"], nil)
+	if status != http.StatusForbidden {
+		t.Fatalf("the in-flight action ran with status %d, want 403 (as a guest)", status)
+	}
+	srv.mu.Lock()
+	_, cached := srv.sessions[sid]
+	srv.mu.Unlock()
+	if cached {
+		t.Fatal("running an action under an ended id cached a session under it")
+	}
+	if code, _, _ := me.do("GET", "/api/me", ""); code != http.StatusUnauthorized {
+		t.Fatalf("GET /api/me after the revoke = %d, want 401", code)
+	}
+}
+
+// A clustered instance's write-back of a session a peer has ended (a slide or
+// a state save racing the peer's revoke) does not re-create it in the shared
+// table: the ending wins, and the local copy is dropped too.
+func TestSessionWriteBackDoesNotResurrect(t *testing.T) {
+	srv, ts := credentialServer(t)
+	srv.cluster = &cluster{srv: srv, instanceID: "me"}
+	srv.store = &notifyStore{Store: srv.store}
+	anon := &apiClient{t: t, base: ts.URL}
+	_, body, _ := anon.do("POST", "/api/accounts", `{"handle":"ada","password":"correct horse"}`)
+	token := toStr(body["token"])
+	sid, _ := verifySigned(token)
+	if _, found, _ := srv.store.LoadSession(sid); !found {
+		t.Fatal("signup did not persist its session")
+	}
+	srv.mu.Lock()
+	visitor := srv.sessions[sid].visitor
+	srv.mu.Unlock()
+
+	// A peer revokes the session: the shared row goes, the bus has not arrived.
+	srv.store.DeleteVisitorSessions(visitor)
+	srv.persistSession(sid)
+	if _, found, _ := srv.store.LoadSession(sid); found {
+		t.Fatal("a write-back re-created a session a peer had ended")
+	}
+	srv.mu.Lock()
+	_, cached := srv.sessions[sid]
+	srv.mu.Unlock()
+	if cached {
+		t.Fatal("the instance kept a session the shared table no longer has")
+	}
+	me := &apiClient{t: t, base: ts.URL, token: token}
+	if code, _, _ := me.do("GET", "/api/me", ""); code != http.StatusUnauthorized {
+		t.Fatalf("GET /api/me after the peer's revoke = %d, want 401", code)
+	}
+
+	// A new session is still inserted, and a live one still written back.
+	_, body, _ = anon.do("POST", "/api/sessions", `{"handle":"ada","password":"correct horse"}`)
+	sid2, _ := verifySigned(toStr(body["token"]))
+	srv.mu.Lock()
+	srv.sessions[sid2].state = map[string]any{"k": "v"}
+	srv.mu.Unlock()
+	srv.persistSession(sid2)
+	if ps, found, _ := srv.store.LoadSession(sid2); !found || toStr(ps.State["k"]) != "v" {
+		t.Fatalf("a live session's write-back was lost (found %v)", found)
+	}
+}
+
+// A peer's change reloads an entity into the working set the way boot does:
+// a @softdelete row the peer archived is gone here too, and its id stays
+// taken.
+func TestRemoteChangeHidesArchivedRows(t *testing.T) {
+	g, err := compile.String(`app S:
+    entity Note @softdelete:
+        id: int
+        body: text
+    action write(body: text):
+        add Note { body: body }
+    view V at "/":
+        text "{count(Note)}"
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewInMemory(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown()
+	for _, b := range []string{"a", "b"} {
+		if _, err := srv.Run("ada", "member", true, "write", []any{b}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The peer archived Note 2 and wrote Note 3 as archived in one go.
+	srv.store.Save("Note", record{"id": 2, "body": "b", "archived": true})
+	srv.store.Save("Note", record{"id": 3, "body": "c", "archived": true})
+	srv.applyRemoteChange([]string{"Note"})
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if n := len(srv.entities["Note"]); n != 1 {
+		t.Fatalf("working set after the peer's archive = %d rows, want 1", n)
+	}
+	if srv.nextID["Note"] != 3 {
+		t.Fatalf("nextID = %d, want 3 (an archived row's id is still taken)", srv.nextID["Note"])
+	}
+}
+
+// FACET_CLUSTER=1 configures an app's runtime. A host running a program
+// (`facet exec` — the FacetQL engine, the fct runtime) is not that runtime:
+// it never joins a cluster, so the variable meant for the program it runs
+// cannot stop it from starting, while an in-memory app still refuses it.
+func TestProgramHostIgnoresCluster(t *testing.T) {
+	t.Setenv("FACET_CLUSTER", "1")
+	g, err := compile.String("app P:\n    view V at \"/\":\n        text \"x\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewInMemory(g); err == nil || !strings.Contains(err.Error(), "FACET_CLUSTER=1 requires the facetql:// store") {
+		t.Fatalf("an in-memory app with FACET_CLUSTER=1 = %v, want the refusal", err)
+	}
+	srv, err := NewProgram(g)
+	if err != nil {
+		t.Fatalf("a program host with FACET_CLUSTER=1: %v", err)
+	}
+	defer srv.Shutdown()
+	if srv.cluster != nil {
+		t.Fatal("a program host joined a cluster")
 	}
 }

@@ -18,7 +18,7 @@ import (
 var clientBuiltinFuncs = []string{
 	"evCall", "isFloatNum", "roundAway", "runeSlice", "listSlice", "utf8Len", "mapCase", "goTrim",
 	"fromJsonJS", "fromIsoJS", "ago", "isoJS", "compact", "commas", "money", "toMoney",
-	"toFloatJS", "truthy", "toInt", "toStr", "numStr",
+	"toFloatJS", "truthy", "toInt", "toStr", "numStr", "eq",
 }
 
 // clientBuiltinPrelude is the shipped client's builtin evaluator as a script
@@ -97,6 +97,10 @@ var clientParityCases = []parityCase{
 	{"slice", []any{"hello", 0, 3}}, {"slice", []any{"hello", 3, 1}}, {"slice", []any{"hello", -5, 99}}, {"slice", []any{"a😀bc", 1, 3}},
 	{"slice", []any{"", 0, 1}}, {"slice", []any{"héllo", 1, 2}},
 	{"slice", []any{[]any{1, 2, 3}, 1, 3}}, {"slice", []any{[]any{"a", "b"}, -1, 9}}, {"slice", []any{[]any{1, 2}, 2, 1}},
+	{"take", []any{[]any{1, 2, 3}, 2}}, {"take", []any{[]any{"a", "b"}, 9}}, {"take", []any{[]any{1, 2}, -1}}, {"take", []any{[]any{}, 1}},
+	{"indexOf", []any{"hello", "l", 0}}, {"indexOf", []any{"hello", "l", 3}}, {"indexOf", []any{"hello", "z", 0}}, {"indexOf", []any{"a😀b😀c", "😀", 2}},
+	{"indexOf", []any{"héllo", "llo", -4}}, {"indexOf", []any{"abc", "", 9}}, {"indexOf", []any{[]any{3, 1, 2}, 2, 0}}, {"indexOf", []any{[]any{"a", "b", "a"}, "a", 1}},
+	{"indexOf", []any{[]any{1, 2}, 5, 0}},
 	{"charAt", []any{"hello", 1}}, {"charAt", []any{"hello", -1}}, {"charAt", []any{"hello", 5}}, {"charAt", []any{"a😀b", 1}},
 	{"replace", []any{"a-b-c", "-", "+"}}, {"replace", []any{"abc", "", "-"}}, {"replace", []any{"", "", "-"}}, {"replace", []any{"a😀", "", "|"}}, {"replace", []any{"aaa", "aa", "b"}},
 	{"slug", []any{"Hello, World!"}}, {"slug", []any{"İx"}}, {"slug", []any{"--Ünïcode  Straße--"}}, {"slug", []any{"KELVIN"}},

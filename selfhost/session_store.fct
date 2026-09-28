@@ -25,6 +25,9 @@ app SessionStore:
         pendingMFA: text
         stateKeys: [text]
         stateVals: [Val]
+        # persisted: the shared session table holds this session's row
+        # (sessionState.persisted) — a later write must find it there
+        persisted: bool
 
     struct RtSub:
         ch: int
@@ -147,6 +150,196 @@ app SessionStore:
         idemBody: [text]
         idemExpires: [int]
         idemTTL: int
+        # FACET_MULTI_TENANT / FACET_BILLING (envOn: 1, true, on, yes)
+        multiTenant: bool
+        billing: bool
+        # the Prometheus series /metrics renders (metrics.go)
+        met: RtMetrics
+        # the generated admin console (FACET_ADMIN=0 turns it off)
+        adminOn: bool
+        # i18n (compliance.go): the default locale (FACET_DEFAULT_LOCALE) and
+        # the catalogs FACET_I18N_DIR/<locale>.json held, by locale name
+        i18nDefault: text
+        i18n: [RtCatalog]
+        # the audit log (audit.go): the newest 1000 entries, and the last
+        # reserved-record id minted (nextFQID) for their durable rows
+        audit: [RtAudit]
+        auditSeq: int
+        # clustering (cluster.go, FACET_CLUSTER=1): this instance's id, and
+        # what the request in flight did to sessions the shared table must
+        # hear of — written through, ended, revoked by `session` key,
+        # re-roled — synced by the loop once the request's writes commit
+        clusterOn: bool
+        instanceID: text
+        sesDirty: [text]
+        sesEnded: [text]
+        revokeKeys: [text]
+        restateActors: [text]
+        restateRoles: [text]
+        # each page's IR as its bootstrap carries it, serialized once: the
+        # graph never changes after boot, so neither does this (by path)
+        irPaths: [text]
+        irJSONs: [text]
+
+    # RtAudit: auditEntry — who ran what, when (unix seconds), and whether
+    # the gate allowed it.
+    struct RtAudit:
+        time: int
+        actor: text
+        action: text
+        allowed: bool
+        detail: text
+
+    struct RtCatalog:
+        locale: text
+        keys: [text]
+        vals: [text]
+
+    # RtMetrics: metrics.go's collector. Requests by "method|route|status",
+    # their latency histogram (cumulative counts per bound), actions by
+    # "action|outcome", durable job runs by outcome, the sessions gauge as
+    # last set, and the streams still open (their key and start) whose
+    # request is observed when they end, as a handler returning is in Go.
+    struct RtMetrics:
+        startMs: int
+        reqKeys: [text]
+        reqCounts: [int]
+        durCounts: [int]
+        durSum: float
+        durCount: int
+        actKeys: [text]
+        actCounts: [int]
+        jobKeys: [text]
+        jobCounts: [int]
+        jobQueueDepth: int
+        sessions: int
+        openChans: [int]
+        openMethods: [text]
+        openPaths: [text]
+        openStatus: [int]
+        openStart: [int]
+
+    # rtMetAction: observeAction — one more of "action|outcome".
+    proc rtMetAction(m0: RtMetrics, key: text) -> RtMetrics:
+        let mut m = m0
+        let mut i = 0
+        loop i < len(m.actKeys):
+            if m.actKeys[i] == key:
+                m.actCounts[i] = m.actCounts[i] + 1
+                return m
+            i = i + 1
+        m.actKeys = append(m.actKeys, key)
+        m.actCounts = append(m.actCounts, 1)
+        return m
+
+    # rtMetJob: observeJob — one more job run with this outcome.
+    proc rtMetJob(m0: RtMetrics, outcome: text) -> RtMetrics:
+        let mut m = m0
+        let mut i = 0
+        loop i < len(m.jobKeys):
+            if m.jobKeys[i] == outcome:
+                m.jobCounts[i] = m.jobCounts[i] + 1
+                return m
+            i = i + 1
+        m.jobKeys = append(m.jobKeys, outcome)
+        m.jobCounts = append(m.jobCounts, 1)
+        return m
+
+    # rtObserveActions: the outcomes an action reported, into the world's
+    # collector.
+    proc rtObserveActions(w0: RtWorld, keys: [text]) -> RtWorld:
+        let mut w = w0
+        let mut i = 0
+        loop i < len(keys):
+            w.met = do rtMetAction(w.met, keys[i])
+            i = i + 1
+        return w
+
+    # rtMetRefused: a request whose writes the store refused — each action
+    # it metered "ok" is metered "error" instead (runActionLocked observes
+    # "error" when commit fails, and never reaches "ok").
+    proc rtMetRefused(before: RtMetrics, failed: RtMetrics) -> RtMetrics:
+        let mut m = failed
+        let mut i = 0
+        loop i < len(failed.actKeys):
+            let k = failed.actKeys[i]
+            if len(k) > 3 && slice(k, len(k) - 3, len(k)) == "|ok":
+                let mut prior = 0
+                let mut j = 0
+                loop j < len(before.actKeys):
+                    if before.actKeys[j] == k:
+                        prior = before.actCounts[j]
+                    j = j + 1
+                let mut d = failed.actCounts[i] - prior
+                m.actCounts[i] = prior
+                let name = slice(k, 0, len(k) - 3)
+                loop d > 0:
+                    m = do rtMetAction(m, name + "|error")
+                    d = d - 1
+            i = i + 1
+        return m
+
+    # rtMetStreamEnded: a stream's request is observed once it closes.
+    proc rtMetStreamEnded(m0: RtMetrics, ch: int) -> RtMetrics:
+        let mut m = m0
+        let mut chans = []
+        let mut methods = []
+        let mut paths = []
+        let mut sts = []
+        let mut starts = []
+        let mut i = 0
+        loop i < len(m0.openChans):
+            if m0.openChans[i] == ch:
+                m = do rtMetRequest(m, m0.openMethods[i], m0.openPaths[i], m0.openStatus[i], monoMs() - m0.openStart[i])
+            else:
+                chans = append(chans, m0.openChans[i])
+                methods = append(methods, m0.openMethods[i])
+                paths = append(paths, m0.openPaths[i])
+                sts = append(sts, m0.openStatus[i])
+                starts = append(starts, m0.openStart[i])
+            i = i + 1
+        m.openChans = chans
+        m.openMethods = methods
+        m.openPaths = paths
+        m.openStatus = sts
+        m.openStart = starts
+        return m
+
+    # rtRouteLabel: routeLabel — a request path collapsed to a bounded label.
+    proc rtRouteLabel(path: text) -> text:
+        if path == "/":
+            return "/"
+        if len(path) >= 5 && slice(path, 0, 5) == "/api/":
+            return "/api/*"
+        if len(path) >= 6 && slice(path, 0, 6) == "/auth/":
+            return "/auth/*"
+        return path
+
+    # rtMetRequest: observeRequest — the request counter and the latency
+    # histogram (each bound counts every observation at or under it).
+    proc rtMetRequest(m0: RtMetrics, method: text, path: text, status: int, ms: int) -> RtMetrics:
+        let mut m = m0
+        let key = method + "|" + rtRouteLabel(path) + "|" + status
+        let mut found = false
+        let mut i = 0
+        loop i < len(m.reqKeys):
+            if m.reqKeys[i] == key:
+                m.reqCounts[i] = m.reqCounts[i] + 1
+                found = true
+            i = i + 1
+        if !found:
+            m.reqKeys = append(m.reqKeys, key)
+            m.reqCounts = append(m.reqCounts, 1)
+        let secs = toFloat(ms) / 1000.0
+        let bounds = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+        let mut b = 0
+        loop b < len(bounds):
+            if secs <= bounds[b]:
+                m.durCounts[b] = m.durCounts[b] + 1
+            b = b + 1
+        m.durSum = m.durSum + secs
+        m.durCount = m.durCount + 1
+        return m
 
     proc rtSessionTTLms() -> int:
         return 24 * 60 * 60 * 1000
@@ -243,7 +436,7 @@ app SessionStore:
             i = i + 1
         return RtApiRead{names: names, guards: guards}
 
-    proc rtWorldNew(g: IRGraph, master: text, apiRead: text) -> RtWorld:
+    proc rtWorldNew(g: IRGraph, master: text, apiRead: text, baseCSS: text) -> RtWorld:
         let mut names = []
         let mut rows = []
         let mut ids = []
@@ -254,12 +447,20 @@ app SessionStore:
             ids = append(ids, 0)
             i = i + 1
         let key = do rtSignKey(master)
-        let css = do rtStylesheet(g)
+        let css = do rtStylesheet(g, baseCSS)
         let ver = do rtStylesheetVersion(css)
         let rules = do rtApiReadRules(g, apiRead)
-        return RtWorld{g: g, entNames: names, entRows: rows, nextIds: ids, sessions: [], writeSeq: 0, subs: [], signKey: key, secure: false, cssBody: css, cssVer: ver, lockNames: [], lockCounts: [], lockFirst: [], lockUntil: [], apiReadNames: rules.names, apiReadGuards: rules.guards, rateKeys: [], rateTokens: [], rateLast: [], rateClassNames: [], rateClassLimits: [], rateDefault: 0, uploadDir: "", uploadCap: 10 * 1024 * 1024, uploadTotalCap: 200 * 1024 * 1024, mediaTTL: 0, upIds: [], upNames: [], upSizes: [], contractRaw: "", contractVersion: "", contractGenerated: 0, schemaVersion: 0, storeOn: false, fqlBase: "", fqlToken: "", encKey: sha256Bytes(textToBytes("facet:encrypt:" + master)), pendingOps: [], pendingChanged: [], streamSubs: [], streamLogs: [], pendingEvents: [], whPaths: [], whKeys: [], idemKeys: [], idemDone: [], idemStatus: [], idemBody: [], idemExpires: [], idemTTL: 86400}
+        return RtWorld{g: g, entNames: names, entRows: rows, nextIds: ids, sessions: [], writeSeq: 0, subs: [], signKey: key, secure: false, cssBody: css, cssVer: ver, lockNames: [], lockCounts: [], lockFirst: [], lockUntil: [], apiReadNames: rules.names, apiReadGuards: rules.guards, rateKeys: [], rateTokens: [], rateLast: [], rateClassNames: [], rateClassLimits: [], rateDefault: 0, uploadDir: "", uploadCap: 10 * 1024 * 1024, uploadTotalCap: 200 * 1024 * 1024, mediaTTL: 0, upIds: [], upNames: [], upSizes: [], contractRaw: "", contractVersion: "", contractGenerated: 0, schemaVersion: 0, storeOn: false, fqlBase: "", fqlToken: "", encKey: sha256Bytes(textToBytes("facet:encrypt:" + master)), pendingOps: [], pendingChanged: [], streamSubs: [], streamLogs: [], pendingEvents: [], whPaths: [], whKeys: [], idemKeys: [], idemDone: [], idemStatus: [], idemBody: [], idemExpires: [], idemTTL: 86400, multiTenant: false, billing: false, met: RtMetrics{startMs: monoMs(), reqKeys: [], reqCounts: [], durCounts: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], durSum: 0.0, durCount: 0, actKeys: [], actCounts: [], jobKeys: [], jobCounts: [], jobQueueDepth: 0, sessions: 0, openChans: [], openMethods: [], openPaths: [], openStatus: [], openStart: []}, adminOn: true, i18nDefault: "en", i18n: [], audit: [], auditSeq: 0, clusterOn: false, instanceID: "", sesDirty: [], sesEnded: [], revokeKeys: [], restateActors: [], restateRoles: [], irPaths: [], irJSONs: []}
 
     proc rtEntIndex(w: RtWorld, name: text) -> int:
+        let idx = rtNames
+        if idx.nEntNames == len(w.entNames) && idx.nEntNames > 0:
+            if name in idx.entNames:
+                let p = idx.entNames[name]
+                if w.entNames[p] == name:
+                    return p
+            else:
+                return -1
         let mut i = 0
         loop i < len(w.entNames):
             if w.entNames[i] == name:
@@ -312,6 +513,115 @@ app SessionStore:
     proc rtIsReservedEntity(name: text) -> bool:
         return name == "FacetUser" || name == "FacetTenant" || name == "FacetMembership" || name == "FacetInvite" || name == "FacetSubscription" || name == "FacetUsage" || name == "FacetContractVersion"
 
+    # ── the audit log (audit.go) ────────────────────────────────────────
+    # rtAuditJSON: an auditEntry as encoding/json writes it (detail
+    # omitted when empty).
+    proc rtAuditJSON(e: RtAudit) -> text:
+        let mut out = "{\"time\":" + e.time + ",\"actor\":" + jsonQuote(e.actor) + ",\"action\":" + jsonQuote(e.action) + ",\"allowed\":" + rtBoolWord(e.allowed)
+        if e.detail != "":
+            out = out + ",\"detail\":" + jsonQuote(e.detail)
+        return out + "}"
+
+    # rtRecordAudit: recordAudit — the entry joins the ring (the newest
+    # 1000) and, with a store, is written through as a reserved __audit
+    # record addressed by a strictly increasing id (nextFQID).
+    proc rtRecordAudit(w0: RtWorld, actor: text, action: text, allowed: bool, detail: text) -> RtWorld:
+        let mut w = w0
+        let now = nowMs()
+        let e = RtAudit{time: now / 1000, actor: actor, action: action, allowed: allowed, detail: detail}
+        w.audit = append(w.audit, e)
+        if len(w.audit) > 1000:
+            w.audit = slice(w.audit, len(w.audit) - 1000, len(w.audit))
+        if w.storeOn:
+            let mut id = now * 1000000
+            if id <= w.auditSeq:
+                id = w.auditSeq + 1
+            w.auditSeq = id
+            let mut digits = "" + id
+            loop len(digits) < 19:
+                digits = "0" + digits
+            w.pendingOps = append(w.pendingOps, RtDurOp{kind: "audit", entity: "__audit:" + digits, row: textVal(rtAuditJSON(e)), id: 0})
+        return w
+
+    proc rtRecordAudits(w0: RtWorld, es: [RtAudit]) -> RtWorld:
+        let mut w = w0
+        let mut i = 0
+        loop i < len(es):
+            w = do rtRecordAudit(w, es[i].actor, es[i].action, es[i].allowed, es[i].detail)
+            i = i + 1
+        return w
+
+    # rtAuditRefused: the request's writes were refused — each action it
+    # audited as allowed is audited as a failed store write instead
+    # (runActionLocked records that, and never reaches the success entry).
+    proc rtAuditRefused(before: [RtAudit], failed: [RtAudit], err: text) -> [RtAudit]:
+        let mut added = len(failed) - len(before)
+        if added < 0:
+            added = 0
+        let mut out = slice(failed, 0, len(failed) - added)
+        let mut i = len(failed) - added
+        loop i < len(failed):
+            let e = failed[i]
+            if e.allowed && e.detail == "":
+                out = append(out, RtAudit{time: e.time, actor: e.actor, action: e.action, allowed: false, detail: "store write failed: " + err})
+            else:
+                out = append(out, e)
+            i = i + 1
+        return out
+
+    # ── i18n negotiation (compliance.go) ────────────────────────────────
+    proc rtHasLocale(w: RtWorld, locale: text) -> bool:
+        if locale == w.i18nDefault:
+            return true
+        let mut i = 0
+        loop i < len(w.i18n):
+            if w.i18n[i].locale == locale:
+                return true
+            i = i + 1
+        return false
+
+    # rtParseAcceptLanguage: the tags in the order sent, ;q= dropped.
+    proc rtParseAcceptLanguage(h: text) -> [text]:
+        let mut out = []
+        if h == "":
+            return out
+        let parts = split(h, ",")
+        let mut i = 0
+        loop i < len(parts):
+            let mut tag = trim(parts[i])
+            let semi = do rtIndexOfText(tag, ";")
+            if semi >= 0:
+                tag = trim(slice(tag, 0, semi))
+            if tag != "" && tag != "*":
+                out = append(out, tag)
+            i = i + 1
+        return out
+
+    # rtLocaleFor: localeFor — `?lang=` the catalog knows, then the first
+    # Accept-Language tag it knows (or that tag's base subtag), then the
+    # default.
+    proc rtLocaleFor(w: RtWorld, req: HttpServerRequest) -> text:
+        if req.hasQuery:
+            let l = do rtQueryValue(req.query, "lang")
+            let known = do rtHasLocale(w, l)
+            if l != "" && known:
+                return l
+        let tags = do rtParseAcceptLanguage(rtHeaderValue(req.headers, "accept-language"))
+        let mut i = 0
+        loop i < len(tags):
+            let t = tags[i]
+            let has = do rtHasLocale(w, t)
+            if has:
+                return t
+            let dash = do rtIndexOfText(t, "-")
+            if dash > 0:
+                let base = slice(t, 0, dash)
+                let hasBase = do rtHasLocale(w, base)
+                if hasBase:
+                    return base
+            i = i + 1
+        return w.i18nDefault
+
     # ── sessions ────────────────────────────────────────────────────────
     proc rtSessionIndex(w: RtWorld, sid: text) -> int:
         let mut i = 0
@@ -336,7 +646,7 @@ app SessionStore:
                 vals = append(vals, r.v)
             i = i + 1
         let visitor = do rtNewSessionID()
-        return RtSession{sid: sid, actor: actor, role: role, verified: false, visitor: visitor, expires: nowMs() + rtSessionTTLms(), pendingMFA: "", stateKeys: keys, stateVals: vals}
+        return RtSession{sid: sid, actor: actor, role: role, verified: false, visitor: visitor, expires: nowMs() + rtSessionTTLms(), pendingMFA: "", stateKeys: keys, stateVals: vals, persisted: false}
 
     proc rtPutSession(w0: RtWorld, ses: RtSession) -> RtWorld:
         let mut w = w0
@@ -414,24 +724,52 @@ app SessionStore:
             i = i + 1
         return ""
 
+    # rtSesDirty: persistSession owed for sid once the request commits.
+    proc rtSesDirty(w0: RtWorld, sid: text) -> RtWorld:
+        let mut w = w0
+        if !w.clusterOn || sid == "" || sid == "__system" || sid == "tool":
+            return w
+        let mut i = 0
+        loop i < len(w.sesDirty):
+            if w.sesDirty[i] == sid:
+                return w
+            i = i + 1
+        w.sesDirty = append(w.sesDirty, sid)
+        return w
+
+    # rtSesEnded: dropSharedSession owed for sid once the request commits.
+    proc rtSesEnded(w0: RtWorld, sid: text) -> RtWorld:
+        let mut w = w0
+        if !w.clusterOn || sid == "" || sid == "__system" || sid == "tool":
+            return w
+        w.sesEnded = append(w.sesEnded, sid)
+        return w
+
     # rtSession: Server.session — resolve or mint the caller's session from
     # the signed cookie; every call slides the expiry and re-stamps.
-    proc rtSession(w0: RtWorld, req: HttpServerRequest) -> RtSessionOut:
+    proc rtSession(w0: RtWorld, req: HttpServerRequest) -> RtSessionOut uses io.net:
         let mut w = w0
         let now = nowMs()
         let raw = do rtCookieValue(req.headers, "fa_sid")
         if raw != "":
             let v = do rtVerifySigned(w, raw)
             if v.ok:
-                let i = do rtSessionIndex(w, v.value)
+                let mut i = do rtSessionIndex(w, v.value)
+                # Stateless servers: a request can land on a cold instance,
+                # so a cache miss rehydrates from the shared table.
+                if i < 0 && w.clusterOn:
+                    w = do rtRehydrateSession(w, v.value)
+                    i = do rtSessionIndex(w, v.value)
                 if i >= 0:
                     if now < w.sessions[i].expires:
                         let mut ses = w.sessions[i]
                         ses.expires = now + rtSessionTTLms()
                         w.sessions[i] = ses
+                        w = do rtSesDirty(w, v.value)
                         let ck = do rtSetCookieHeader(w, v.value)
                         return RtSessionOut{sid: v.value, w: w, cookie: ck}
                     w = do rtDropSession(w, v.value)
+                    w = do rtSesEnded(w, v.value)
         let sid = do rtNewSessionID()
         let mut ses2 = do rtNewSession(w, sid, "guest", "guest")
         if !w.g.auth:
@@ -440,6 +778,8 @@ app SessionStore:
                 if as != "":
                     ses2.actor = as
         w = do rtPutSession(w, ses2)
+        w.met.sessions = len(w.sessions)
+        w = do rtSesDirty(w, sid)
         let ck2 = do rtSetCookieHeader(w, sid)
         return RtSessionOut{sid: sid, w: w, cookie: ck2}
 
@@ -449,7 +789,7 @@ app SessionStore:
         sid: text
         w: RtWorld
 
-    proc rtSidForRequest(w0: RtWorld, req: HttpServerRequest) -> RtSidOut:
+    proc rtSidForRequest(w0: RtWorld, req: HttpServerRequest) -> RtSidOut uses io.net:
         let mut w = w0
         let mut raw = ""
         let auth = do rtHeaderValue(req.headers, "authorization")
@@ -462,7 +802,10 @@ app SessionStore:
         let v = do rtVerifySigned(w, raw)
         if !v.ok:
             return RtSidOut{sid: "", w: w}
-        let i = do rtSessionIndex(w, v.value)
+        let mut i = do rtSessionIndex(w, v.value)
+        if i < 0 && w.clusterOn:
+            w = do rtRehydrateSession(w, v.value)
+            i = do rtSessionIndex(w, v.value)
         if i < 0:
             return RtSidOut{sid: "", w: w}
         let now = nowMs()
@@ -472,6 +815,7 @@ app SessionStore:
             let mut ses = w.sessions[i]
             ses.expires = now + rtSessionTTLms()
             w.sessions[i] = ses
+            w = do rtSesDirty(w, v.value)
         return RtSidOut{sid: v.value, w: w}
 
     # rtRotateSession: rotateSession — a new identifier for an existing
@@ -488,7 +832,11 @@ app SessionStore:
         if i >= 0:
             let mut ses = w.sessions[i]
             ses.sid = fresh
+            ses.persisted = false
             w.sessions[i] = ses
+            w.met.sessions = len(w.sessions)
+            w = do rtSesEnded(w, old)
+            w = do rtSesDirty(w, fresh)
         let ck = do rtSetCookieHeader(w, fresh)
         return RtRotated{sid: fresh, w: w, cookie: ck}
 

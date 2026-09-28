@@ -59,12 +59,12 @@ app WalSelfHost:
 
     # WalOperation's variant order is its bincode index.
     proc fqwOpTags() -> [text]:
-        return ["begin", "commit", "abort", "archive", "insert", "delete", "insert_edge", "delete_edge", "insert_user", "revoke_user", "create_index", "drop_index", "create_reference", "drop_reference", "create_text_index", "drop_text_index"]
+        return ["begin", "commit", "abort", "archive", "insert", "delete", "insert_edge", "delete_edge", "insert_user", "revoke_user", "create_index", "drop_index", "create_reference", "drop_reference", "create_text_index", "drop_text_index", "create_folded_text_index"]
 
     proc fqwTagIndex(tag: text) -> int:
         let tags = do fqwOpTags()
         let mut i = 0
-        loop i < 16:
+        loop i < 17:
             if tags[i] == tag:
                 return i
             i = i + 1
@@ -81,14 +81,10 @@ app WalSelfHost:
             i = i + 1
         return o
 
+    # fqwPutBytes: bs appended to out — one native concatenation, never a
+    # byte-at-a-time loop: a node's data (kilobytes) passes through it.
     proc fqwPutBytes(out: [int], bs: [int]) -> [int]:
-        let mut o = out
-        let n = len(bs)
-        let mut i = 0
-        loop i < n:
-            o = append(o, bs[i])
-            i = i + 1
-        return o
+        return out + bs
 
     proc fqwPutString(out: [int], s: text) -> [int]:
         let bs = textToBytes(s)
@@ -126,7 +122,10 @@ app WalSelfHost:
         let o3 = do fqwPutUint(o2, r.transactionId, 8)
         let o4 = do fqwPutUint(o3, r.operationId, 8)
         let tag = r.op.tag
-        let idx = do fqwTagIndex(tag)
+        let mut idx = do fqwTagIndex(tag)
+        # a folded text index is its own variant, CreateFoldedTextIndex
+        if tag == "create_text_index" && r.op.textIndexDef.folded:
+            idx = 16
         let o5 = do fqwPutUint(o4, idx, 4)
         let op = r.op
         if tag == "archive":
@@ -375,11 +374,15 @@ app WalSelfHost:
         if tg.cur.err != "":
             let e0 = do fqwRecordErr(tg.cur.err)
             return e0
-        if tg.v > 15:
-            let e1 = do fqwRecordErr("invalid value: integer `" + tg.v + "`, expected variant index 0 <= i < 16")
+        if tg.v > 16:
+            let e1 = do fqwRecordErr("invalid value: integer `" + tg.v + "`, expected variant index 0 <= i < 17")
             return e1
         let tags = do fqwOpTags()
-        let tag = tags[tg.v]
+        let mut tag = tags[tg.v]
+        # CreateFoldedTextIndex: the create_text_index operation, folded
+        let foldedTag = tag == "create_folded_text_index"
+        if foldedTag:
+            tag = "create_text_index"
         let op0 = do operationBlank(tag)
         let mut op = op0
         let mut cur = tg.cur
@@ -440,7 +443,9 @@ app WalSelfHost:
         if tag == "create_text_index":
             let gt = do fqwGetTextIndexDef(cur)
             cur = gt.cur
-            let tdef = gt.def
+            let mut tdef = gt.def
+            if foldedTag:
+                tdef = textIndexDefFolded(tdef)
             op = Operation{tag: tag, entry: op.entry, node: op.node, name: "", edge: op.edge, edgeId: op.edgeId, user: op.user, indexDef: op.indexDef, reference: op.reference, textIndexDef: tdef}
         if cur.err != "":
             let e2 = do fqwRecordErr(cur.err)

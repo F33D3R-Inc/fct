@@ -1,0 +1,421 @@
+import "runtime_page.fct"
+
+app RuntimeCluster:
+    # Horizontal scale (runtime/cluster.go, FACET_CLUSTER=1): many instances
+    # over one FacetQL. Sessions live in the shared table (reserved kind
+    # "__session", address "__session:<id>") with this instance's list as a
+    # write-through cache a cold instance rehydrates from; entity changes,
+    # ended sessions, revoked `session` keys and re-roled actors are
+    # announced on the engine's own feed (POST /publish, GET /events), and
+    # a peer's announcement is applied here — the loop hears it as a "C"
+    # message from the receiver task.
+
+    # ── the shared session table (fqStore's session methods) ───────────
+    proc rtSessionAddr(sid: text) -> text:
+        return "__session:" + sid
+
+    # rtSessionData: fqSessionData — the persisted fields and the expiry as
+    # unix seconds (what the purge and a set_if test).
+    proc rtSessionData(s: RtSession) -> text:
+        let mut out = "{\"actor\":" + jsonQuote(s.actor) + ",\"role\":" + jsonQuote(s.role) + ",\"verified\":" + rtBoolWord(s.verified)
+        if s.visitor != "":
+            out = out + ",\"visitor\":" + jsonQuote(s.visitor)
+        out = out + ",\"pendingMFA\":" + jsonQuote(s.pendingMFA) + ",\"state\":" + rtObjectJSON(s.stateKeys, s.stateVals)
+        out = out + ",\"expires\":" + jsonQuote(iso(s.expires / 1000)) + ",\"_expires_unix\":" + (s.expires / 1000) + "}"
+        return out
+
+    # rtSessionFromData: sessionFromPersisted — a live session from a row
+    # (read from the shared table, so its row exists).
+    proc rtSessionFromData(w: RtWorld, sid: text, data: text) -> RtSession:
+        let j = do jsonParse(data)
+        let mut ses = do rtNewSession(w, sid, jStr(j, "actor"), jStr(j, "role"))
+        ses.verified = do jBool(j, "verified")
+        let visitor = do jStr(j, "visitor")
+        if visitor != "":
+            ses.visitor = visitor
+        ses.pendingMFA = do jStr(j, "pendingMFA")
+        let exp = do jGet(j, "_expires_unix")
+        ses.expires = toInt(exp.s) * 1000
+        let st = do jGet(j, "state")
+        if st.kind == "obj":
+            let mut i = 0
+            loop i < len(st.keys):
+                ses = do rtSesSet(ses, st.keys[i], rtJValToVal(st.vals[i]))
+                i = i + 1
+        ses.persisted = true
+        return ses
+
+    # rtRehydrateSession: LoadSession on a cache miss — the row, if the
+    # shared table still has one, joins this instance's cache.
+    proc rtRehydrateSession(w0: RtWorld, sid: text) -> RtWorld uses io.net:
+        let mut w = w0
+        let c = do rtFqlClient(w)
+        let got = do rtFqGetNode(c, rtSessionAddr(sid))
+        if !got.ok || !got.found:
+            return w
+        let ses = do rtSessionFromData(w, sid, got.v.data)
+        w = do rtPutSession(w, ses)
+        w.met.sessions = len(w.sessions)
+        return w
+
+    proc rtFqTxBody(ops: [text]) -> text:
+        return "{\"operations\":[" + join(ops, ",") + "]}"
+
+    # rtPersistSession: persistSession — a session never stored is
+    # inserted; one already there is updated only if its row still exists
+    # (set_if over the expiry every row meets). A row a peer deleted means
+    # the session ended: the ending wins, and the local copy goes too.
+    proc rtPersistSession(w0: RtWorld, sid: text) -> RtWorld uses io.net:
+        let mut w = w0
+        let i = do rtSessionIndex(w, sid)
+        if i < 0:
+            return w
+        let ses = w.sessions[i]
+        let data = do rtSessionData(ses)
+        let c = do rtFqlClient(w)
+        if !ses.persisted:
+            let op = "{\"type\":\"insert_node\",\"address\":" + jsonQuote(rtSessionAddr(sid)) + ",\"kind\":\"__session\",\"x\":0,\"y\":0,\"z\":0,\"q\":0,\"data\":" + jsonQuote(data) + ",\"public\":false}"
+            let r = do rtFqPostJson(c, "/transaction", rtFqTxBody([op]), "POST /transaction")
+            if r.ok:
+                let j = do rtSessionIndex(w, sid)
+                if j >= 0:
+                    let mut s2 = w.sessions[j]
+                    s2.persisted = true
+                    w.sessions[j] = s2
+            return w
+        let op2 = "{\"type\":\"set_if\",\"address\":" + jsonQuote(rtSessionAddr(sid)) + ",\"field\":\"_expires_unix\",\"expect_le\":9223372036854775807,\"set\":" + data + "}"
+        let r2 = do rtFqPostJson(c, "/transaction", rtFqTxBody([op2]), "POST /transaction")
+        if !r2.ok && (r2.err.kind == "PreconditionFailed" || r2.err.kind == "NotFound"):
+            w = do rtDropSession(w, sid)
+            w.met.sessions = len(w.sessions)
+        return w
+
+    # rtDeleteSharedSession: DeleteSession — gone already is fine.
+    proc rtDeleteSharedSession(w: RtWorld, sid: text) -> bool uses io.net:
+        let c = do rtFqlClient(w)
+        let r = do rtFqSend(c, "DELETE", fqlEndpointUrl(c.endpoint, "/node/" + rtSessionAddr(sid)), false, "", "DELETE /node/:address")
+        return r.ok
+
+    # rtFieldEquals: `item.<field> == "<v>"` as the engine reads a predicate.
+    proc rtFieldEquals(field: text, v: text) -> text:
+        let e = do irBin("==", irGet(irRef("item"), field), irLit(v, "text"))
+        let j = do irExprJSON(e)
+        return j
+
+    # rtRestateShared: RestateSessions — each stored session of the actor
+    # written back with the new role.
+    proc rtRestateShared(w: RtWorld, actor: text, role: text) -> bool uses io.net:
+        let c = do rtFqlClient(w)
+        let mut after = ""
+        let mut going = true
+        loop going:
+            let mut body = "{\"kind\":\"__session\",\"item_var\":\"item\",\"limit\":500,\"where\":" + rtFieldEquals("actor", actor)
+            if after != "":
+                body = body + ",\"after\":" + jsonQuote(after)
+            body = body + "}"
+            let sent = do rtFqPostJson(c, "/nodes/query", body, "POST /nodes/query")
+            if !sent.ok:
+                return false
+            let page = do fqlDecodeQueryPage(sent.body)
+            if !page.ok:
+                return false
+            let mut ops = []
+            let mut i = 0
+            loop i < len(page.v.nodes):
+                let n = page.v.nodes[i]
+                let sid = slice(n.address, 10, len(n.address))
+                let mut ses = do rtSessionFromData(w, sid, n.data)
+                ses.role = role
+                ops = append(ops, "{\"type\":\"insert_node\",\"address\":" + jsonQuote(n.address) + ",\"kind\":\"__session\",\"x\":0,\"y\":0,\"z\":0,\"q\":0,\"data\":" + jsonQuote(rtSessionData(ses)) + ",\"public\":false}")
+                i = i + 1
+            if len(ops) > 0:
+                let r = do rtFqPostJson(c, "/transaction", rtFqTxBody(ops), "POST /transaction")
+                if !r.ok:
+                    return false
+            if page.v.next == "" || len(page.v.nodes) == 0:
+                going = false
+            else:
+                after = page.v.next
+        return true
+
+    # ── the bus ────────────────────────────────────────────────────────
+    # rtPublish: Notify — one payload on the engine's feed.
+    proc rtPublish(w: RtWorld, payload: text) -> bool uses io.net:
+        let c = do rtFqlClient(w)
+        let r = do rtFqPostJson(c, "/publish", "{\"channel\":\"facet_events\",\"payload\":" + jsonQuote(payload) + "}", "POST /publish")
+        return r.ok
+
+    proc rtJSONTexts(xs: [text]) -> text:
+        let mut parts = []
+        let mut i = 0
+        loop i < len(xs):
+            parts = append(parts, jsonQuote(xs[i]))
+            i = i + 1
+        return "[" + join(parts, ",") + "]"
+
+    # rtClusterPublishEntities: publish — the entities a commit changed.
+    proc rtClusterPublishEntities(w: RtWorld, changed: [text]) -> RtWorld uses io.net:
+        if !w.clusterOn || len(changed) == 0:
+            return w
+        let sent = do rtPublish(w, "{\"origin\":" + jsonQuote(w.instanceID) + ",\"entities\":" + rtJSONTexts(changed) + "}")
+        return w
+
+    # rtClusterSync: what the request did to sessions, made true in the
+    # shared table and announced: ended ids deleted (dropSharedSession),
+    # changed or new sessions written through (persistSession), revoked
+    # `session` keys deleted wherever they were minted (DeleteVisitorSessions),
+    # re-roled actors rewritten (RestateSessions).
+    proc rtClusterSync(w0: RtWorld) -> RtWorld uses io.net:
+        let mut w = w0
+        if !w.clusterOn:
+            return w
+        let ended = w.sesEnded
+        let dirty = w.sesDirty
+        let keys = w.revokeKeys
+        let actors = w.restateActors
+        let roles = w.restateRoles
+        w.sesEnded = []
+        w.sesDirty = []
+        w.revokeKeys = []
+        w.restateActors = []
+        w.restateRoles = []
+        let mut i = 0
+        loop i < len(ended):
+            let gone = do rtDeleteSharedSession(w, ended[i])
+            i = i + 1
+        let mut d = 0
+        loop d < len(dirty):
+            let mut wasEnded = false
+            let mut k = 0
+            loop k < len(ended):
+                if ended[k] == dirty[d]:
+                    wasEnded = true
+                k = k + 1
+            if !wasEnded:
+                w = do rtPersistSession(w, dirty[d])
+            d = d + 1
+        if len(keys) > 0:
+            let c = do rtFqlClient(w)
+            let mut ops = []
+            let mut r = 0
+            loop r < len(keys):
+                ops = append(ops, "{\"type\":\"delete_where\",\"kind\":\"__session\",\"where\":" + rtFieldEquals("visitor", keys[r]) + "}")
+                r = r + 1
+            let sent = do rtFqPostJson(c, "/transaction", rtFqTxBody(ops), "POST /transaction")
+        if len(ended) > 0 || len(keys) > 0:
+            let mut ev = "{\"origin\":" + jsonQuote(w.instanceID)
+            if len(ended) > 0:
+                ev = ev + ",\"sessions\":" + rtJSONTexts(ended)
+            if len(keys) > 0:
+                ev = ev + ",\"visitors\":" + rtJSONTexts(keys)
+            let pub = do rtPublish(w, ev + "}")
+        if len(actors) > 0:
+            let mut a = 0
+            loop a < len(actors):
+                let ok = do rtRestateShared(w, actors[a], roles[a])
+                a = a + 1
+            let pub2 = do rtPublish(w, "{\"origin\":" + jsonQuote(w.instanceID) + ",\"restated\":" + rtJSONTexts(actors) + "}")
+        return w
+
+    # rtPurgeSessions: PurgeExpiredSessions — every expired row, one op.
+    proc rtPurgeSessions(w: RtWorld) -> bool uses io.net:
+        let c = do rtFqlClient(w)
+        let e = do irBin("<", irGet(irRef("item"), "_expires_unix"), irLit("" + (nowMs() / 1000), "int"))
+        let r = do rtFqPostJson(c, "/transaction", rtFqTxBody(["{\"type\":\"delete_where\",\"kind\":\"__session\",\"where\":" + irExprJSON(e) + "}"]), "POST /transaction")
+        return r.ok
+
+    # rtReserveCron: ReserveCron — a tick is due when the stored next run is
+    # at or before now; exactly one instance's set_if moves it an interval
+    # out and runs the job. The first tick ever creates the row (create
+    # only if absent), whoever gets there first.
+    proc rtReserveCron(w: RtWorld, name: text, everySecs: int) -> bool uses io.net:
+        let c = do rtFqlClient(w)
+        let now = nowMs() / 1000
+        let next = now + everySecs
+        let addr = "__cron:" + name
+        let op = "{\"type\":\"set_if\",\"address\":" + jsonQuote(addr) + ",\"field\":\"next_run\",\"expect_le\":" + now + ",\"set\":{\"next_run\":" + next + "}}"
+        let r = do rtFqPostJson(c, "/transaction", rtFqTxBody([op]), "POST /transaction")
+        if r.ok:
+            return true
+        if r.err.kind != "PreconditionFailed":
+            return false
+        let got = do rtFqGetNode(c, addr)
+        if !got.ok || got.found:
+            return false
+        let body = do fqlEncodeCreateNodeRequest(FqlCreateNodeRequest{address: addr, kind: "__cron", x: 0, y: 0, z: 0, q: 0, data: "{\"name\":" + jsonQuote(name) + ",\"next_run\":" + next + "}", public: false, ifAbsent: true})
+        let made = do rtFqPostJson(c, "/node", body, "POST /node")
+        return made.ok
+
+    # ── a peer's announcement ──────────────────────────────────────────
+    proc rtJStrs(v: JVal) -> [text]:
+        let mut out = []
+        if v.kind != "arr":
+            return out
+        let mut i = 0
+        loop i < len(v.vals):
+            if v.vals[i].kind == "str":
+                out = append(out, v.vals[i].s)
+            i = i + 1
+        return out
+
+    # rtEvictWhere: the cached sessions a peer ended (by id, `session` key
+    # or actor) dropped here; "*" as the only id drops them all (a lost
+    # resume position). The system and tool sessions stay.
+    proc rtEvictWhere(w0: RtWorld, sids: [text], visitors: [text], actors: [text]) -> RtWorld:
+        let mut w = w0
+        let all = len(sids) == 1 && sids[0] == "*"
+        let mut kept = []
+        let mut i = 0
+        loop i < len(w.sessions):
+            let s = w.sessions[i]
+            let mut drop = false
+            if s.sid != "__system" && s.sid != "tool":
+                drop = all || s.sid in sids || s.visitor in visitors || s.actor in actors
+            if !drop:
+                kept = append(kept, s)
+            i = i + 1
+        w.sessions = kept
+        w.met.sessions = len(w.sessions)
+        return w
+
+    # rtClusterApply: consume's flush — a peer's event, skipped when it is
+    # this instance's own.
+    proc rtClusterApply(w0: RtWorld, data: text) -> RtWorld uses io.net:
+        let mut w = w0
+        let ev = do jsonParse(data)
+        if ev.kind != "obj":
+            return w
+        let origin = do jStr(ev, "origin")
+        if origin == w.instanceID:
+            return w
+        let sids = do rtJStrs(jGet(ev, "sessions"))
+        let restated = do rtJStrs(jGet(ev, "restated"))
+        let visitors = do rtJStrs(jGet(ev, "visitors"))
+        if len(sids) > 0 || len(restated) > 0 || len(visitors) > 0:
+            w = do rtEvictWhere(w, sids, visitors, restated)
+        let ents = do rtJStrs(jGet(ev, "entities"))
+        if len(ents) > 0:
+            w = do rtApplyRemoteChange(w, ents)
+        return w
+
+    # rtApplyRemoteChange: applyRemoteChange — the named entities reloaded
+    # from the store as boot loads them, the id counters kept ahead, and
+    # the change fanned out to this instance's subscribers only.
+    proc rtApplyRemoteChange(w0: RtWorld, ents: [text]) -> RtWorld uses io.net:
+        let mut w = w0
+        let mut changed = []
+        let mut i = 0
+        loop i < len(ents):
+            let ei = do rtEntityIndex(w.g, ents[i])
+            if ei >= 0 && ents[i] != "FacetUser":
+                let r = do rtStoreLoadEntity(w, w.g.entities[ei])
+                if r.ok:
+                    w = r.w
+                    changed = append(changed, ents[i])
+            i = i + 1
+        if len(changed) > 0:
+            w = do rtFanoutChanged(w, changed)
+        return w
+
+    # ── the receiver task ──────────────────────────────────────────────
+    struct RtFeed:
+        ok: bool
+        gone: bool
+        err: text
+        stream: HttpStream
+
+    # rtOpenFeed: streamEvents — GET /events, resuming after a sequence;
+    # 410 means that position aged out.
+    proc rtOpenFeed(base: text, token: text, after: int, timeoutMs: int) -> RtFeed uses io.net:
+        let mut path = "/events"
+        if after > 0:
+            path = "/events?after=" + after
+        let s = do httpOpenStreamTrust(HttpRequest{method: "GET", url: base + path, headers: [HttpHeader{name: "x-api-key", value: token}, HttpHeader{name: "accept", value: "text/event-stream"}], body: "", timeoutMs: timeoutMs}, "")
+        if !s.ok:
+            return RtFeed{ok: false, gone: false, err: s.err, stream: s}
+        if s.status == 410:
+            let c1 = do httpStreamClose(s)
+            return RtFeed{ok: false, gone: true, err: "", stream: s}
+        if s.status < 200 || s.status > 299:
+            let c2 = do httpStreamClose(s)
+            return RtFeed{ok: false, gone: false, err: "GET " + path + ": " + s.status, stream: s}
+        # pollBytes sets its own deadline on every read, so the bound on the
+        # head (timeoutMs) never cuts the stream itself short.
+        return RtFeed{ok: true, gone: false, err: "", stream: s}
+
+    # rtClusterReceiver: receiveLoop — for the life of the process, the
+    # feed read frame by frame (id:/data: lines, a blank line ending one),
+    # each frame handed to the loop; a dropped connection resumed after
+    # the last sequence seen, with backoff; a lost position ("E") drops
+    # every cached session, since ends published meanwhile are gone.
+    proc rtClusterReceiver(ch: int, base: text, token: text, first: HttpStream) uses io.net:
+        let mut s = first
+        let mut have = true
+        let mut after = 0
+        let mut backoff = 1000
+        loop true:
+            if !have:
+                let f = do rtOpenFeed(base, token, after, 0)
+                if f.ok:
+                    s = f.stream
+                    have = true
+                    backoff = 1000
+                else:
+                    if f.gone:
+                        after = 0
+                        let evict = send(ch, rtPack(["E"]))
+                    let slept = sleepMs(backoff)
+                    if backoff < 30000:
+                        backoff = backoff * 2
+            if have:
+                let mut buf = ""
+                let mut data = ""
+                let mut hasData = false
+                let mut open = true
+                loop open:
+                    s = do httpStreamPump(s, 1000)
+                    if len(s.data) > 0:
+                        buf = buf + bytesToText(s.data)
+                        s = do httpStreamWithData(s, [])
+                    let mut nl = do rtIndexOfText(buf, "\n")
+                    loop nl >= 0:
+                        let mut line = slice(buf, 0, nl)
+                        buf = slice(buf, nl + 1, len(buf))
+                        if len(line) > 0 && slice(line, len(line) - 1, len(line)) == "\r":
+                            line = slice(line, 0, len(line) - 1)
+                        if line == "":
+                            if hasData:
+                                let sent = send(ch, rtPack(["C", data]))
+                            data = ""
+                            hasData = false
+                        else:
+                            if len(line) >= 3 && slice(line, 0, 3) == "id:":
+                                let n = toInt(trim(slice(line, 3, len(line))))
+                                if n > 0:
+                                    after = n
+                            if len(line) >= 5 && slice(line, 0, 5) == "data:":
+                                let mut piece = slice(line, 5, len(line))
+                                if len(piece) > 0 && slice(piece, 0, 1) == " ":
+                                    piece = slice(piece, 1, len(piece))
+                                if hasData:
+                                    data = data + "\n"
+                                data = data + piece
+                                hasData = true
+                        nl = do rtIndexOfText(buf, "\n")
+                    if s.ended:
+                        open = false
+                if hasData:
+                    let last = send(ch, rtPack(["C", data]))
+                let closed = do httpStreamClose(s)
+                have = false
+                let pause = sleepMs(1000)
+
+    # rtClusterPurger: purgeSessions' ticker — every hour, a "P" to the loop.
+    proc rtClusterPurger(ch: int):
+        loop true:
+            # an hour, in the ten-minute steps sleepMs allows
+            let mut k = 0
+            loop k < 6:
+                let slept = sleepMs(600000)
+                k = k + 1
+            let sent = send(ch, rtPack(["P"]))

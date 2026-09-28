@@ -1,0 +1,411 @@
+import "runtime_page.fct"
+
+app RuntimeAdmin:
+    # The generated admin console (runtime/admin.go): /admin lists every
+    # entity with its row count, /admin/<Entity> its rows (newest first),
+    # /admin/<Entity>/new and /admin/<Entity>/<id> a form, and the
+    # CSRF-checked POSTs /admin/_save and /admin/_delete write through the
+    # store like an action. Every page needs an admin session; FACET_ADMIN=0
+    # removes the console (404).
+
+    # rtAdminFormValue: Request.FormValue — the urlencoded body's value first
+    # (PostForm is prepended), then the query string's; "" when neither
+    # names it.
+    proc rtAdminFormValue(req: HttpServerRequest, name: text) -> text:
+        let ct = do rtHeaderValue(req.headers, "content-type")
+        let form = lower(ct) == "application/x-www-form-urlencoded" || rtHasPrefix(lower(ct), "application/x-www-form-urlencoded;")
+        if form && (req.method == "POST" || req.method == "PUT" || req.method == "PATCH"):
+            let has = do rtFormHas(req.body, name)
+            if has:
+                let v = do rtQueryValue(req.body, name)
+                return v
+        if req.hasQuery:
+            let q = do rtQueryValue(req.query, name)
+            return q
+        return ""
+
+    proc rtFormHas(form: text, name: text) -> bool:
+        let parts = split(form, "&")
+        let mut i = 0
+        loop i < len(parts):
+            let p = parts[i]
+            let eq = do rtIndexOfText(p, "=")
+            if eq > 0 && slice(p, 0, eq) == name:
+                return true
+            if eq < 0 && p == name:
+                return true
+            i = i + 1
+        return false
+
+    # rtAdminShell: adminShell's three holes — the app's name, the nav, the
+    # body.
+    proc rtAdminShell(app: text, nav: text, body: text) -> text:
+        let style = "<style>\n :root{--bg:#0f1115;--panel:#161a22;--fg:#e7eaf0;--muted:#8b93a7;--accent:#5b8cff;--border:#262c39;--danger:#ff6b6b}\n *{box-sizing:border-box} body{margin:0;font:15px/1.5 system-ui,sans-serif;color:var(--fg);background:var(--bg);display:flex;min-height:100vh}\n nav{width:220px;background:var(--panel);border-right:1px solid var(--border);padding:1rem;display:flex;flex-direction:column;gap:.25rem}\n .brand{font-weight:700;font-size:1.1rem;margin-bottom:.75rem;color:var(--fg);text-decoration:none}\n .navlink{color:var(--muted);text-decoration:none;padding:.35rem .5rem;border-radius:6px}\n .navlink:hover{background:#1d2330;color:var(--fg)} .navlink.active{background:#1d2330;color:var(--accent)}\n main{flex:1;padding:1.5rem 2rem;max-width:960px}\n h1{font-size:1.4rem;margin:.2rem 0 1rem} .muted{color:var(--muted);font-weight:400}\n table{width:100%;border-collapse:collapse;margin:.5rem 0} th,td{text-align:left;padding:.5rem .6rem;border-bottom:1px solid var(--border);vertical-align:top}\n th{color:var(--muted);font-weight:600;font-size:.85rem} td a{color:var(--accent)}\n a{color:var(--accent)} .btn{display:inline-block;background:var(--accent);color:#fff;padding:.35rem .7rem;border-radius:6px;text-decoration:none;font-size:.9rem}\n form{display:flex;flex-direction:column;gap:.35rem;max-width:32rem} label{color:var(--muted);font-size:.85rem;margin-top:.5rem}\n input{font:inherit;padding:.45rem .6rem;background:#0c0e13;border:1px solid var(--border);border-radius:6px;color:var(--fg)}\n input[type=checkbox]{width:auto} .formrow{margin-top:1rem}\n button{font:inherit;padding:.45rem .9rem;border:0;border-radius:6px;background:var(--accent);color:#fff;cursor:pointer}\n button.danger{background:transparent;color:var(--danger);border:1px solid var(--border);padding:.2rem .5rem;font-size:.85rem}\n form.inline{display:inline} .actions{white-space:nowrap}\n</style>"
+        return "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>" + app + " — Admin</title>\n" + style + "</head>\n<body><nav>" + nav + "</nav><main>" + body + "</main></body></html>\n"
+
+    # rtActorName: actorName — a session's actor ("" for none).
+    proc rtActorName(w: RtWorld, sid: text) -> text:
+        let i = do rtSessionIndex(w, sid)
+        if i < 0:
+            return ""
+        return w.sessions[i].actor
+
+    # rtUrlSeg: urlSeg.
+    proc rtUrlSeg(s: text) -> text:
+        return replace(s, "/", "")
+
+    proc rtAdminNames(w: RtWorld) -> [text]:
+        let mut names = []
+        let mut i = 0
+        loop i < len(w.g.entities):
+            names = append(names, w.g.entities[i].name)
+            i = i + 1
+        let sorted = do rtSortedTexts(names)
+        return sorted
+
+    # rtAdminNav: adminNav — the entity sidebar.
+    proc rtAdminNav(w: RtWorld, active: text) -> text:
+        let names = do rtAdminNames(w)
+        let mut b = "<a href=\"/admin\" class=\"brand\">⌘ Admin</a>"
+        let mut i = 0
+        loop i < len(names):
+            let mut cls = "navlink"
+            if names[i] == active:
+                cls = cls + " active"
+            b = b + "<a class=\"" + cls + "\" href=\"/admin/" + rtUrlSeg(names[i]) + "\">" + rtEsc(names[i]) + "</a>"
+            i = i + 1
+        return b
+
+    # rtAdminPage: adminPage — the body in the shell, the session's cookie
+    # on it.
+    proc rtAdminPage(w: RtWorld, cookie: HttpHeader, active: text, body: text) -> HttpServerResponse:
+        let html = do rtAdminShell(rtEsc(w.g.app), rtAdminNav(w, active), body)
+        return HttpServerResponse{status: 200, reason: "", headers: [HttpHeader{name: "content-type", value: "text/html; charset=utf-8"}, cookie], body: html}
+
+    proc rtWithCookie(r0: HttpServerResponse, cookie: HttpHeader) -> HttpServerResponse:
+        let mut r = r0
+        r.headers = append(r.headers, cookie)
+        return r
+
+    # rtAdminColumns: columns — id first, then every other field.
+    proc rtAdminColumns(e: IREntity) -> [text]:
+        let mut cols = ["id"]
+        let mut i = 0
+        loop i < len(e.fields):
+            if e.fields[i].name != "id":
+                cols = append(cols, e.fields[i].name)
+            i = i + 1
+        return cols
+
+    # rtDisplayCell: displayCell — credential-shaped fields masked, a long
+    # value cut at 80 bytes.
+    proc rtDisplayCell(e: IREntity, col: text, v: Val) -> text:
+        let mut i = 0
+        loop i < len(e.fields):
+            let f = e.fields[i]
+            if f.name == col && f.password:
+                let pv = do valToStr(v)
+                if pv == "":
+                    return ""
+                return "••••••"
+            if f.name == col && f.secret:
+                return "••••••"
+            i = i + 1
+        let s = do valToStr(v)
+        if byteLen(s) > 80:
+            let cut = bytesToText(slice(textToBytes(s), 0, 80))
+            return cut + "…"
+        return s
+
+    proc rtFieldTypeLabel(f: IRField) -> text:
+        if f.enumName != "":
+            return f.enumName
+        if f.ref != "":
+            return f.ref + " id"
+        return f.type
+
+    # rtAdminInput: adminInput — the control for a field's type, pre-filled.
+    proc rtAdminInput(f: IRField, cur: Val) -> text:
+        let n = do rtEsc(f.name)
+        if f.type == "bool":
+            let mut checked = ""
+            let t = do valTruthy(cur)
+            if t:
+                checked = " checked"
+            return "<input type=\"checkbox\" name=\"" + n + "\" value=\"1\"" + checked + ">"
+        if f.enumName != "":
+            return "<input type=\"text\" name=\"" + n + "\" value=\"" + rtEsc(valToStr(cur)) + "\">"
+        if f.password || f.secret:
+            return "<input type=\"password\" name=\"" + n + "\" placeholder=\"(unchanged)\">"
+        if f.ref != "" || f.type == "int" || f.type == "money" || f.type == "date":
+            let mut v = ""
+            if cur.kind != "none":
+                v = "" + valToInt(cur)
+            return "<input type=\"number\" name=\"" + n + "\" value=\"" + rtEsc(v) + "\">"
+        if f.type == "float":
+            let mut fv = ""
+            if cur.kind != "none":
+                fv = do valToStr(cur)
+            return "<input type=\"number\" step=\"any\" name=\"" + n + "\" value=\"" + rtEsc(fv) + "\">"
+        return "<input type=\"text\" name=\"" + n + "\" value=\"" + rtEsc(valToStr(cur)) + "\">"
+
+    proc rtAdminDeleteForm(w: RtWorld, sid: text, entity: text, id: int) -> text:
+        let csrf = do rtCsrfToken(w, sid)
+        return "<form method=\"post\" action=\"/admin/_delete\" class=\"inline\" onsubmit=\"return confirm('Delete " + rtEsc(entity) + " #" + id + "?')\"><input type=\"hidden\" name=\"_csrf\" value=\"" + rtEsc(csrf) + "\"><input type=\"hidden\" name=\"_entity\" value=\"" + rtEsc(entity) + "\"><input type=\"hidden\" name=\"_id\" value=\"" + id + "\"><button class=\"danger\" type=\"submit\">delete</button></form>"
+
+    # rtAdminIndex: adminIndex — every entity and its row count.
+    proc rtAdminIndex(w: RtWorld, cookie: HttpHeader) -> HttpServerResponse:
+        let names = do rtAdminNames(w)
+        let mut b = "<h1>Admin</h1><p class=\"muted\">Generated dashboard over every entity in this app.</p><table><thead><tr><th>Entity</th><th>Rows</th><th></th></tr></thead><tbody>"
+        let mut i = 0
+        loop i < len(names):
+            let rows = do rtEntRows(w, names[i])
+            let seg = do rtUrlSeg(names[i])
+            b = b + "<tr><td><a href=\"/admin/" + seg + "\">" + rtEsc(names[i]) + "</a></td><td>" + len(rows) + "</td><td><a class=\"btn\" href=\"/admin/" + seg + "/new\">+ New</a></td></tr>"
+            i = i + 1
+        b = b + "</tbody></table>"
+        let page = do rtAdminPage(w, cookie, "", b)
+        return page
+
+    # rtAdminNewestFirst: rows by id, highest first (a stable sort).
+    proc rtAdminNewestFirst(rows: [Val]) -> [Val]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(rows):
+            let id = do valToInt(valGet(rows[i], "id"))
+            let mut j = len(out)
+            let mut placed = false
+            loop j > 0 && !placed:
+                let prev = do valToInt(valGet(out[j - 1], "id"))
+                if id > prev:
+                    j = j - 1
+                else:
+                    placed = true
+            out = slice(out, 0, j) + [rows[i]] + slice(out, j, len(out))
+            i = i + 1
+        return out
+
+    # rtAdminRows: adminList — at most 200 rows, each with edit and delete.
+    proc rtAdminRows(w: RtWorld, cookie: HttpHeader, sid: text, e: IREntity) -> HttpServerResponse:
+        let cols = do rtAdminColumns(e)
+        let all = do rtEntRows(w, e.name)
+        let mut rows = do rtAdminNewestFirst(all)
+        if len(rows) > 200:
+            rows = slice(rows, 0, 200)
+        let seg = do rtUrlSeg(e.name)
+        let mut b = "<p><a href=\"/admin\">← Admin</a></p><h1>" + rtEsc(e.name) + " <span class=\"muted\">(" + len(rows) + ")</span></h1>"
+        b = b + "<p><a class=\"btn\" href=\"/admin/" + seg + "/new\">+ New " + rtEsc(e.name) + "</a></p><table><thead><tr>"
+        let mut c = 0
+        loop c < len(cols):
+            b = b + "<th>" + rtEsc(cols[c]) + "</th>"
+            c = c + 1
+        b = b + "<th></th></tr></thead><tbody>"
+        let mut r = 0
+        loop r < len(rows):
+            let id = do valToInt(valGet(rows[r], "id"))
+            b = b + "<tr>"
+            let mut k = 0
+            loop k < len(cols):
+                let cell = do rtDisplayCell(e, cols[k], valGet(rows[r], cols[k]))
+                b = b + "<td>" + rtEsc(cell) + "</td>"
+                k = k + 1
+            b = b + "<td class=\"actions\"><a href=\"/admin/" + seg + "/" + id + "\">edit</a> " + rtAdminDeleteForm(w, sid, e.name, id) + "</td></tr>"
+            r = r + 1
+        b = b + "</tbody></table>"
+        let page = do rtAdminPage(w, cookie, e.name, b)
+        return page
+
+    # rtAdminForm: adminForm — a create form (no row) or an edit form.
+    proc rtAdminForm(w: RtWorld, cookie: HttpHeader, sid: text, e: IREntity, hasRow: bool, row: Val) -> HttpServerResponse:
+        let mut title = "New " + e.name
+        let mut id = 0
+        if hasRow:
+            id = do valToInt(valGet(row, "id"))
+            title = e.name + " #" + id
+        let csrf = do rtCsrfToken(w, sid)
+        let mut b = "<p><a href=\"/admin/" + rtUrlSeg(e.name) + "\">← " + rtEsc(e.name) + "</a></p><h1>" + rtEsc(title) + "</h1>"
+        b = b + "<form method=\"post\" action=\"/admin/_save\"><input type=\"hidden\" name=\"_csrf\" value=\"" + rtEsc(csrf) + "\"><input type=\"hidden\" name=\"_entity\" value=\"" + rtEsc(e.name) + "\"><input type=\"hidden\" name=\"_id\" value=\"" + id + "\">"
+        let mut i = 0
+        loop i < len(e.fields):
+            let f = e.fields[i]
+            if f.name != "id":
+                let mut cur = do noneVal()
+                if hasRow:
+                    cur = do valGet(row, f.name)
+                b = b + "<label>" + rtEsc(f.name) + " <span class=\"muted\">" + rtEsc(rtFieldTypeLabel(f)) + "</span></label>" + rtAdminInput(f, cur)
+            i = i + 1
+        b = b + "<div class=\"formrow\"><button type=\"submit\">Save</button></div></form>"
+        let page = do rtAdminPage(w, cookie, e.name, b)
+        return page
+
+    # rtAdminFindRow: the row with this id, if any.
+    struct RtAdminRow:
+        found: bool
+        at: int
+        row: Val
+
+    proc rtAdminFindRow(w: RtWorld, entity: text, id: int) -> RtAdminRow:
+        let rows = do rtEntRows(w, entity)
+        let mut i = 0
+        loop i < len(rows):
+            if rows[i].kind == "record":
+                let rid = do valToInt(valGet(rows[i], "id"))
+                if rid == id:
+                    return RtAdminRow{found: true, at: i, row: rows[i]}
+            i = i + 1
+        let none = do noneVal()
+        return RtAdminRow{found: false, at: -1, row: none}
+
+    # rtSeeOther: http.Redirect for a POST — 303 and a Location, no body.
+    proc rtSeeOther(location: text, cookie: HttpHeader) -> HttpServerResponse:
+        return HttpServerResponse{status: 303, reason: "", headers: [HttpHeader{name: "location", value: location}, cookie], body: ""}
+
+    # rtAdminSave: adminSave — create or update a row from the form.
+    proc rtAdminSave(w0: RtWorld, req: HttpServerRequest, cookie: HttpHeader, sid: text) -> RtHandled:
+        let mut w = w0
+        if req.method != "POST":
+            let na = do rtTextError(405, "POST only")
+            return RtHandled{resp: rtWithCookie(na, cookie), w: w}
+        let token = do rtAdminFormValue(req, "_csrf")
+        let want = do rtCsrfToken(w, sid)
+        if token != want:
+            let bad = do rtTextError(403, "invalid CSRF token")
+            return RtHandled{resp: rtWithCookie(bad, cookie), w: w}
+        let entity = do rtAdminFormValue(req, "_entity")
+        let ei = do rtEntityIndex(w.g, entity)
+        if ei < 0:
+            let nf = do rtNotFound()
+            return RtHandled{resp: rtWithCookie(nf, cookie), w: w}
+        let e = w.g.entities[ei]
+        let mut id = do valToInt(textVal(rtAdminFormValue(req, "_id")))
+        let mut found = RtAdminRow{found: false, at: -1, row: noneVal()}
+        if id > 0:
+            found = do rtAdminFindRow(w, entity, id)
+        let isNew = !found.found
+        let mut row = found.row
+        if isNew:
+            let wi = do rtEntIndex(w, entity)
+            id = w.nextIds[wi] + 1
+            w.nextIds[wi] = id
+            row = do recordVal(["id"], [intVal(id)])
+        let mut i = 0
+        loop i < len(e.fields):
+            let f = e.fields[i]
+            let raw = do rtAdminFormValue(req, f.name)
+            if f.name != "id":
+                if f.type == "bool":
+                    row = do valSet(row, f.name, boolVal(raw != ""))
+                else:
+                    if !((f.password || f.secret) && !isNew && raw == ""):
+                        let sv = do rtStoredValue(w.g, entity, f.name, rtCoerce(textVal(raw), f.type))
+                        if sv.msg != "":
+                            let inv = do rtTextError(422, sv.msg)
+                            return RtHandled{resp: rtWithCookie(inv, cookie), w: w0}
+                        row = do valSet(row, f.name, sv.v)
+            i = i + 1
+        let mut rows = do rtEntRows(w, entity)
+        if isNew:
+            rows = append(rows, row)
+        else:
+            rows[found.at] = row
+        w = do rtSetEntRows(w, entity, rows)
+        w = do rtDurSave(w, entity, row)
+        let reserved = do rtIsReservedEntity(entity)
+        if !reserved:
+            w.pendingChanged = append(w.pendingChanged, entity)
+        w = do rtRecordAudit(w, rtActorName(w, sid), "admin:save", true, entity)
+        let to = do rtSeeOther("/admin/" + rtUrlSeg(entity), cookie)
+        return RtHandled{resp: to, w: w}
+
+    # rtAdminDelete: adminDelete — a hard delete, cascading like the
+    # database.
+    proc rtAdminDelete(w0: RtWorld, req: HttpServerRequest, cookie: HttpHeader, sid: text) -> RtHandled:
+        let mut w = w0
+        if req.method != "POST":
+            let na = do rtTextError(405, "POST only")
+            return RtHandled{resp: rtWithCookie(na, cookie), w: w}
+        let token = do rtAdminFormValue(req, "_csrf")
+        let want = do rtCsrfToken(w, sid)
+        if token != want:
+            let bad = do rtTextError(403, "invalid CSRF token")
+            return RtHandled{resp: rtWithCookie(bad, cookie), w: w}
+        let entity = do rtAdminFormValue(req, "_entity")
+        let ei = do rtEntityIndex(w.g, entity)
+        if ei < 0:
+            let nf = do rtNotFound()
+            return RtHandled{resp: rtWithCookie(nf, cookie), w: w}
+        let id = do valToInt(textVal(rtAdminFormValue(req, "_id")))
+        let found = do rtAdminFindRow(w, entity, id)
+        if found.found:
+            let rows = do rtEntRows(w, entity)
+            let kept = slice(rows, 0, found.at) + slice(rows, found.at + 1, len(rows))
+            w = do rtSetEntRows(w, entity, kept)
+            w = do rtDurDelete(w, entity, id)
+            let ses = do rtNewSession(w, sid, "guest", "guest")
+            let sc = do rtScopeNew()
+            let ex0 = RtExec{w: w, sc: sc, ses: ses, deltaKeys: [], deltaVals: [], changed: [entity], retVal: noneVal(), returned: false, status: 200, msg: "", bound: [], retStatus: 0, headerNames: [], headerVals: [], errCode: "", revokes: [], restateActors: [], restateRoles: [], rekey: "", actName: "admin:delete", runDepth: 0, obs: [], actor: "", audits: []}
+            let ex = do rtCascade(ex0, entity, [id])
+            w = ex.w
+            let mut c = 0
+            loop c < len(ex.changed):
+                let reserved = do rtIsReservedEntity(ex.changed[c])
+                if !reserved:
+                    w.pendingChanged = append(w.pendingChanged, ex.changed[c])
+                c = c + 1
+        w = do rtRecordAudit(w, rtActorName(w, sid), "admin:delete", true, entity)
+        let to = do rtSeeOther("/admin/" + rtUrlSeg(entity), cookie)
+        return RtHandled{resp: to, w: w}
+
+    # rtHandleAdmin: handleAdmin — authenticate an admin, then route within
+    # /admin.
+    proc rtHandleAdmin(w0: RtWorld, req: HttpServerRequest) -> RtHandled:
+        let mut w = w0
+        if !w.adminOn:
+            let off = do rtNotFound()
+            return RtHandled{resp: off, w: w}
+        let so = do rtSession(w, req)
+        w = so.w
+        let si = do rtSessionIndex(w, so.sid)
+        let admin = si >= 0 && w.sessions[si].role == "admin"
+        if !admin:
+            let html = do rtAdminShell(rtEsc(w.g.app), "", "<h1>Admin</h1><p>You must be signed in as an admin to view this dashboard.</p><p><a href=\"/\">Home</a></p>")
+            return RtHandled{resp: HttpServerResponse{status: 403, reason: "", headers: [HttpHeader{name: "content-type", value: "text/html; charset=utf-8"}, so.cookie], body: html}, w: w}
+        let mut rest = slice(req.path, 6, len(req.path))
+        loop len(rest) > 0 && slice(rest, 0, 1) == "/":
+            rest = slice(rest, 1, len(rest))
+        loop len(rest) > 0 && slice(rest, len(rest) - 1, len(rest)) == "/":
+            rest = slice(rest, 0, len(rest) - 1)
+        if rest == "":
+            let ix = do rtAdminIndex(w, so.cookie)
+            return RtHandled{resp: ix, w: w}
+        if rest == "_save":
+            let sv = do rtAdminSave(w, req, so.cookie, so.sid)
+            return sv
+        if rest == "_delete":
+            let dl = do rtAdminDelete(w, req, so.cookie, so.sid)
+            return dl
+        let slash = do rtIndexOfText(rest, "/")
+        let mut entity = rest
+        let mut sub = ""
+        if slash >= 0:
+            entity = slice(rest, 0, slash)
+            sub = slice(rest, slash + 1, len(rest))
+        let ei = do rtEntityIndex(w.g, entity)
+        if ei < 0:
+            let nf = do rtNotFound()
+            return RtHandled{resp: rtWithCookie(nf, so.cookie), w: w}
+        let e = w.g.entities[ei]
+        if slash < 0:
+            let ls = do rtAdminRows(w, so.cookie, so.sid, e)
+            return RtHandled{resp: ls, w: w}
+        if sub == "new":
+            let none = do noneVal()
+            let nw = do rtAdminForm(w, so.cookie, so.sid, e, false, none)
+            return RtHandled{resp: nw, w: w}
+        let id = do valToInt(textVal(sub))
+        let got = do rtAdminFindRow(w, entity, id)
+        if !got.found:
+            let nf2 = do rtNotFound()
+            return RtHandled{resp: rtWithCookie(nf2, so.cookie), w: w}
+        let ed = do rtAdminForm(w, so.cookie, so.sid, e, true, got.row)
+        return RtHandled{resp: ed, w: w}

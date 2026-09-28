@@ -17,11 +17,13 @@ app M:
         l: float
         s: float
         sig: float
+        sn: float
+        cs: float
     proc sigmoid(x: float) -> float:
         return 1.0 / (1.0 + exp(0.0 - x))
     action calc(x: float) -> R:
         let sg = do sigmoid(x)
-        return R{e: exp(x), l: ln(x), s: sqrt(x), sig: sg}
+        return R{e: exp(x), l: ln(x), s: sqrt(x), sig: sg, sn: sin(x), cs: cos(x)}
     view Home at "/":
         text "hi"
 `)
@@ -38,7 +40,7 @@ app M:
 		t.Fatal(err)
 	}
 	r := got.(map[string]any)
-	for k, want := range map[string]float64{"e": math.Exp(2), "l": math.Ln2, "s": math.Sqrt2, "sig": 1 / (1 + math.Exp(-2))} {
+	for k, want := range map[string]float64{"e": math.Exp(2), "l": math.Ln2, "s": math.Sqrt2, "sig": 1 / (1 + math.Exp(-2)), "sn": math.Sin(2), "cs": math.Cos(2)} {
 		if v := toFloat(r[k]); math.Abs(v-want) > 1e-12 {
 			t.Errorf("%s = %v, want %v", k, v, want)
 		}

@@ -255,6 +255,7 @@ global.window = {
   addEventListener: () => {},
   location: { pathname: "/", href: "http://127.0.0.1:9312/", search: "" },
   history: { pushState: () => {}, replaceState: () => {} },
+  scrollTo: () => {},
   localStorage: global.localStorage,
   crypto: require("crypto").webcrypto,
   matchMedia: () => ({ matches: false, addEventListener: () => {} }),
@@ -308,6 +309,30 @@ async function settle() {
     }
   }
 }
+// DOMParser, as far as SPA navigation reads a fetched page: its #fa-ir and
+// #fa-state scripts, its CSRF and description metas, its title. Without it a
+// click on an app link would throw inside navigate() and no test could follow
+// the client from one page to the next.
+global.DOMParser = class {
+  parseFromString(html) {
+    const script = (id) => {
+      const m = html.match(new RegExp('<script[^>]*id="' + id + '"[^>]*>([\\s\\S]*?)</script>'));
+      return m ? { textContent: m[1] } : null;
+    };
+    const meta = (name) => {
+      const m = html.match(new RegExp('<meta name="' + name + '" content="([^"]*)"'));
+      return m ? { getAttribute: () => m[1] } : null;
+    };
+    return {
+      getElementById: script,
+      querySelector: (sel) => {
+        const m = sel.match(/^meta\[name="([^"]+)"\]$/);
+        return m ? meta(m[1]) : null;
+      },
+      title: (html.match(/<title>([\s\S]*?)<\/title>/) || [null, ""])[1],
+    };
+  }
+};
 global.location = global.window.location;
 global.history = global.window.history;
 global.navigator = { language: "en-US" };

@@ -43,6 +43,8 @@ func loadDriverApp(t *testing.T) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// the on-start job resets the driver's module cache (driverModCache)
+	srv.StartJobs()
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts
@@ -93,12 +95,36 @@ func driverGotSrc(t *testing.T, ts *httptest.Server, src string) (map[string]int
 	return driverDecode(t, d)
 }
 
+// driverGotRaw is runCompileFile's output exactly as the driver wrote it.
+func driverGotRaw(t *testing.T, ts *httptest.Server, root, path string) string {
+	t.Helper()
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel, err := filepath.Rel(root, abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := postExprJSON(t, ts, "runCompileFile", root, filepath.ToSlash(rel))
+	j, ok := d["compiledOut"].(string)
+	if !ok {
+		t.Fatalf("no compiledOut delta: %+v", d)
+	}
+	return j
+}
+
 func driverDecode(t *testing.T, d map[string]interface{}) (map[string]interface{}, string) {
 	t.Helper()
 	j, ok := d["compiledOut"].(string)
 	if !ok {
 		t.Fatalf("no compiledOut delta: %+v", d)
 	}
+	return driverDecodeRaw(j)
+}
+
+// driverDecodeRaw decodes the driver's output: its IR, or its refusal.
+func driverDecodeRaw(j string) (map[string]interface{}, string) {
 	var full map[string]interface{}
 	if err := json.Unmarshal([]byte(j), &full); err != nil {
 		return nil, fmt.Sprintf("compiledOut is not valid JSON: %v\nraw: %s", err, j)
@@ -232,11 +258,8 @@ var driverPassingExamples = []string{
 	"testdata/cssfrom/app.fct",
 	"testdata/files.fct",
 	"testdata/dispatch.fct",
-	"../../facets/f33d3r.fct",
-	"../../facets/home.fct",
-	"../../facets/live.fct",
-	"../../facets/messages.fct",
-	"../../facets/timeline.fct",
+	"../../facets/layered_demo.fct",
+	"../../facets/f33d3r_com.fct",
 	"../../facets/api/main.fct",
 }
 

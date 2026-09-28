@@ -24,12 +24,9 @@ import (
 	"math"
 	"math/rand"
 	"net/http/httptest"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 
 	"facet/internal/compile"
@@ -62,46 +59,10 @@ func laRun(t *testing.T, ts *httptest.Server, action string, lines []string) []s
 	return strings.Split(out, "\n")
 }
 
-var (
-	laCheckOnce sync.Once
-	laCheckBin  string
-	laCheckErr  string
-)
-
-// laCheck builds testdata/fabric_check once and returns its path, or skips
-// the calling test when cargo is not installed.
+// laCheck: the fabric_check harness (fabricCheckBinary).
 func laCheck(t *testing.T) string {
 	t.Helper()
-	laCheckOnce.Do(func() {
-		cargo, err := exec.LookPath("cargo")
-		if err != nil {
-			laCheckErr = "cargo is not installed"
-			return
-		}
-		if _, err := os.Stat("../../fabric/crates/fabric-protocol/Cargo.toml"); err != nil {
-			laCheckErr = "no fabric checkout beside fct"
-			return
-		}
-		target := os.Getenv("FCT_FABRIC_CHECK_TARGET")
-		if target == "" {
-			target = filepath.Join(os.TempDir(), "fct-fabric-check")
-		}
-		cmd := exec.Command(cargo, "build", "--release", "--quiet")
-		cmd.Dir = "testdata/fabric_check"
-		cmd.Env = append(os.Environ(), "CARGO_TARGET_DIR="+target)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			laCheckErr = "cargo build failed: " + err.Error() + "\n" + string(out)
-			return
-		}
-		laCheckBin = filepath.Join(target, "release", "fabric_check")
-	})
-	if laCheckBin == "" {
-		if strings.HasPrefix(laCheckErr, "cargo build failed") {
-			t.Fatal(laCheckErr)
-		}
-		t.Skip("fabric_check unavailable: " + laCheckErr)
-	}
-	return laCheckBin
+	return fabricCheckBinary(t)
 }
 
 // laRust runs fabric_check in mode over lines (one per stdin line).

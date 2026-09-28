@@ -1,0 +1,42 @@
+# Two runtimes sharing one FacetQL (FACET_CLUSTER=1), driven by
+# TestRuntimeCluster: sessions ended on one instance end on the other.
+app CS:
+    type TokenDTO:
+        token: text
+    entity Account:
+        id: int
+        handle: text
+        password: text @password
+    policy member:
+        actor != "guest"
+    action signup(handle: text, password: text) -> TokenDTO:
+        add Account { handle: handle, password: password }
+        establish actor handle
+        return TokenDTO{token: sessionToken}
+    action login(handle: text, password: text) -> TokenDTO:
+        let id = max(a.id in Account where a.handle == handle)
+        check verifyPassword(Account(id).password, password) "wrong password" status 401
+        establish actor handle
+        return TokenDTO{token: sessionToken}
+    action whoami() -> TokenDTO:
+        requires member
+        return TokenDTO{token: actor}
+    action sessionKey() -> TokenDTO:
+        requires member
+        return TokenDTO{token: session}
+    action revokeKey(key: text):
+        requires member
+        revoke key
+    api POST "/api/accounts" -> signup status 201
+    api POST "/api/sessions" -> login status 201
+    api GET "/api/me" -> whoami
+    api GET "/api/me/session" -> sessionKey
+    api DELETE "/api/sessions" -> revokeKey status 204
+    entity Note:
+        id: int
+        body: text
+    action write(body: text):
+        requires member
+        add Note { body: body }
+    view V at "/":
+        text "{count(Note)} notes"

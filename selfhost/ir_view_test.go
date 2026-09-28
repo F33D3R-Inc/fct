@@ -20,7 +20,7 @@ var irViewExamples = []string{
 	"../examples/stage.fct", "../examples/timer.fct", "../examples/metadata.fct",
 	"../examples/media.fct", "../examples/secure.fct", "../examples/popover.fct",
 	"../examples/identity.fct", "../examples/typing_indicator.fct", "../examples/chirp.fct",
-	"../examples/zones.fct", "../../facets/f33d3r.fct",
+	"../examples/zones.fct", "../../facets/layered_demo.fct",
 }
 
 func loadIRViewApp(t *testing.T) *httptest.Server {

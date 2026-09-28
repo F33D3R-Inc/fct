@@ -140,6 +140,26 @@ app DeclChecksSelfHost:
     private proc declOk() -> DeclCheckResult:
         return DeclCheckResult{valid: true, message: ""}
 
+    # declLine: msg at source line n as build.go's BuildError spells it.
+    private proc declLine(n: int, msg: text) -> text:
+        if n > 0:
+            return "line " + n + ": " + msg
+        return msg
+
+    # wireTypeNames: every `type Name [@internal]:` declared.
+    private proc wireTypeNames(prog: Program) -> [text]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(prog.rawDecls):
+            if prog.rawDecls[i].kw == "type":
+                let mut h = trim(slice(prog.rawDecls[i].header, 4, len(prog.rawDecls[i].header)))
+                let mut j = 0
+                loop j < len(h) && charAt(h, j) != " " && charAt(h, j) != ":" && charAt(h, j) != "@":
+                    j = j + 1
+                out = append(out, slice(h, 0, j))
+            i = i + 1
+        return out
+
     private proc declErr(msg: text) -> DeclCheckResult:
         return DeclCheckResult{valid: false, message: msg}
 
@@ -393,8 +413,6 @@ app DeclChecksSelfHost:
         if p == "/":
             return true
         if p == "/event":
-            return true
-        if p == "/live":
             return true
         if p == "/api":
             return true
@@ -790,21 +808,38 @@ app DeclChecksSelfHost:
         let names = do procNames(prog)
         let entities = do entityNames(prog)
         let services = do serviceNames(prog)
+        let enumsK = do enumNames(prog)
+        let recordsK = do recordNames(prog)
+        let structsK = do structNames(prog)
+        let wireK = do wireTypeNames(prog)
         let n = len(prog.procs)
         let mut i = 0
         loop i < n:
-            let dup = do dupUpTo(names, i)
-            if dup:
-                let __ret38 = do declErr("proc \"" + names[i] + "\" redeclared")
+            let pline = prog.procs[i].lineNo
+            let first = indexOf(names, names[i], 0)
+            if first < i:
+                let __ret38 = do declErr(declLine(pline, "proc \"" + names[i] + "\" redeclared (first at line " + prog.procs[first].lineNo + ")"))
                 return __ret38
             let entClash = do containsText(entities, names[i])
             if entClash:
-                let __ret39 = do declErr("proc \"" + names[i] + "\" collides with an entity name")
+                let __ret39 = do declErr(declLine(pline, "proc \"" + names[i] + "\" collides with an entity name"))
                 return __ret39
             let svcClash = do containsText(services, names[i])
             if svcClash:
-                let __ret40 = do declErr("proc \"" + names[i] + "\" collides with a service name")
+                let __ret40 = do declErr(declLine(pline, "proc \"" + names[i] + "\" collides with a service name"))
                 return __ret40
+            # its return type: a primitive, or a declared enum, record, struct
+            # or wire type (a nested list's element; a map's value)
+            if prog.procs[i].hasRet:
+                let mut ret = prog.procs[i].retCore
+                let mspec = do parseProcHeaderRetMapSpec(prog.procs[i].headerLine)
+                if mspec != "":
+                    ret = mapSpecVal(mspec)
+                ret = nestedBase(ret)
+                let prim = ret == "int" || ret == "text" || ret == "bool" || ret == "money" || ret == "date" || ret == "float" || ret == "datetime"
+                if ret != "" && !prim && !(ret in enumsK) && !(ret in recordsK) && !(ret in structsK) && !(ret in wireK):
+                    let __ret40b = do declErr(declLine(pline, "proc \"" + names[i] + "\" returns unknown type \"" + ret + "\""))
+                    return __ret40b
             let uses = prog.procs[i].uses
             let un = len(uses)
             let mut usesSoFar = []
@@ -813,11 +848,11 @@ app DeclChecksSelfHost:
                 let u = uses[ui]
                 let known = do isKnownCapability(u)
                 if !known:
-                    let __ret41 = do declErr("proc \"" + names[i] + "\" declares unknown capability \"" + u + "\" — known capabilities: io.console, io.env, io.file, io.net, io.net.listen")
+                    let __ret41 = do declErr(declLine(pline, "proc \"" + names[i] + "\" declares unknown capability \"" + u + "\" — known capabilities: io.console, io.env, io.file, io.net, io.net.listen"))
                     return __ret41
                 let udup = do containsText(usesSoFar, u)
                 if udup:
-                    let __ret42 = do declErr("proc \"" + names[i] + "\" declares capability \"" + u + "\" more than once")
+                    let __ret42 = do declErr(declLine(pline, "proc \"" + names[i] + "\" declares capability \"" + u + "\" more than once"))
                     return __ret42
                 usesSoFar = append(usesSoFar, u)
                 ui = ui + 1

@@ -19,7 +19,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -226,9 +225,6 @@ func fabricProtoStartPort(t *testing.T) {
 // source order) and skipped if the port is already up in this process.
 func TestFabricProtocolServerGoldenMatchesRealBinary(t *testing.T) {
 	bin := fabricProtoRealBinary(t)
-	if bin == "" {
-		t.Skip("real facet-protocol unavailable: " + fabricProtoBinErr)
-	}
 	if c, err := net.Dial("tcp", "127.0.0.1:7700"); err == nil {
 		c.Close()
 		t.Skip("127.0.0.1:7700 is already taken (the port runs in this process); run this test on its own")
@@ -314,31 +310,9 @@ func TestFabricProtocolServerRefusesWithoutToken(t *testing.T) {
 	}
 }
 
-var (
-	fabricProtoBinOnce sync.Once
-	fabricProtoBin     string
-	fabricProtoBinErr  string
-)
-
+// fabricProtoRealBinary: fabric-protocol's `facet-protocol`
+// (fabricWorkspaceBinary).
 func fabricProtoRealBinary(t *testing.T) string {
 	t.Helper()
-	fabricProtoBinOnce.Do(func() {
-		cargo, err := exec.LookPath("cargo")
-		if err != nil {
-			fabricProtoBinErr = "cargo is not installed"
-			return
-		}
-		target := filepath.Join(os.TempDir(), "fct-fabric-protocol")
-		cmd := exec.Command(cargo, "build", "--locked", "--quiet", "--manifest-path", "../../fabric/crates/fabric-protocol/Cargo.toml", "--bin", "facet-protocol")
-		cmd.Env = append(os.Environ(), "CARGO_TARGET_DIR="+target)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			fabricProtoBinErr = "cargo build failed: " + err.Error() + "\n" + string(out)
-			return
-		}
-		fabricProtoBin = filepath.Join(target, "debug", "facet-protocol")
-	})
-	if strings.HasPrefix(fabricProtoBinErr, "cargo build failed") {
-		t.Fatal(fabricProtoBinErr)
-	}
-	return fabricProtoBin
+	return fabricWorkspaceBinary(t, "facet-protocol")
 }

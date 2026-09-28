@@ -315,10 +315,22 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 // the signature is all a fragment can expect of its host.
 func parseActionHead(text string, line int) (*ast.Action, error) {
 	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(text, "action")), ":")
-	optimistic := false
-	if strings.HasSuffix(head, "@optimistic") {
-		optimistic = true
-		head = strings.TrimSpace(strings.TrimSuffix(head, "@optimistic"))
+	optimistic, internal := false, false
+	for {
+		switch {
+		case strings.HasSuffix(head, "@optimistic"):
+			optimistic = true
+			head = strings.TrimSpace(strings.TrimSuffix(head, "@optimistic"))
+			continue
+		case strings.HasSuffix(head, "@internal"):
+			internal = true
+			head = strings.TrimSpace(strings.TrimSuffix(head, "@internal"))
+			continue
+		}
+		break
+	}
+	if optimistic && internal {
+		return nil, &Error{line, "an @internal action runs only on the authority, so it has nothing for a client to predict — drop @optimistic"}
 	}
 	// `-> Type` declares a return value, the same trailing clause a proc header
 	// carries (parseProc).
@@ -340,7 +352,7 @@ func parseActionHead(text string, line int) (*ast.Action, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ast.Action{Name: name, Params: params, Optimistic: optimistic, Ret: ret, RetList: retList, Line: line}, nil
+	return &ast.Action{Name: name, Params: params, Optimistic: optimistic, Internal: internal, Ret: ret, RetList: retList, Line: line}, nil
 }
 
 // parseExpect parses the four `expect` forms:
@@ -1110,6 +1122,11 @@ func parseStruct(n *source.Node) (*ast.Struct, error) {
 			return nil
 		}
 		core, list, optional := splitType(ft)
+		depth := 0
+		if inner, d := splitNestedList(core); list && d > 0 {
+			// `[[T]]`: a nested list field
+			core, depth = inner, d+1
+		}
 		if optional {
 			return &Error{line, fmt.Sprintf("struct field %q cannot be optional (?) — a struct literal must set every field", fn)}
 		}
@@ -1119,7 +1136,7 @@ func parseStruct(n *source.Node) (*ast.Struct, error) {
 		if !isTypeName(core) {
 			return &Error{line, fmt.Sprintf("unknown type %q in struct field %q (use int/text/bool/float, another struct, or a list of those)", core, fn)}
 		}
-		st.Fields = append(st.Fields, ast.StructField{Name: fn, Type: core, List: list, Line: line})
+		st.Fields = append(st.Fields, ast.StructField{Name: fn, Type: core, List: list, Depth: depth, Line: line})
 		return nil
 	}
 	if inline != "" {
@@ -1215,6 +1232,11 @@ func parseType(n *source.Node) (*ast.Type, error) {
 	// `type Name query:` — bound from a URL query string, never a JSON body
 	// (see ast.Type.Query's doc comment). The marker sits between the name
 	// and the colon, so it must be stripped before the identifier check.
+	isInternal := false
+	if trimmed := strings.TrimSuffix(name, " @internal"); trimmed != name {
+		isInternal = true
+		name = strings.TrimSpace(trimmed)
+	}
 	isQuery := false
 	if trimmed := strings.TrimSuffix(name, " query"); trimmed != name {
 		isQuery = true
@@ -1223,7 +1245,7 @@ func parseType(n *source.Node) (*ast.Type, error) {
 	if !isIdent(name) || !isUpper(name) {
 		return nil, &Error{n.Line.No, fmt.Sprintf("type name %q must be capitalized", name)}
 	}
-	t := &ast.Type{Name: name, Schema: schemaName, Query: isQuery, Line: n.Line.No}
+	t := &ast.Type{Name: name, Schema: schemaName, Query: isQuery, Internal: isInternal, Line: n.Line.No}
 	add := func(spec string, line int) error {
 		spec = strings.TrimSpace(spec)
 		if spec == "" {
@@ -3178,6 +3200,7 @@ func parseProc(n *source.Node) (*ast.Proc, error) {
 	}
 	var ret, retKey string
 	var retList, retMap bool
+	retDepth := 0
 	if arrow := strings.Index(head, "->"); arrow >= 0 {
 		rt := strings.TrimSpace(head[arrow+2:])
 		head = strings.TrimSpace(head[:arrow])
@@ -3188,6 +3211,10 @@ func parseProc(n *source.Node) (*ast.Proc, error) {
 			ret, retMap, retKey = mv, true, mk
 		} else {
 			core, list, optional := splitType(rt)
+			if inner, d := splitNestedList(core); list && d > 0 {
+				// `-> [[T]]`: a nested list
+				core, retDepth = inner, d+1
+			}
 			if optional || !isTypeName(core) {
 				return nil, &Error{n.Line.No, fmt.Sprintf("invalid return type %q", rt)}
 			}
@@ -3203,7 +3230,7 @@ func parseProc(n *source.Node) (*ast.Proc, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &ast.Proc{Name: name, Params: params, Ret: ret, RetList: retList, RetMap: retMap, RetKey: retKey, Uses: uses, Line: n.Line.No}
+	p := &ast.Proc{Name: name, Params: params, Ret: ret, RetList: retList, RetMap: retMap, RetKey: retKey, RetDepth: retDepth, Uses: uses, Line: n.Line.No}
 	body, err := parseProcBody(n.Children, fmt.Sprintf("proc %q", name))
 	if err != nil {
 		return nil, err
@@ -3964,6 +3991,11 @@ func parseSignature(head string, line int, allowList, allowRef bool) (string, []
 				continue
 			}
 			core, list, optional := splitType(pt)
+			// `[[T]]`: a nested list, where a map parameter is allowed (a proc).
+			depth := 0
+			if inner, d := splitNestedList(core); list && d > 0 && allowList && ref == ast.RefValue {
+				core, depth = inner, d+1
+			}
 			// A reference parameter names a declaration, so the two modifiers a value
 			// parameter carries do not apply: a cell is or is not a list because the
 			// cell it names is, and there is no such thing as an absent name.
@@ -3978,7 +4010,7 @@ func parseSignature(head string, line int, allowList, allowRef bool) (string, []
 			if !isTypeName(core) && !(core == "json" && !list) {
 				return "", nil, &Error{line, fmt.Sprintf("invalid parameter %q", strings.TrimSpace(p))}
 			}
-			params = append(params, ast.Param{Name: pn, Type: core, List: list, Optional: optional, Ref: ref})
+			params = append(params, ast.Param{Name: pn, Type: core, List: list, Optional: optional, Ref: ref, Depth: depth})
 		}
 	}
 	return name, params, nil
@@ -4506,6 +4538,12 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 				return nil, err
 			}
 			out = append(out, u)
+		case strings.HasPrefix(t, "camera "):
+			cm, err := parseCamera(strings.TrimSpace(t[len("camera "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, cm)
 		case strings.HasPrefix(t, "use "):
 			u, err := parseUse(strings.TrimSpace(t[len("use "):]), c.Line.No, c.Children)
 			if err != nil {
@@ -4994,18 +5032,37 @@ func parseRange(head string, line int) (ast.Range, error) {
 	}
 	if byS != "" {
 		bp := strings.Fields(byS)
-		if len(bp) < 1 || len(bp) > 2 || !isIdent(bp[0]) {
-			return rg, &Error{line, "ordering is `by field [desc|asc]`"}
-		}
-		rg.Order = bp[0]
-		if len(bp) == 2 {
-			switch bp[1] {
-			case "desc":
+		// `by <expr> [desc|asc]`: a key computed per row, the way a
+		// `list(… by <expr>)` aggregate already orders.
+		if len(bp) >= 1 && !(len(bp) <= 2 && isIdent(bp[0])) {
+			src := strings.TrimSpace(byS)
+			if strings.HasSuffix(src, " desc") {
 				rg.Desc = true
-			case "asc":
-				rg.Desc = false
-			default:
-				return rg, &Error{line, fmt.Sprintf("order direction must be `desc` or `asc`, got %q", bp[1])}
+				src = strings.TrimSpace(strings.TrimSuffix(src, " desc"))
+			} else {
+				src = strings.TrimSpace(strings.TrimSuffix(src, " asc"))
+			}
+			e, err := parseExpr(src, line)
+			if err != nil {
+				return rg, &Error{line, fmt.Sprintf("ordering is `by field [desc|asc]` or `by <expr> [desc|asc]`: %v", err)}
+			}
+			rg.OrderExpr = e
+			bp = nil
+		}
+		if bp != nil {
+			if len(bp) < 1 || len(bp) > 2 || !isIdent(bp[0]) {
+				return rg, &Error{line, "ordering is `by field [desc|asc]`"}
+			}
+			rg.Order = bp[0]
+			if len(bp) == 2 {
+				switch bp[1] {
+				case "desc":
+					rg.Desc = true
+				case "asc":
+					rg.Desc = false
+				default:
+					return rg, &Error{line, fmt.Sprintf("order direction must be `desc` or `asc`, got %q", bp[1])}
+				}
 			}
 		}
 	}
@@ -5779,6 +5836,28 @@ func parseUpload(s string, line int) (ast.Node, error) {
 	return up, nil
 }
 
+// parseCamera: `camera bind shot [label "text"]`.
+func parseCamera(s string, line int) (ast.Node, error) {
+	if !strings.HasPrefix(s, "bind ") {
+		return nil, &Error{line, "camera needs a binding: camera bind shot"}
+	}
+	rest := strings.TrimSpace(s[len("bind "):])
+	cm := ast.Camera{Label: []ast.Seg{{Lit: "Capture"}}, Line: line}
+	if lp := indexTop(rest, "label "); lp >= 0 {
+		l, err := parseText(strings.TrimSpace(rest[lp+len("label "):]), line)
+		if err != nil {
+			return nil, err
+		}
+		cm.Label = l
+		rest = strings.TrimSpace(rest[:lp])
+	}
+	if !isIdent(rest) {
+		return nil, &Error{line, fmt.Sprintf("invalid camera binding %q", rest)}
+	}
+	cm.Bind = rest
+	return cm, nil
+}
+
 // parseUse: `use Component(arg, ...)` — invoke a reusable view fragment,
 // optionally with an indented block of children that fill the component's `slot`.
 //
@@ -5999,6 +6078,18 @@ func splitType(s string) (core string, list, optional bool) {
 		s = strings.TrimSpace(s[1 : len(s)-1])
 	}
 	return s, list, optional
+}
+
+// splitNestedList peels the list wrappers off a list's element type:
+// `[float]` (the element of `[[float]]`) is "float" with 1 more level, and
+// so on; a type that is no list is returned as is with 0.
+func splitNestedList(core string) (string, int) {
+	d := 0
+	for strings.HasPrefix(core, "[") && strings.HasSuffix(core, "]") {
+		core = strings.TrimSpace(core[1 : len(core)-1])
+		d++
+	}
+	return core, d
 }
 
 // splitNullable strips a wire field type's ` or null` suffix.

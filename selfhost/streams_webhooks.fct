@@ -98,7 +98,7 @@ app StreamsWebhooks:
                 if names[k] == p.name:
                     raw = vals[k]
                 k = k + 1
-            let c = do rtParamArg(textVal(raw), p)
+            let c = do rtArgFor(w0.g, textVal(raw), p)
             if !c.ok:
                 return RtHook{ok: false, status: 404, msg: "parameter \"" + p.name + "\" expects " + rtParamTypeName(p), value: noneVal(), w: w0}
             args = append(args, c.v)
@@ -199,7 +199,8 @@ app StreamsWebhooks:
         let actorV = do rtGet(rtScope(w, sid), "actor")
         let actor = do valToStr(actorV)
         let key = do rtJoinTexts(m.vals, "\x00")
-        let ch = channel()
+        # 32 frames, as Go buffers a declared stream's subscriber
+        let ch = channel(32)
         w.streamSubs = append(w.streamSubs, RtStreamSub{ch: ch, path: st.path, actor: actor, key: key, sid: sid, paramNames: m.names, paramVals: m.vals})
         let mut replay = ""
         if lastID >= 0:
@@ -293,7 +294,10 @@ app StreamsWebhooks:
                             let sub = w.streamSubs[k]
                             let vis = do rtVisibleTo(f, sub.actor, sub.key)
                             if sub.path == st.path && vis:
-                                let sent = send(sub.ch, f.frame)
+                                # one that cannot keep up drops this event
+                                # rather than the connection; it can resume
+                                # by id (streams.go)
+                                let sent = trySend(sub.ch, f.frame)
                             k = k + 1
                     d = d + 1
                 si = si + 1
@@ -414,6 +418,7 @@ app StreamsWebhooks:
             w = do rtIdemRecord(w, ikey, run.status, run.msg)
             let e = do rtTextError(run.status, run.msg)
             return RtHandled{resp: e, w: w}
+        w = do rtRecordAudit(w, "system", act.name, true, "webhook " + w.g.webhooks[at].path)
         let ok2 = do rtWebhookOK()
         w = do rtIdemRecord(w, ikey, 200, ok2.body)
         return RtHandled{resp: ok2, w: w}

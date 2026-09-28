@@ -144,6 +144,7 @@ func fqServerPairWith(t *testing.T, perServer func(dir string) []string, env ...
 		}
 		cmd.Stdout = log
 		cmd.Stderr = log
+		dieWithParent(cmd)
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("starting %s: %v", name, err)
 		}
@@ -707,6 +708,7 @@ func TestFqServerTLSBothWays(t *testing.T) {
 // than its source.
 func fqFacetqlStart(t *testing.T) string {
 	t.Helper()
+	fqRustReference(t)
 	bin, err := filepath.Abs("../../facetql/target/release/facetql")
 	if err != nil {
 		t.Fatal(err)
@@ -751,6 +753,7 @@ func fqStartProc(t *testing.T, which, dir string, env ...string) *fqProc {
 	cmd.Env = append(append(os.Environ(), env...), "FACETQL_DATA_DIR="+dir, "FACETQL_PORT=0")
 	p := &fqProc{cmd: cmd, stdout: &fqLockedBuf{}, stderr: &fqLockedBuf{}, done: make(chan struct{})}
 	cmd.Stdout, cmd.Stderr = p.stdout, p.stderr
+	dieWithParent(cmd)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -870,4 +873,106 @@ func TestFqServerRefusalsBothWays(t *testing.T) {
 	if outcome["fct"] != outcome["rust"] {
 		t.Errorf("refusals:\n--- facetql\n%s\n--- fqserver.fct\n%s", outcome["rust"], outcome["fct"])
 	}
+}
+
+// TestFqServerTLSVanishingClientsReturnTheirPermits: with one TLS
+// connection allowed at a time, clients that reset their connection in the
+// middle of a request — the server's close_notify then has nowhere to go —
+// each give their permit back: the next client is still served.
+func TestFqServerTLSVanishingClientsReturnTheirPermits(t *testing.T) {
+	openssl, err := exec.LookPath("openssl")
+	if err != nil {
+		t.Skip("openssl is not installed")
+	}
+	dir := t.TempDir()
+	key, cert, p12 := filepath.Join(dir, "id.key"), filepath.Join(dir, "id.crt"), filepath.Join(dir, "id.p12")
+	for _, args := range [][]string{
+		{"req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert, "-days", "2", "-subj", "/CN=localhost"},
+		{"pkcs12", "-export", "-inkey", key, "-in", cert, "-out", p12, "-passout", "pass:pw"},
+	} {
+		if out, err := exec.Command(openssl, args...).CombinedOutput(); err != nil {
+			t.Fatalf("openssl %v: %v\n%s", args, err, out)
+		}
+	}
+	p := fqStartProc(t, "fct", dir, "FACETQL_ENV=development", "FACETQL_TOKENS=tok:alice:admin",
+		"FACETQL_TLS_IDENTITY="+p12, "FACETQL_TLS_IDENTITY_PASSWORD=pw", "FACETQL_MAX_CONNECTIONS=1")
+	port := fqWaitListening(t, p)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	// A permit comes back once the server has seen its connection end, so
+	// a client arriving just before that is refused; one that is refused
+	// for two seconds means a permit never came back.
+	handshake := func(i int) (net.Conn, *tls.Conn) {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			raw, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := tls.Client(raw, &tls.Config{InsecureSkipVerify: true})
+			err = c.Handshake()
+			if err == nil {
+				return raw, c
+			}
+			raw.Close()
+			if time.Now().After(deadline) {
+				t.Fatalf("client %d: refused for 2s — a permit was not returned: %v\n%s", i, err, p.stderr.String())
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	for i := 0; i < 20; i++ {
+		raw, c := handshake(i)
+		_, _ = c.Write([]byte("POST /node HTTP/1.1\r\nHost: x\r\nx-api-key: tok\r\nContent-Type: application/json\r\nContent-Length: 50\r\n\r\n{"))
+		time.Sleep(20 * time.Millisecond)
+		raw.(*net.TCPConn).SetLinger(0)
+		raw.Close()
+	}
+	raw, c := handshake(20)
+	defer raw.Close()
+	_, _ = c.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	body, _ := io.ReadAll(c)
+	if !strings.Contains(string(body), "FacetQL Online") {
+		t.Fatalf("after 20 vanished clients the next is not served: %q\n%s", body, p.stderr.String())
+	}
+}
+
+// fqDumpOnHang arms a watchdog for an engine process a test depends on: if
+// the test is still running after `after`, the engine gets SIGQUIT — the Go
+// runtime then writes every goroutine's stack to its stderr and exits,
+// which also ends whatever the test was blocked on — and the test fails
+// with that dump (from out), written in full to a file it names. A hang is
+// captured the first time it happens rather than reproduced later.
+func fqDumpOnHang(t *testing.T, cmd *exec.Cmd, out func() string, after time.Duration) {
+	t.Helper()
+	var mu sync.Mutex
+	finished := false
+	timer := time.AfterFunc(after, func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if finished {
+			return
+		}
+		_ = cmd.Process.Signal(syscall.SIGQUIT)
+		time.Sleep(2 * time.Second)
+		dump := out()
+		f, err := os.CreateTemp("", "fqserver-hang-*.txt")
+		path := "(not written)"
+		if err == nil {
+			_, _ = f.WriteString(dump)
+			f.Close()
+			path = f.Name()
+		}
+		tail := dump
+		if len(tail) > 20000 {
+			tail = tail[len(tail)-20000:]
+		}
+		t.Errorf("still running after %v: the engine's goroutines (all of it in %s):\n%s", after, path, tail)
+	})
+	t.Cleanup(func() {
+		mu.Lock()
+		finished = true
+		mu.Unlock()
+		timer.Stop()
+	})
 }

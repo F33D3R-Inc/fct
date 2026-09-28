@@ -130,7 +130,11 @@ func resolveExpects(app *ast.App) error {
 		case ex.Action != nil:
 			want := ex.Action
 			if have, ok := actions[want.Name]; ok {
-				if sig := signatureOf(have); sig != signatureOf(want) {
+				if sig := signatureOf(have); !actionFits(have, want) || have.Internal != want.Internal {
+					if sig == signatureOf(want) {
+						return fmt.Errorf("%s expects action %s to be %s, but this app's action (line %d) is %s",
+							where(ex), signatureOf(want), internalWord(want.Internal), have.Line, internalWord(have.Internal))
+					}
 					return fmt.Errorf("%s expects action %s, but this app's action (line %d) is %s — the fragment invokes the signature it expected",
 						where(ex), signatureOf(want), have.Line, sig)
 				}
@@ -143,7 +147,7 @@ func resolveExpects(app *ast.App) error {
 				}
 				continue
 			}
-			syn := &ast.Action{Name: want.Name, Params: want.Params, Ret: want.Ret, RetList: want.RetList, Line: want.Line}
+			syn := &ast.Action{Name: want.Name, Params: want.Params, Ret: want.Ret, RetList: want.RetList, Internal: want.Internal, StandIn: true, Line: want.Line}
 			synthAction[want.Name] = syn
 			app.Actions = append(app.Actions, syn)
 
@@ -277,4 +281,40 @@ func signatureOf(a *ast.Action) string {
 		}
 	}
 	return sig
+}
+
+// actionFits reports whether the host's action serves every call a fragment
+// written against want can make: the expected parameters first, in order,
+// with the same names and types (one the fragment may omit must be optional
+// on the host too), then only optional parameters the fragment never passes;
+// and the expected reply, when the fragment expects one. A fragment that
+// expects no reply discards whatever the host answers — so a host's
+// `post(body: text, is_nsfw: bool?, …) -> WorkCreatedDTO` serves a
+// ComposeBox's `post(body: text)`.
+func actionFits(have, want *ast.Action) bool {
+	if len(have.Params) < len(want.Params) {
+		return false
+	}
+	for i, wp := range want.Params {
+		hp := have.Params[i]
+		if hp.Name != wp.Name || hp.Type != wp.Type || hp.List != wp.List || (wp.Optional && !hp.Optional) {
+			return false
+		}
+	}
+	for _, hp := range have.Params[len(want.Params):] {
+		if !hp.Optional {
+			return false
+		}
+	}
+	if want.Ret == "" {
+		return true
+	}
+	return have.Ret == want.Ret && have.RetList == want.RetList
+}
+
+func internalWord(internal bool) string {
+	if internal {
+		return "@internal"
+	}
+	return "client-callable"
 }

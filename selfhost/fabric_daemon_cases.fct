@@ -241,8 +241,8 @@ app FabricDaemonCases:
         let resident = do dcaJ(v, "resident")
         return MoverReport{rowsCopied: dcaU(v, "rows"), bytesCopied: dcaU(v, "bytes"), hasResidentBytes: resident.kind == "num", residentBytes: resident.u, snapshotComplete: dcaJ(v, "snapshot_complete").b, observedWrites: dcaU(v, "observed"), appliedWrites: dcaU(v, "applied"), verdict: dcaVerdict(dcaJ(v, "verdict"))}
 
-    # One scripted cycle: control.rs `cycle` with the sweep and the sample
-    # taken from the step (used only when due, as there), no store.
+    # One scripted cycle: control.rs `cycle` with the sweep taken from the
+    # step (used only when due, as there), no store.
     proc dcaCycle(c: DaemonControl, now: int, step: SjV) -> DaemonControl:
         let mut out = do daemonControlTickClock(c, now)
         let due = do daemonControlProbeDue(out, now)
@@ -266,28 +266,29 @@ app FabricDaemonCases:
                 probes = append(probes, probe)
                 k = k + 1
             out = daemonControlApplyProbes(out, now, ids, probes)
-        let pollDue = do daemonControlPollDue(out, now)
-        if pollDue:
-            let sv = do dcaJ(step, "sample")
-            let mut sample = do daemonSampleEmpty()
-            let notes = do dcaJ(sv, "notes")
-            let nn = len(notes.items)
-            let mut j = 0
-            loop j < nn:
-                sample.noteIds = append(sample.noteIds, notes.items[j].items[0].s)
-                sample.notes = append(sample.notes, notes.items[j].items[1].s)
-                j = j + 1
-            let messages = do dcaJ(sv, "messages")
-            let nm = len(messages.items)
-            let mut m = 0
-            loop m < nm:
-                let decoded = do protocolDecode(messages.items[m].s)
-                sample.messages = append(sample.messages, decoded.message)
-                m = m + 1
-            out = daemonControlApplySample(out, now, sample)
         let middle = do daemonControlCycleMiddle(out, now)
         let finished = do daemonControlFinishCycle(middle.control, now)
         return finished
+
+    # One scripted sample arriving from the pump: control.rs `ingest`.
+    proc dcaSample(c: DaemonControl, step: SjV) -> DaemonControl:
+        let sv = do dcaJ(step, "sample")
+        let mut sample = do daemonSampleEmpty()
+        let notes = do dcaJ(sv, "notes")
+        let nn = len(notes.items)
+        let mut j = 0
+        loop j < nn:
+            sample.noteIds = append(sample.noteIds, notes.items[j].items[0].s)
+            sample.notes = append(sample.notes, notes.items[j].items[1].s)
+            j = j + 1
+        let messages = do dcaJ(sv, "messages")
+        let nm = len(messages.items)
+        let mut m = 0
+        loop m < nm:
+            let decoded = do protocolDecode(messages.items[m].s)
+            sample.messages = append(sample.messages, decoded.message)
+            m = m + 1
+        return daemonControlApplySample(c, sample)
 
     proc dcaAnswer(ok: bool, message: text) -> text:
         if ok:
@@ -326,6 +327,9 @@ app FabricDaemonCases:
             if op == "boot":
                 c = daemonControlNew(settings, dcaJ(script, "telemetry").s, now, daemonBootstrapDeclared(settings))
                 out = append(out, "boot")
+            if op == "sample":
+                c = dcaSample(c, step)
+                out = append(out, "sampled")
             if op == "cycle":
                 c = dcaCycle(c, now, step)
                 out = append(out, daemonStatusJson(c.status))
@@ -352,6 +356,11 @@ app FabricDaemonCases:
                 let published = do daemonControlPublishRouting(answered3.control)
                 c = daemonControlPublishStatus(published.control, now)
                 out = append(out, dcaAnswer(answered3.ok, answered3.message) + "|" + daemonStatusJson(c.status))
+            if op == "migrate":
+                let asked = do daemonControlMigrate(c, ActionTarget{shardId: dcaU(step, "shard"), coordinate: Coordinate{x: dcaU(step, "x"), y: dcaU(step, "y")}}, dcaJ(step, "destination").s)
+                let publishedM = do daemonControlPublishRouting(asked.control)
+                c = daemonControlPublishStatus(publishedM.control, now)
+                out = append(out, dcaAnswer(asked.ok, asked.message) + "|" + daemonStatusJson(c.status))
             if op == "drain":
                 let begun = do daemonControlDrainBegin(c, now)
                 c = begun.control
@@ -397,7 +406,9 @@ app FabricDaemonCases:
             let a = routed.request
             if a.kind == "Abort":
                 asked = "Abort " + sjU64Text(a.id)
-            else:
+            if a.kind == "Migrate":
+                asked = "Migrate " + sjU64Text(a.shard) + " " + a.x + " " + a.y + " " + a.destination
+            if a.kind == "Transfer":
                 let mut resident = "None"
                 if a.hasResident:
                     resident = "Some(" + sjU64Text(a.residentBytes) + ")"
@@ -497,7 +508,9 @@ app FabricDaemonCases:
     # while the test loads it, keeping the hottest profile and stopping once
     # one is hot; then the production optimizer's decision for it, over a
     # topology that places the cell on that instance.
-    # `pressure|hot|cpu|queue|writeLatency|writeRatio|action`.
+    # `pressure|hot|cpu|queue|writeLatency|writeRatio|action|refused` —
+    # refused: the polls FacetQL did not answer (its /stats is exempt from the
+    # admission cap, so none, however saturated).
     proc dcaLoadedCell(base: text, token: text, seconds: int) -> text uses io.net:
         let shard = 9
         let cell = Coordinate{x: 0, y: 0}
@@ -536,7 +549,7 @@ app FabricDaemonCases:
             return "no sample (" + failures + " poll(s) refused)"
         let placed = do topologyRegistryPlace(topologyRegistryNew(), "loaded-instance", shard, cell, "us-east")
         let decision = do workloadOptimizerOptimizeFromTopology(workloadOptimizerDefault(), hottest, placed)
-        return "" + hottest.pressureScore + "|" + workloadProfileIsHot(hottest) + "|" + hottest.cpuUtilization + "|" + hottest.queueDepth + "|" + hottest.writeLatencyUs + "|" + hottest.writeRatio + "|" + decision.action.kind
+        return "" + hottest.pressureScore + "|" + workloadProfileIsHot(hottest) + "|" + hottest.cpuUtilization + "|" + hottest.queueDepth + "|" + hottest.writeLatencyUs + "|" + hottest.writeRatio + "|" + decision.action.kind + "|" + failures
 
     state daemonLoadedOut: text = ""
 

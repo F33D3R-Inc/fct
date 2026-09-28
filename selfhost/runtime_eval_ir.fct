@@ -39,13 +39,33 @@ app RuntimeEvalIR:
         err: text
         # given: the parameters an action's caller actually sent (`given(p)`).
         given: [text]
+        # ixs: the row indexes this evaluation built (rowindex.go) — one
+        # scope's, dropped before any statement that can write rows
+        ixs: [RtRowIx]
+
+    # RtRowIx: rowIndex — one entity's rows (the `n` the scope held when it
+    # was built) by one field: int-like values (an int, or nothing) by
+    # value, every value by its text; a value neither view can stand for is
+    # "loose", always a candidate. Positions ascend in row order.
+    struct RtRowIx:
+        key: text
+        n: int
+        # value → slot in the position lists (a map holds no lists)
+        ints: {text: int}
+        intPos: [[int]]
+        intsLoose: [int]
+        hasInts: bool
+        texts: {text: int}
+        textPos: [[int]]
+        textsLoose: [int]
+        hasTexts: bool
 
     struct RtOut:
         v: Val
         sc: RtScope
 
     proc rtScopeNew() -> RtScope:
-        return RtScope{names: [], vals: [], matOn: false, matPath: "", matKeys: [], matVals: [], unaddressed: 0, err: "", given: []}
+        return RtScope{names: [], vals: [], matOn: false, matPath: "", matKeys: [], matVals: [], unaddressed: 0, err: "", given: [], ixs: []}
 
     proc rtGet(sc: RtScope, name: text) -> Val:
         let v = do lookupRef(name, sc.names, sc.vals)
@@ -483,12 +503,23 @@ app RuntimeEvalIR:
             return ap
         if name == "fromJson":
             let j = do jsonParse(valToStr(a0))
-            let fj = do rtJValToVal(j)
+            let fj = do rtJValFloats(j)
             return fj
         if name == "canonicalJson":
             let cj = do rtCanonicalJSON(a0)
             let cjv = do textVal(cj)
             return cjv
+        if name == "bytes":
+            # bytes(n): an n-length, zero-filled byte buffer — the same list
+            # a literal makes; a byte buffer is an array whose writes are
+            # range-checked, not a runtime kind of its own
+            let mut zs = []
+            let mut zn = do valToInt(a0)
+            loop zn > 0:
+                zs = append(zs, intVal(0))
+                zn = zn - 1
+            let zv = do listVal(zs)
+            return zv
         if name == "textToBytes":
             let bs = textToBytes(valToStr(a0))
             let mut bl2 = []
@@ -605,7 +636,7 @@ app RuntimeEvalIR:
     proc rtValJSONWith(v: Val, html: bool) -> text:
         if v.kind == "text":
             if html:
-                let q = do jsonQuote(v.t)
+                let q = jsonQuote(v.t)
                 return q
             let q2 = do rtPlainQuote(v.t)
             return q2
@@ -643,7 +674,7 @@ app RuntimeEvalIR:
 
     # rtPlainQuote: jsonQuote without the \u003c/\u003e/\u0026 escapes.
     proc rtPlainQuote(s: text) -> text:
-        let q = do jsonQuote(s)
+        let q = jsonQuote(s)
         let a = replace(q, "\\u003c", "<")
         let b = replace(a, "\\u003e", ">")
         let c = replace(b, "\\u0026", "&")
@@ -694,7 +725,7 @@ app RuntimeEvalIR:
         loop i < len(idx):
             if i > 0:
                 out = out + ","
-            let kq = do jsonQuote(keys[idx[i]])
+            let kq = jsonQuote(keys[idx[i]])
             out = out + kq + ":" + raws[idx[i]]
             i = i + 1
         return out + "}"
@@ -702,6 +733,34 @@ app RuntimeEvalIR:
     # rtJValToVal: a parsed JSON value as a runtime value (json.Unmarshal
     # into `any`: every number a float64; a whole one behaves as an int
     # everywhere here, so only a fractional spelling becomes a float).
+    # rtJValFloats: fromJson's decoding — encoding/json into `any`, where
+    # every JSON number is a float64 (3 as well as 3.5), unlike a request's
+    # arguments, which are shaped to their declared types.
+    proc rtJValFloats(j: JVal) -> Val:
+        if j.kind == "num":
+            let fv = do floatVal(toFloat(j.s))
+            return fv
+        if j.kind == "arr":
+            let mut items = []
+            let mut i = 0
+            loop i < len(j.vals):
+                let ev = do rtJValFloats(j.vals[i])
+                items = append(items, ev)
+                i = i + 1
+            let lv = do listVal(items)
+            return lv
+        if j.kind == "obj":
+            let mut vals = []
+            let mut k = 0
+            loop k < len(j.vals):
+                let ov = do rtJValFloats(j.vals[k])
+                vals = append(vals, ov)
+                k = k + 1
+            let rv = do recordVal(j.keys, vals)
+            return rv
+        let other = do rtJValToVal(j)
+        return other
+
     proc rtJValToVal(j: JVal) -> Val:
         if j.kind == "str":
             let tv = do textVal(j.s)
@@ -1049,6 +1108,14 @@ app RuntimeEvalIR:
 
     proc rtProcIndex(name: text) -> int:
         let procs = rtProcTable
+        let idx = rtNames
+        if idx.nProcs == len(procs) && idx.nProcs > 0:
+            if name in idx.procs:
+                let p = idx.procs[name]
+                if procs[p].name == name:
+                    return p
+            else:
+                return -1
         let mut i = 0
         loop i < len(procs):
             if procs[i].name == name:
@@ -1146,7 +1213,7 @@ app RuntimeEvalIR:
         let none = do noneVal()
         return RtCtl{kind: "", v: none, sc: fr}
 
-    proc rtProcStmt(st: IRStmt, fr0: RtScope) -> RtCtl:
+    proc rtProcStmt(st: IRStmt, fr0: RtScope) -> RtCtl uses io.file:
         let mut fr = fr0
         let op = st.op
         if op == "let" || op == "assign":
@@ -1283,11 +1350,137 @@ app RuntimeEvalIR:
                         going = false
             let c6 = do rtCtlNone(fr)
             return c6
-        if op == "spawn" || op == "join" || op == "fileread" || op == "filewrite" || op == "actcall" || op == "call":
+        if op == "spawn":
+            # spawnTask: the child runs on its own; the only thing a caller
+            # can observe of it is what join hands back, so running it to
+            # completion here, before the caller continues, is one of the
+            # schedules Go's goroutine may take. Its failure surfaces at join.
+            let pi = do rtProcIndex(st.service)
+            if pi < 0:
+                let fu = do rtProcFail(fr, "spawn calls unknown proc \"" + st.service + "\"")
+                return fu
+            let sa = do rtEvalList(st.args, fr, -1)
+            fr = sa.sc
+            if fr.err != "":
+                let fs = do rtCtlNone(fr)
+                return fs
+            let child = do rtRunProc(st.service, sa.v.items)
+            let handle = do recordVal(["\x00task", "v", "err"], [boolVal(true), child.v, textVal(child.sc.err)])
+            fr = do rtSet(fr, st.target, handle)
+            let cs = do rtCtlNone(fr)
+            return cs
+        if op == "join":
+            let h = do rtGet(fr, st.target)
+            let isTask = do valHas(h, "\x00task")
+            if h.kind != "record" || !isTask:
+                let fj = do rtProcFail(fr, "\"" + st.target + "\" is not a spawned task handle")
+                return fj
+            let herr = do valToStr(valGet(h, "err"))
+            if herr != "":
+                let fe = do rtProcFail(fr, herr)
+                return fe
+            if st.bind != "":
+                let jv = do rtCoerceRet(valGet(h, "v"), st.ret, st.retList)
+                fr = do rtSet(fr, st.bind, jv)
+            let cj = do rtCtlNone(fr)
+            return cj
+        if op == "fileread":
+            let who = do rtFileOpName(false, st.bytesFlag)
+            let bad = do rtSandboxError(st.path)
+            if bad != "":
+                let fb = do rtProcFail(fr, who + ": " + bad)
+                return fb
+            let there = fileExists(st.path)
+            if !there:
+                let fn = do rtProcFail(fr, who + ": " + rtGoQ(st.path) + " not found")
+                return fn
+            let raw = readFile(st.path)
+            let mut rv = do textVal(raw)
+            if st.bytesFlag:
+                let bs = textToBytes(raw)
+                let mut items = []
+                let mut i = 0
+                loop i < len(bs):
+                    items = append(items, intVal(bs[i]))
+                    i = i + 1
+                rv = do listVal(items)
+            if st.bind != "":
+                fr = do rtSet(fr, st.bind, rv)
+            let cr0 = do rtCtlNone(fr)
+            return cr0
+        if op == "filewrite":
+            let who2 = do rtFileOpName(true, st.bytesFlag)
+            let vr3 = do rtEvalOpt(st.value, fr, -1)
+            fr = vr3.sc
+            if fr.err != "":
+                let fw0 = do rtCtlNone(fr)
+                return fw0
+            let bad2 = do rtSandboxError(st.path)
+            if bad2 != "":
+                let fb2 = do rtProcFail(fr, who2 + ": " + bad2)
+                return fb2
+            let mut content = ""
+            if st.bytesFlag:
+                if vr3.v.kind != "list":
+                    let nb = do rtProcFail(fr, who2 + ": " + rtGoQ(st.path) + ": content is not a byte buffer")
+                    return nb
+                let mut bs2 = []
+                let mut j = 0
+                loop j < len(vr3.v.items):
+                    let b = vr3.v.items[j]
+                    let n = do valToInt(b)
+                    if b.kind != "int" || n < 0 || n > 255:
+                        let ob = do rtProcFail(fr, who2 + ": " + rtGoQ(st.path) + ": byte value out of range (must be 0-255)")
+                        return ob
+                    bs2 = append(bs2, n)
+                    j = j + 1
+                content = bytesToText(bs2)
+            else:
+                content = do valToStr(vr3.v)
+            let wrote = writeFile(st.path, content)
+            if st.bind != "":
+                fr = do rtSet(fr, st.bind, boolVal(wrote))
+            let cw = do rtCtlNone(fr)
+            return cw
+        if op == "actcall" || op == "call":
             let f13 = do rtProcFail(fr, op + " is not available in the self-hosted runtime")
             return f13
         let c7 = do rtCtlNone(fr)
         return c7
+
+    # rtFileOpName: the builtin a file statement's errors are named after
+    # (ioReadFile / ioReadFileBytes / ioWriteFile / ioWriteFileBytes).
+    proc rtFileOpName(write: bool, bytes: bool) -> text:
+        if write && bytes:
+            return "write"
+        if write:
+            return "writeFile"
+        if bytes:
+            return "read"
+        return "readFile"
+
+    # rtSandboxError: resolveDataPath's refusal of a declared (relative)
+    # path — empty, or climbing out of the data directory — else "".
+    proc rtSandboxError(path: text) -> text:
+        if path == "":
+            return "empty file path"
+        let parts = split(path, "/")
+        let mut depth = 0
+        let mut i = 0
+        loop i < len(parts):
+            if parts[i] == "..":
+                depth = depth - 1
+                if depth < 0:
+                    return "path " + rtGoQ(path) + " escapes the sandboxed data directory"
+            else:
+                if parts[i] != "" && parts[i] != ".":
+                    depth = depth + 1
+            i = i + 1
+        return ""
+
+    # rtGoQ: %q of a path.
+    proc rtGoQ(s: text) -> text:
+        return "\"" + replace(replace(s, "\\", "\\\\"), "\"", "\\\"") + "\""
 
     # rtCoerceRet: coerceRet — a `do`'s declared return type applied to
     # what the proc handed back (a list wrapped when one was declared).
@@ -1343,9 +1536,15 @@ app RuntimeEvalIR:
             let kb = base + 1
             let kr = do rtEvalOpt(e.key, sc, kb)
             sc = kr.sc
+            # by id through the scope's index of the rows' ids
+            let mut cands = rows.items
+            let byId = do rtIndexedRows(sc, e.name, "id", rows.items, kr.v, false)
+            sc = byId.sc
+            if byId.ok:
+                cands = byId.rows
             let mut i = 0
-            loop i < len(rows.items):
-                let m = rows.items[i]
+            loop i < len(cands):
+                let m = cands[i]
                 if m.kind == "record":
                     let id = do valGet(m, "id")
                     let same = do valEqual(id, kr.v)
@@ -1385,16 +1584,57 @@ app RuntimeEvalIR:
                 sc = do rtFoldOuter(policy[0], iv, sc, -1)
             if len(e.where) > 0:
                 sc = do rtFoldOuter(e.where[0], iv, sc, wb)
-        if len(policy) > 0:
-            let pr0 = do rtFilterRows(kept, pv, policy[0], sc, -1)
-            sc = pr0.sc
-            kept = pr0.v.items
-        if len(e.where) > 0:
-            let fr = do rtFilterRows(kept, e.itemVar, e.where[0], sc, wb)
-            sc = fr.sc
-            kept = fr.v.items
         let sb = do rtBaseAfter(wb, e.where)
         let lb = do rtBaseAfter(sb, e.sel)
+        let mut presorted = false
+        if len(e.where) > 0:
+            # a predicate pinning a field to a value tests only the rows an
+            # index of that field names for it — the same predicate, on
+            # fewer rows (the probe evaluated unaddressed, as per row)
+            let pin = do rtPinnedEquality(e.where[0], e.itemVar)
+            if pin.ok:
+                sc.unaddressed = sc.unaddressed + 1
+                let pvr = do rtEval(pin.probe, sc, -1)
+                sc = pvr.sc
+                sc.unaddressed = sc.unaddressed - 1
+                let ixr = do rtIndexedRows(sc, e.name, pin.field, kept, pvr.v, pin.isIn)
+                sc = ixr.sc
+                if ixr.ok:
+                    kept = ixr.rows
+            # how many kept rows the answer can use: `exists` one; a capped
+            # list, once its rows are in answer order, `limit`
+            let mut need = -1
+            if e.op == "exists":
+                need = 1
+            if e.op == "list" && len(e.limit) > 0:
+                let lr0 = do rtEval(e.limit[0], sc, lb)
+                sc = lr0.sc
+                let lim0 = do valToInt(lr0.v)
+                if lim0 >= 0:
+                    let ps = do rtSortedForEarlyStop(e, kept)
+                    if ps.ok:
+                        kept = ps.rows
+                        need = lim0
+                        presorted = true
+            if len(policy) > 0 && need >= 0:
+                # both filters per row, so the count stops on rows that pass both
+                let both = do irBin("&&", policy[0], e.where[0])
+                let fb = do rtFilterRowsUntil(kept, pv, both, sc, -1, need)
+                sc = fb.sc
+                kept = fb.v.items
+            else:
+                if len(policy) > 0:
+                    let pr0 = do rtFilterRows(kept, pv, policy[0], sc, -1)
+                    sc = pr0.sc
+                    kept = pr0.v.items
+                let fr = do rtFilterRowsUntil(kept, e.itemVar, e.where[0], sc, wb, need)
+                sc = fr.sc
+                kept = fr.v.items
+        else:
+            if len(policy) > 0:
+                let pr1 = do rtFilterRows(kept, pv, policy[0], sc, -1)
+                sc = pr1.sc
+                kept = pr1.v.items
         if e.op == "exists":
             let ex = do boolVal(len(kept) > 0)
             return RtOut{v: ex, sc: sc}
@@ -1403,13 +1643,16 @@ app RuntimeEvalIR:
             return RtOut{v: cv, sc: sc}
         if e.op == "list":
             let mut ordered = kept
-            if len(e.orderBy) > 0:
-                let ob = do rtSortRowsBy(kept, e.itemVar, e.orderBy[0], e.desc, sc)
-                ordered = ob
+            if presorted:
+                ordered = kept
             else:
-                let os = do rtSortRows(kept, e.order, e.desc)
-                ordered = os
-            if len(e.limit) > 0:
+                if len(e.orderBy) > 0:
+                    let ob = do rtSortRowsBy(kept, e.itemVar, e.orderBy[0], e.desc, sc)
+                    ordered = ob
+                else:
+                    let os = do rtSortRows(kept, e.order, e.desc)
+                    ordered = os
+            if len(e.limit) > 0 && !presorted:
                 let lr = do rtEval(e.limit[0], sc, lb)
                 sc = lr.sc
                 let lim = do valToInt(lr.v)
@@ -1471,6 +1714,261 @@ app RuntimeEvalIR:
             return s1
         let s2 = do rtDrop(sc0, name)
         return s2
+
+    # ── row indexes (rowindex.go) ──────────────────────────────────────
+    # rtIntLike: intLike — a value equal compares as an integer.
+    proc rtIntLike(v: Val) -> bool:
+        return v.kind == "int" || v.kind == "none"
+
+    proc rtRowIxAt(sc: RtScope, key: text, n: int) -> int:
+        let mut i = 0
+        loop i < len(sc.ixs):
+            if sc.ixs[i].key == key && sc.ixs[i].n == n:
+                return i
+            i = i + 1
+        return -1
+
+    # rtRowIxBuild: both views over rows; hasInts/hasTexts false when a row
+    # is not a record (a list cell's values are not indexed).
+    proc rtRowIxBuild(key: text, rows: [Val], field: text) -> RtRowIx:
+        let mut ints = {}
+        let mut texts = {}
+        let mut ip = []
+        let mut tp = []
+        let mut il = []
+        let mut tl = []
+        let mut i = 0
+        loop i < len(rows):
+            let r = rows[i]
+            if r.kind != "record":
+                return RtRowIx{key: key, n: len(rows), ints: {}, intPos: [], intsLoose: [], hasInts: false, texts: {}, textPos: [], textsLoose: [], hasTexts: false}
+            let v = do valGet(r, field)
+            if v.kind == "int" || v.kind == "none":
+                let k = "" + valToInt(v)
+                if k in ints:
+                    let at = ints[k]
+                    ip[at] = append(ip[at], i)
+                else:
+                    ints[k] = len(ip)
+                    ip = append(ip, [i])
+            else:
+                il = append(il, i)
+            if v.kind == "list":
+                tl = append(tl, i)
+            else:
+                let t = do valToStr(v)
+                if t in texts:
+                    let at2 = texts[t]
+                    tp[at2] = append(tp[at2], i)
+                else:
+                    texts[t] = len(tp)
+                    tp = append(tp, [i])
+            i = i + 1
+        return RtRowIx{key: key, n: len(rows), ints: ints, intPos: ip, intsLoose: il, hasInts: true, texts: texts, textPos: tp, textsLoose: tl, hasTexts: true}
+
+    # rtMergePos: two ascending position lists as one, each position once.
+    proc rtMergePos(a: [int], b: [int]) -> [int]:
+        let mut out = []
+        let mut i = 0
+        let mut j = 0
+        loop i < len(a) || j < len(b):
+            if j >= len(b) || (i < len(a) && a[i] < b[j]):
+                out = append(out, a[i])
+                i = i + 1
+            else:
+                if i < len(a) && a[i] == b[j]:
+                    i = i + 1
+                out = append(out, b[j])
+                j = j + 1
+        return out
+
+    struct RtIxRows:
+        ok: bool
+        rows: [Val]
+        sc: RtScope
+
+    # rtIndexedRows: indexedRows / indexedRowsIn — the rows of entity that
+    # can satisfy `row.field == probe` (or `in` a list of probes), in row
+    # order; ok false when a scan must answer (under 64 rows, or a probe no
+    # view stands for).
+    proc rtIndexedRows(sc0: RtScope, entity: text, field: text, rows: [Val], probe: Val, isIn: bool) -> RtIxRows:
+        let mut sc = sc0
+        if len(rows) < 64:
+            return RtIxRows{ok: false, rows: [], sc: sc}
+        let mut probes = [probe]
+        if isIn:
+            if probe.kind != "list":
+                return RtIxRows{ok: false, rows: [], sc: sc}
+            probes = probe.items
+        let key = entity + "\x00" + field
+        let mut at = do rtRowIxAt(sc, key, len(rows))
+        if at < 0:
+            let built = do rtRowIxBuild(key, rows, field)
+            sc.ixs = append(sc.ixs, built)
+            at = len(sc.ixs) - 1
+        let ix = sc.ixs[at]
+        let mut pos = []
+        let mut p = 0
+        loop p < len(probes):
+            let v = probes[p]
+            let il = do rtIntLike(v)
+            if il:
+                if !ix.hasInts:
+                    return RtIxRows{ok: false, rows: [], sc: sc}
+                let k = "" + valToInt(v)
+                let mut exact = []
+                if k in ix.ints:
+                    exact = ix.intPos[ix.ints[k]]
+                pos = do rtMergePos(pos, rtMergePos(exact, ix.intsLoose))
+            else:
+                if v.kind != "text" || !ix.hasTexts:
+                    return RtIxRows{ok: false, rows: [], sc: sc}
+                let mut exact2 = []
+                if v.t in ix.texts:
+                    exact2 = ix.textPos[ix.texts[v.t]]
+                pos = do rtMergePos(pos, rtMergePos(exact2, ix.textsLoose))
+            p = p + 1
+        let mut out = []
+        let mut q = 0
+        loop q < len(pos):
+            out = append(out, rows[pos[q]])
+            q = q + 1
+        return RtIxRows{ok: true, rows: out, sc: sc}
+
+    # rtItemField: `v.f`, a stored field of the item itself ("" if not).
+    proc rtItemField(e: IRExpr, v: text) -> text:
+        if e.kind == "get" && e.field != "" && len(e.obj) > 0 && e.obj[0].kind == "ref" && e.obj[0].name == v:
+            return e.field
+        return ""
+
+    # rtProbeExpr: probeExpr — plain, and independent of the item.
+    proc rtProbeExpr(e: IRExpr, v: text) -> bool:
+        if e.kind == "lit":
+            return true
+        if e.kind == "ref":
+            return e.name != v
+        if e.kind == "get":
+            if len(e.obj) == 0:
+                return false
+            let o = do rtProbeExpr(e.obj[0], v)
+            return o
+        if e.kind == "un":
+            if len(e.x) == 0:
+                return false
+            let x = do rtProbeExpr(e.x[0], v)
+            return x
+        if e.kind == "bin":
+            if len(e.l) == 0 || len(e.r) == 0:
+                return false
+            let l = do rtProbeExpr(e.l[0], v)
+            let r = do rtProbeExpr(e.r[0], v)
+            return l && r
+        if e.kind == "eget":
+            if len(e.key) == 0:
+                return false
+            let k = do rtProbeExpr(e.key[0], v)
+            return k
+        if e.kind == "list" || (e.kind == "call" && e.name in ["toInt", "toStr", "lower", "upper", "trim"]):
+            let mut i = 0
+            loop i < len(e.args):
+                let a = do rtProbeExpr(e.args[i], v)
+                if !a:
+                    return false
+                i = i + 1
+            return true
+        return false
+
+    # RtPinned: pinnedEquality — the first top-level conjunct pinning a
+    # field: `v.f == e`, `e == v.f`, or `v.f in e`.
+    struct RtPinned:
+        ok: bool
+        field: text
+        probe: IRExpr
+        isIn: bool
+
+    proc rtPinnedEquality(w: IRExpr, v: text) -> RtPinned:
+        let none = RtPinned{ok: false, field: "", probe: w, isIn: false}
+        if v == "" || w.kind != "bin" || len(w.l) == 0 || len(w.r) == 0:
+            return none
+        if w.op == "&&":
+            let a = do rtPinnedEquality(w.l[0], v)
+            if a.ok:
+                return a
+            let b = do rtPinnedEquality(w.r[0], v)
+            return b
+        if w.op == "==":
+            let lf = do rtItemField(w.l[0], v)
+            let rp = do rtProbeExpr(w.r[0], v)
+            if lf != "" && rp:
+                return RtPinned{ok: true, field: lf, probe: w.r[0], isIn: false}
+            let rf = do rtItemField(w.r[0], v)
+            let lp = do rtProbeExpr(w.l[0], v)
+            if rf != "" && lp:
+                return RtPinned{ok: true, field: rf, probe: w.l[0], isIn: false}
+        if w.op == "in":
+            let lf2 = do rtItemField(w.l[0], v)
+            let rp2 = do rtProbeExpr(w.r[0], v)
+            if lf2 != "" && rp2:
+                return RtPinned{ok: true, field: lf2, probe: w.r[0], isIn: true}
+        return none
+
+    # rtSortedForEarlyStop: sortedForEarlyStop — a capped list's rows put in
+    # answer order before filtering, when its order is a plain field whose
+    # values are all numbers or all text.
+    struct RtPresorted:
+        ok: bool
+        rows: [Val]
+
+    proc rtSortedForEarlyStop(e: IRExpr, rows: [Val]) -> RtPresorted:
+        let mut field = e.order
+        if len(e.orderBy) > 0:
+            field = do rtItemField(e.orderBy[0], e.itemVar)
+            if field == "":
+                return RtPresorted{ok: false, rows: []}
+        if field == "":
+            return RtPresorted{ok: true, rows: rows}
+        let mut nums = 0
+        let mut texts = 0
+        let mut i = 0
+        loop i < len(rows):
+            if rows[i].kind != "record":
+                return RtPresorted{ok: false, rows: []}
+            let v = do valGet(rows[i], field)
+            if v.kind == "int" || v.kind == "float":
+                nums = nums + 1
+            else:
+                if v.kind == "text":
+                    texts = texts + 1
+                else:
+                    return RtPresorted{ok: false, rows: []}
+            i = i + 1
+        if nums > 0 && texts > 0:
+            return RtPresorted{ok: false, rows: []}
+        let sorted = do rtSortRows(rows, field, e.desc)
+        return RtPresorted{ok: true, rows: sorted}
+
+    # rtFilterRowsUntil: rtFilterRows stopping once `need` rows are kept
+    # (need < 0: all of them).
+    proc rtFilterRowsUntil(rows: [Val], itemVar: text, where: IRExpr, sc0: RtScope, base: int, need: int) -> RtOut:
+        let mut sc = sc0
+        let prev = do rtGet(sc, itemVar)
+        let had = do rtHas(sc, itemVar)
+        let mut kept = []
+        let mut i = 0
+        loop i < len(rows) && (need < 0 || len(kept) < need):
+            if rows[i].kind == "record":
+                sc = do rtSet(sc, itemVar, rows[i])
+                sc.unaddressed = sc.unaddressed + 1
+                let pr = do rtEval(where, sc, base)
+                sc = pr.sc
+                sc.unaddressed = sc.unaddressed - 1
+                let ok = do valTruthy(pr.v)
+                if ok:
+                    kept = append(kept, rows[i])
+            i = i + 1
+        sc = do rtRestore(sc, itemVar, had, prev)
+        let lv = do listVal(kept)
+        return RtOut{v: lv, sc: sc}
 
     # rtFilterRows: the rows a predicate accepts with the item variable bound
     # to each — evalRowPredicate: the materializer is suspended per row.
@@ -1589,11 +2087,18 @@ app RuntimeEvalIR:
         return tv
 
     # ── ordering ─────────────────────────────────────────────────────────
-    # rtLess: lessVal — two numbers compare as ints, anything else as text.
+    # rtLess: lessVal — two ints compare as ints, a float on either side as
+    # floats, anything else as text.
     proc rtLess(a: Val, b: Val) -> bool:
         let an = a.kind == "int" || a.kind == "float"
         let bn = b.kind == "int" || b.kind == "float"
         if an && bn:
+            # two ints compare as ints; a float on either side compares as
+            # floats (lessVal), so 0.1 < 0.9 though both truncate to 0
+            if a.kind == "float" || b.kind == "float":
+                let fa = do valToFloat(a)
+                let fb = do valToFloat(b)
+                return fa < fb
             let x = do valToInt(a)
             let y = do valToInt(b)
             return x < y

@@ -11,9 +11,11 @@ package selfhost
 // covers the whole programs the language's newest forms land in first
 // (`shared` cells, `detach` and the daemon-context procs it makes, nested
 // field/index writes, `proc main`), so a form the driver has not been
-// ported to fails here the day a program uses it. The same rule as the
-// inline sweep: the same whole IR when the real compiler accepts the
-// program, a refusal when it refuses it. driverFileSweepUnported may name
+// ported to fails here the day a program uses it. When the real compiler
+// accepts the program the driver's IR must be json.Marshal's bytes exactly
+// (every number and string spelled as encoding/json spells it); when it
+// refuses it, the driver must refuse it with the same text, compile.File's
+// `file: line N: …` included. driverFileSweepUnported may name
 // programs the driver knowingly does not match yet; it can only shrink.
 
 import (
@@ -77,20 +79,35 @@ func TestDriverFileSweep(t *testing.T) {
 			defer wg.Done()
 			for f := range jobs {
 				g, werr := compile.File(f)
-				got, gerr := driverGot(t, ts, root, f)
+				raw := driverGotRaw(t, ts, root, f)
+				var b []byte
+				if werr == nil {
+					b, _ = json.Marshal(g)
+				}
 				problem := ""
-				switch {
-				case werr != nil && gerr == "":
-					problem = fmt.Sprintf("the real compiler refuses it (%v) but the driver accepts it — a check is not ported", werr)
-				case werr != nil:
-				case gerr != "":
-					problem = "the real compiler accepts it but the driver refuses it: " + strings.TrimPrefix(gerr, "driver refused the program: ")
-				default:
-					b, _ := json.Marshal(g)
-					var want map[string]interface{}
-					json.Unmarshal(b, &want)
-					if d := driverDiff(want, got); d != "" {
-						problem = "the driver's IR differs from the real compiler's — not ported:\n" + d
+				// the IR must be the real compiler's json.Marshal bytes; a
+				// mismatch is decoded and diffed to say where it differs
+				if werr != nil || raw != string(b) {
+					got, gerr := driverDecodeRaw(raw)
+					switch {
+					case werr != nil && gerr == "":
+						problem = fmt.Sprintf("the real compiler refuses it (%v) but the driver accepts it — a check is not ported", werr)
+					case werr != nil:
+						// both refuse: with the same words, `file: line N:`
+						// included, as compile.File's error spells them
+						if got := strings.TrimPrefix(gerr, "driver refused the program: "); got != werr.Error() {
+							problem = fmt.Sprintf("both refuse it, but in different words:\n want %s\n got  %s", werr.Error(), got)
+						}
+					case gerr != "":
+						problem = "the real compiler accepts it but the driver refuses it: " + strings.TrimPrefix(gerr, "driver refused the program: ")
+					default:
+						var want map[string]interface{}
+						json.Unmarshal(b, &want)
+						if d := driverDiff(want, got); d != "" {
+							problem = "the driver's IR differs from the real compiler's — not ported:\n" + d
+						} else {
+							problem = "the same IR spelled differently — " + driverByteDiff(string(b), raw)
+						}
 					}
 				}
 				results <- result{f, problem}
@@ -127,5 +144,29 @@ func TestDriverFileSweep(t *testing.T) {
 			t.Errorf("driverFileSweepUnported names %s, which no longer exists — remove it", f)
 		}
 	}
-	t.Logf("%d programs: %d match", len(files), matched)
+	t.Logf("%d programs: %d match, byte for byte", len(files), matched)
+}
+
+// driverByteDiff names the first byte where the driver's IR text departs
+// from json.Marshal's (a number or string spelled another way), with context.
+func driverByteDiff(want, got string) string {
+	i := 0
+	for i < len(want) && i < len(got) && want[i] == got[i] {
+		i++
+	}
+	from := i - 80
+	if from < 0 {
+		from = 0
+	}
+	clip := func(s string) string {
+		end := i + 80
+		if end > len(s) {
+			end = len(s)
+		}
+		if from > len(s) {
+			return ""
+		}
+		return s[from:end]
+	}
+	return fmt.Sprintf("first difference at byte %d:\n want …%s…\n got  …%s…", i, clip(want), clip(got))
 }

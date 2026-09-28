@@ -49,6 +49,11 @@ app FabricDaemonAdminSelfHost:
         bytesCopied: int
         hasResident: bool
         residentBytes: int
+        # "Migrate" (POST /actions): the cell and the node asked to take it.
+        shard: int
+        x: int
+        y: int
+        destination: text
 
     struct DaemonAdminOutcome:
         ask: bool
@@ -62,7 +67,7 @@ app FabricDaemonAdminSelfHost:
         return DaemonAdminResponse{status: 200, contentType: "application/json", allow: "-", body: body}
 
     proc dadNoAsk() -> DaemonControlAsk:
-        return DaemonControlAsk{kind: "", id: 0, atomsCopied: 0, bytesCopied: 0, hasResident: false, residentBytes: 0}
+        return DaemonControlAsk{kind: "", id: 0, atomsCopied: 0, bytesCopied: 0, hasResident: false, residentBytes: 0, shard: 0, x: 0, y: 0, destination: ""}
 
     proc dadAnswered(r: DaemonAdminResponse) -> DaemonAdminOutcome:
         return DaemonAdminOutcome{ask: false, request: dadNoAsk(), response: r}
@@ -168,6 +173,10 @@ app FabricDaemonAdminSelfHost:
     proc daemonTransferReportTypes() -> [SjType]:
         return [sjOptionType("Option<u64>", "u64"), sjStructTypeDeny("TransferReport", "struct TransferReport", ["atoms_copied", "bytes_copied", "resident_bytes"], ["usize", "u64", "Option<u64>"], [true, false, true])]
 
+    # admin.rs MigrateRequest: `POST /actions`, serde's deny_unknown_fields.
+    proc daemonMigrateRequestTypes() -> [SjType]:
+        return [sjStructTypeDeny("MigrateRequest", "struct MigrateRequest", ["shard", "x", "y", "destination"], ["u64", "u8", "u8", "string"], [false, false, false, false])]
+
     proc dadIsGetRoute(path: text) -> bool:
         return path == "/status" || path == "/fleet" || path == "/placements" || path == "/routing" || path == "/actions" || path == "/actions/history"
 
@@ -203,9 +212,23 @@ app FabricDaemonAdminSelfHost:
                 return dadAnswered(dadMethodNotAllowed("GET,HEAD"))
             return dadAnswered(dadWithoutBody(dadText(200, "ok\n"), req.method))
         let getRoute = do dadIsGetRoute(path)
+        # `/actions` also takes POST: an operator asking for a move
+        # (`get(actions).post(migrate)`).
+        if path == "/actions" && req.method == "POST":
+            let authorizedM = do daemonAuthorized(dadApiKey(req.headers), token)
+            if !authorizedM:
+                return dadAnswered(dadUnauthorized())
+            let asked = do sjDecode(daemonMigrateRequestTypes(), req.body, "MigrateRequest")
+            if !asked.ok:
+                return dadAnswered(dadText(400, "fabricd: " + asked.err + "\n"))
+            let mv = asked.v
+            return DaemonAdminOutcome{ask: true, request: DaemonControlAsk{kind: "Migrate", id: 0, atomsCopied: 0, bytesCopied: 0, hasResident: false, residentBytes: 0, shard: mv.items[0].u, x: mv.items[1].u, y: mv.items[2].u, destination: mv.items[3].s}, response: dadText(0, "")}
         if getRoute:
             if !isGet:
-                return dadAnswered(dadMethodNotAllowed("GET,HEAD"))
+                let mut allow = "GET,HEAD"
+                if path == "/actions":
+                    allow = "GET,HEAD,POST"
+                return dadAnswered(dadMethodNotAllowed(allow))
             let authorized = do daemonAuthorized(dadApiKey(req.headers), token)
             if !authorized:
                 return dadAnswered(dadWithoutBody(dadUnauthorized(), req.method))
@@ -224,7 +247,7 @@ app FabricDaemonAdminSelfHost:
         if !authorized2:
             return dadAnswered(dadUnauthorized())
         if segments[3] == "abort":
-            return DaemonAdminOutcome{ask: true, request: DaemonControlAsk{kind: "Abort", id: id.id, atomsCopied: 0, bytesCopied: 0, hasResident: false, residentBytes: 0}, response: dadText(0, "")}
+            return DaemonAdminOutcome{ask: true, request: DaemonControlAsk{kind: "Abort", id: id.id, atomsCopied: 0, bytesCopied: 0, hasResident: false, residentBytes: 0, shard: 0, x: 0, y: 0, destination: ""}, response: dadText(0, "")}
         let parsed = do sjDecode(daemonTransferReportTypes(), req.body, "TransferReport")
         if !parsed.ok:
             return dadAnswered(dadText(400, "fabricd: " + parsed.err + "\n"))
@@ -235,7 +258,7 @@ app FabricDaemonAdminSelfHost:
         if sjU64Gt(atoms, 1):
             atoms = 1
         let resident = v.items[2]
-        return DaemonAdminOutcome{ask: true, request: DaemonControlAsk{kind: "Transfer", id: id.id, atomsCopied: atoms, bytesCopied: v.items[1].u, hasResident: resident.kind == "num", residentBytes: resident.u}, response: dadText(0, "")}
+        return DaemonAdminOutcome{ask: true, request: DaemonControlAsk{kind: "Transfer", id: id.id, atomsCopied: atoms, bytesCopied: v.items[1].u, hasResident: resident.kind == "num", residentBytes: resident.u, shard: 0, x: 0, y: 0, destination: ""}, response: dadText(0, "")}
 
     # `ask`'s response for the loop's reply: kind "ok" (200, the message),
     # "err" (409, a refusal is the control plane declining, not a bad

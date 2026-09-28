@@ -11,9 +11,14 @@ app FabricDaemonControlSelfHost:
     #
     # Every step of `ControlPlane::cycle` is its own proc, in the Rust
     # order: tick the clock; probe (when due) and file what the probes
-    # found; poll telemetry (when due) and ingest it; decide (unless
+    # found; decide (unless
     # draining); advance every action; drive the movers; measure; publish
-    # routing; persist; count the cycle; publish the status. The steps that
+    # routing; persist; count the cycle; publish the status. Telemetry is
+    # not a step of the cycle: a pump samples it beside the loop and each
+    # finished sample is ingested the moment it arrives
+    # (`daemonControlApplySample`), so a slow /stats never holds a probe
+    # back nor carries the clock past probes that waited for it — which is
+    # how one slow read once made every live node look lost. The steps that
     # touch the outside world take its answers as arguments (a sweep's
     # probes, a sample) or say what it must do (the copies to start, the
     # routing table to hand the front door), and `daemonControlCycle` is the
@@ -59,7 +64,6 @@ app FabricDaemonControlSelfHost:
         cycles: int
         draining: bool
         nextProbeMs: int
-        nextPollMs: int
         decisions: DaemonDecisionCounters
         probeIds: [text]
         probeVerdicts: [text]
@@ -151,7 +155,7 @@ app FabricDaemonControlSelfHost:
         rt = fabricRuntimeAdoptTopology(rt, boot.topology)
         let routing = do placementFabricRouting(fabricRuntimePlacement(rt))
         let status = do daemonStartingStatus(settings, daemonAddrText(settings.dataListen), daemonAddrText(settings.adminListen), startedAtMs)
-        return DaemonControl{settings: settings, runtime: rt, telemetrySource: telemetrySource, hasStore: boot.hasStore, store: boot.store, versions: boot.versions, storeState: boot.state, hasStoreError: false, storeError: "", storeWrites: 0, movers: daemonMoversNew(), acceptedIds: [], acceptedCounts: [], publishedGeneration: 0, doorRouting: routing, startedAtMs: startedAtMs, cycles: 0, draining: false, nextProbeMs: 0, nextPollMs: 0, decisions: daemonDecisionCountersDefault(), probeIds: [], probeVerdicts: [], probeAts: [], sampleIds: [], sampleNotes: [], status: status}
+        return DaemonControl{settings: settings, runtime: rt, telemetrySource: telemetrySource, hasStore: boot.hasStore, store: boot.store, versions: boot.versions, storeState: boot.state, hasStoreError: false, storeError: "", storeWrites: 0, movers: daemonMoversNew(), acceptedIds: [], acceptedCounts: [], publishedGeneration: 0, doorRouting: routing, startedAtMs: startedAtMs, cycles: 0, draining: false, nextProbeMs: 0, decisions: daemonDecisionCountersDefault(), probeIds: [], probeVerdicts: [], probeAts: [], sampleIds: [], sampleNotes: [], status: status}
 
     # ------------------------------------------------------------ the cycle's steps
 
@@ -163,9 +167,6 @@ app FabricDaemonControlSelfHost:
 
     proc daemonControlProbeDue(c: DaemonControl, nowMs: int) -> bool:
         return !sjU64Gt(c.nextProbeMs, nowMs)
-
-    proc daemonControlPollDue(c: DaemonControl, nowMs: int) -> bool:
-        return !sjU64Gt(c.nextPollMs, nowMs)
 
     proc daemonControlProbeTargets(c: DaemonControl) -> [DaemonProbeTarget]:
         let mut out = []
@@ -214,9 +215,9 @@ app FabricDaemonControlSelfHost:
         out.nextProbeMs = nowMs + c.settings.cadence.livenessProbeMs
         return out
 
-    # `poll`: the source's notes for the status page, its messages into the
-    # runtime; the next poll is due one interval on.
-    proc daemonControlApplySample(c: DaemonControl, nowMs: int, sample: DaemonSample) -> DaemonControl:
+    # `ingest`: a sample the pump finished — the source's notes for the
+    # status page, its messages into the runtime.
+    proc daemonControlApplySample(c: DaemonControl, sample: DaemonSample) -> DaemonControl:
         let mut out = c
         let n = len(sample.noteIds)
         let mut k = 0
@@ -236,7 +237,6 @@ app FabricDaemonControlSelfHost:
             let handled = do fabricRuntimeHandle(out.runtime, sample.messages[j])
             out.runtime = handled.runtime
             j = j + 1
-        out.nextPollMs = nowMs + c.settings.cadence.telemetryPollMs
         return out
 
     proc dcoSameTarget(a: ActionTarget, b: ActionTarget) -> bool:
@@ -806,6 +806,33 @@ app FabricDaemonControlSelfHost:
         if !aborted.known:
             return dcoAnswer(out, false, "no action " + shown)
         return dcoAnswer(out, true, shown + ": " + executionStateLabel(aborted.execState))
+
+    # `migrate`: an operator's move — `destination` takes over `target`,
+    # through the same controller, mechanism, mover and cutover as a move
+    # the loop decided on. Asked at the runtime's own clock against the
+    # fleet as the runtime sees it; its baseline is the cell's current
+    # profile, or a profile of no evidence for a cell no telemetry has
+    # described. (The caller publishes routing and status, as `serve` does.)
+    proc daemonControlMigrate(c: DaemonControl, target: ActionTarget, destination: text) -> DaemonAnswer:
+        if c.draining:
+            return dcoAnswer(c, false, "fabricd is draining: it admits no new action")
+        let profiles = do workloadAnalyzerProfiles(c.runtime.analyzer)
+        let mut baseline = workloadProfileFromMetrics(target.shardId, target.coordinate, workloadMetricsDefault())
+        let mut found = false
+        let mut i = 0
+        loop i < len(profiles) && !found:
+            if profiles[i].shardId == target.shardId && profiles[i].coordinate.x == target.coordinate.x && profiles[i].coordinate.y == target.coordinate.y:
+                baseline = profiles[i]
+                found = true
+            i = i + 1
+        let action = do optimizationActionMove(destination)
+        let envelope = do decisionEnvelopeRequestedByOperator(target, action, fabricRuntimeClockMs(c.runtime), fleetViewGeneration(fabricRuntimeFleetView(c.runtime)))
+        let submitted = do fabricRuntimeSubmit(c.runtime, envelope, baseline)
+        let mut out = c
+        out.runtime = submitted.runtime
+        if !submitted.ok:
+            return dcoAnswer(out, false, validationErrorDisplay(submitted.err))
+        return dcoAnswer(out, true, actionIdDisplay(submitted.id) + ": admitted, move " + actionTargetDisplay(target) + " to '" + destination + "'")
 
     # `serve` for a transfer or copy report that was accepted: applied at
     # once — the advance it allows, the routing it moves, the status. (The

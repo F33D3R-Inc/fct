@@ -43,6 +43,7 @@ package runtime
 // the compiler's type system (see internal/ir/build.go's inferProcType,
 // "listen"/"accept" cases).
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -469,6 +470,12 @@ func (s *Server) ioWriteBytes(id int, data any) (any, error) {
 // and drops it from the registry. Closing an already-closed (or unknown)
 // handle is a clean error, not a panic, matching every other builtin's
 // bad-input contract in this codebase.
+//
+// A close whose goodbye cannot be delivered — a TLS close_notify, or a
+// flush, to a peer that has already gone — still closes: the descriptor is
+// released and the handle is gone, so it answers false (like a writeBytes
+// that did not reach the peer) rather than failing the caller. A task
+// tidying up after a vanished client must be able to finish tidying up.
 func (s *Server) ioCloseConn(id int) (any, error) {
 	r := s.netConns
 	r.mu.Lock()
@@ -484,7 +491,7 @@ func (s *Server) ioCloseConn(id int) (any, error) {
 		return true, nil
 	}
 	if err := nc.c.Close(); err != nil {
-		return nil, fmt.Errorf("closeConn: %v", err)
+		return false, nil
 	}
 	return true, nil
 }
@@ -590,6 +597,43 @@ func (s *Server) ioShutdownConn(id int) (any, error) {
 	return true, nil
 }
 
+// ioCloseWrite implements `closeWrite(c: int) -> bool`: ends c's send side
+// while its read side stays open — a TCP half-close (FIN), after a TLS
+// connection's close_notify — so a peer reading to end-of-stream sees it
+// now instead of waiting on a close that has not happened. A server that
+// refuses a request writes its answer, closes its send side, and drains
+// what the client was still sending before it closes, as hyper does. A peer
+// that is already gone makes this false, never an error: there is nothing
+// left to tell it.
+func (s *Server) ioCloseWrite(id int) (any, error) {
+	nc, err := s.lookupConn(id, "closeWrite")
+	if err != nil {
+		return nil, err
+	}
+	if nc.c == nil {
+		return false, nil
+	}
+	var tcp *net.TCPConn
+	switch c := nc.c.(type) {
+	case *net.TCPConn:
+		tcp = c
+	case *tls.Conn:
+		// close_notify first: the TLS layer's own end of stream, which a
+		// TLS peer must see before the transport's.
+		if err := c.CloseWrite(); err != nil {
+			return false, nil
+		}
+		tcp, _ = c.NetConn().(*net.TCPConn)
+	}
+	if tcp == nil {
+		return false, nil
+	}
+	if err := tcp.CloseWrite(); err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
 // lookupConn resolves a connection handle for readBytes/writeBytes, or a
 // clean error naming what's actually wrong (an unknown handle, or one that
 // names a listener rather than a connection — an easy mistake to make since
@@ -621,4 +665,29 @@ func (s *Server) ioConnPeer(id int) (any, error) {
 		return "", nil
 	}
 	return nc.c.RemoteAddr().String(), nil
+}
+
+// closeAll closes every listener and connection (haltProgram): a blocked
+// accept or read returns its error.
+func (r *netRegistry) closeAll() {
+	r.mu.Lock()
+	var lns []net.Listener
+	var cs []net.Conn
+	for _, l := range r.listeners {
+		if l.ln != nil {
+			lns = append(lns, l.ln)
+		}
+	}
+	for _, c := range r.conns {
+		if c.c != nil {
+			cs = append(cs, c.c)
+		}
+	}
+	r.mu.Unlock()
+	for _, l := range lns {
+		l.Close()
+	}
+	for _, c := range cs {
+		c.Close()
+	}
 }

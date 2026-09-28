@@ -137,6 +137,20 @@ func safeExt(filename string) string {
 	return ext
 }
 
+// uploadBytes is the content of a stored upload (the value a `bytes`
+// parameter holds, "/uploads/<name>"), an empty buffer when it is not one.
+func (s *Server) uploadBytes(ref string) any {
+	durable, ok := mediaDurableRef(ref)
+	if !ok {
+		return byteBuf(nil)
+	}
+	b, err := os.ReadFile(filepath.Join(s.uploadDir, strings.TrimPrefix(durable, mediaPathPrefix)))
+	if err != nil {
+		return byteBuf(nil)
+	}
+	return byteBuf(b)
+}
+
 // fileDigest is the hex sha256 of a stored upload's content (the value a
 // `bytes` parameter holds, "/uploads/<name>"), or "" when it is not one.
 func (s *Server) fileDigest(ref string) string {

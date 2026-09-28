@@ -35,6 +35,16 @@ import (
 //go:embed assets/facet.js
 var clientJS []byte
 
+// BaseCSS is the runtime's own stylesheet exactly as this build serves it,
+// ahead of an app's theme and its own CSS in /facet.css — what another
+// runtime serving the same app is handed, rather than a copy of its own.
+func BaseCSS() string { return baseCSS }
+
+// ClientJS is the client runtime exactly as this build serves it at
+// /facet.js — the embedded copy, not whatever assets/facet.js holds on disk
+// now — so another runtime handed these bytes serves the same client.
+func ClientJS() []byte { return append([]byte(nil), clientJS...) }
+
 // Server serves one compiled app.
 type Server struct {
 	ir          *ir.IR
@@ -58,6 +68,8 @@ type Server struct {
 	uploadDir   string                      // directory uploaded files are written to and served from
 	dataDir     string                      // sandbox root for a proc's readFile/writeFile (io.file) — see runtime/io.go
 	channels    *channelRegistry            // backs the `channel()`/`send`/`recv` builtins — see runtime/channel.go
+	halted      chan struct{}               // closed by Shutdown: a program's sleeps end (haltProgram)
+	haltOnce    sync.Once                   // closes halted once
 	netConns    *netRegistry                // backs listen/accept/readBytes/writeBytes/closeConn (io.net.listen) — see runtime/netconn.go
 	shared      *sharedCells                // backs `shared` cells ($shared.get/$shared.set) — see runtime/shared.go
 	console     *stdio                      // backs writeStdout/writeStderr/readStdin (io.console) — see runtime/stdio.go
@@ -71,6 +83,8 @@ type Server struct {
 
 	fieldRE   map[string]*regexp.Regexp // compiled @matches patterns, keyed by entity.field
 	hashed    map[string]bool           // @password fields, keyed by entity.field: every write stores a hash (storedValue)
+	cols      map[string]ir.Field       // every entity column, keyed by entity.field: a write stores the column's type (columnValue)
+	colOrder  map[string][]ir.Field     // each entity's columns, in declared order (storeRow fills the absent ones)
 	softDel   map[string]bool           // entity names that soft-delete (archive) on remove
 	ephemeral map[string]bool           // entity names that never reach the durable store (see commit, attachStore)
 
@@ -103,6 +117,7 @@ type Server struct {
 
 	obs      *obs         // structured logs + metrics + tracing
 	cluster  *cluster     // cross-instance pub/sub + shared sessions (nil unless FACET_CLUSTER)
+	program  bool         // hosts a program (NewProgram), never an app: no cluster
 	jobs     *jobQueue    // durable job workers (nil until StartJobs)
 	apiCache *apiCache    // optional read cache for entity-list GETs (nil unless FACET_API_CACHE_TTL)
 	dev      *devHub      // live-reload hub (nil unless `facet dev`)
@@ -177,6 +192,11 @@ type sessionState struct {
 	// pendingMFA holds the username that passed a password check and now awaits a
 	// TOTP second factor (set by login, consumed by loginMFA).
 	pendingMFA string
+	// persisted: this session's row is in the shared session table — inserted
+	// by this instance or rehydrated from it. From then on a write is an update
+	// that must find the row (Store.UpdateSession): if a peer ended the session
+	// meanwhile, the write-back must not re-create it.
+	persisted bool
 }
 
 // New builds a server for a compiled IR, opening the Postgres entity store
@@ -217,6 +237,7 @@ func newServer(graph *ir.IR) *Server {
 		dataDir:     dataDirFromEnv(),
 		channels:    newChannelRegistry(),
 		netConns:    newNetRegistry(),
+		halted:      make(chan struct{}),
 		shared:      newSharedCells(),
 		console:     newStdio(),
 		exit:        os.Exit,
@@ -225,6 +246,8 @@ func newServer(graph *ir.IR) *Server {
 		idem:           map[string]*idemRecord{},
 		fieldRE:        map[string]*regexp.Regexp{},
 		hashed:         map[string]bool{},
+		cols:           map[string]ir.Field{},
+		colOrder:       map[string][]ir.Field{},
 		softDel:        map[string]bool{},
 		ephemeral:      map[string]bool{},
 		entities:       map[string][]any{},
@@ -269,6 +292,10 @@ func newServer(graph *ir.IR) *Server {
 			s.ephemeral[ent.Name] = true
 		}
 		for _, f := range ent.Fields {
+			s.cols[ent.Name+"."+f.Name] = f
+			if f.Name != "id" {
+				s.colOrder[ent.Name] = append(s.colOrder[ent.Name], f)
+			}
 			if f.Password {
 				s.hashed[ent.Name+"."+f.Name] = true
 			}
@@ -325,12 +352,28 @@ func NewInMemory(graph *ir.IR) (*Server, error) {
 	return s, nil
 }
 
+// NewProgram builds the server that hosts a program — `facet exec` running
+// a proc main or daemons (the FacetQL engine, the fct runtime) — rather than
+// one serving an app. Its environment belongs to the program it runs: a
+// FACET_CLUSTER=1 there configures the runtime that program is, not the host,
+// so the host never joins a cluster (which its private in-memory store would
+// refuse anyway, failing the program before it starts).
+func NewProgram(graph *ir.IR) (*Server, error) {
+	s := newServer(graph)
+	s.program = true
+	if err := s.attachStore(newMemStore()); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
 // attachStore wires a Store into a half-built server: it initializes the schema,
 // loads the working set, seeds the audit feed, and brings up optional OIDC and
 // clustering. New and NewInMemory share it so both backends behave identically.
 func (s *Server) attachStore(store Store) error {
 	graph := s.ir
 	s.store = store
+	tellSearched(store, graph)
 	// @ephemeral entities never reach the store: not the schema/migration (no
 	// table for a row that outlives nothing), and not Init's load. They start
 	// empty every process start, by design — see ast.Entity.Ephemeral.
@@ -376,7 +419,7 @@ func (s *Server) attachStore(store Store) error {
 
 	// Horizontal scale (opt-in): join the cross-instance event bus and back
 	// sessions with the shared store, so many instances can run behind one LB.
-	if clusterEnabled() {
+	if clusterEnabled() && !s.program {
 		c, err := startCluster(s)
 		if err != nil {
 			store.Close()
@@ -486,7 +529,10 @@ var builtins = []builtinRoute{
 		}
 	}},
 	{BuiltinRoute{"/event", "the action endpoint", true}, func(s *Server) http.HandlerFunc { return s.handleEvent }},
-	{BuiltinRoute{"/live", "the live change stream", true}, func(s *Server) http.HandlerFunc { return s.handleLive }},
+	// The change stream lives in the runtime's own namespace, next to
+	// /api/_contract: a machine endpoint under /api/, not a product word at
+	// the top of the site. /live belongs to the app.
+	{BuiltinRoute{Pattern: "/api/_live", What: "the live change stream", Always: true}, func(s *Server) http.HandlerFunc { return s.handleLive }},
 	{BuiltinRoute{"/region", "the region data endpoint", true}, func(s *Server) http.HandlerFunc { return s.handleRegion }},
 	{BuiltinRoute{"/api", "the JSON API schema", true}, func(s *Server) http.HandlerFunc { return s.handleAPISchema }},
 	{BuiltinRoute{"/api/", "the JSON API", true}, func(s *Server) http.HandlerFunc { return s.handleAPI }},
@@ -995,25 +1041,8 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 		rd.node(&body, n, store, childPath("", i))
 	}
 
-	// Ship the IR with this page's view/bindings/depgraph (the client runtime
-	// reads those three fields), not every page's tree. Routes (lightweight) stay,
-	// so the client can match links and hide guarded ones.
-	reqIR := *s.ir
-	reqIR.View = pg.View
-	reqIR.Bindings = pg.Bindings
-	reqIR.DepGraph = pg.DepGraph
-	reqIR.Pages = nil
-	// …and with the components this page can reach, not every component the app
-	// defines. An app assembled from a facet library defines hundreds; a page
-	// renders a handful. Shipping all of them made the library, not the page, the
-	// size of the download: on f33d3r.com it was 323 KB of the 368 KB IR — 88% of
-	// every page — to render views the route cannot reach.
-	reqIR.Components = s.pageComponents(pg)
-	// The stylesheet is already in <style id="fa-css"> above; the client renderer
-	// never reads it off the IR. Shipping it in both places sent every visitor the
-	// same 67 KB twice.
-	reqIR.CSS = ""
-	irJSON, _ := json.Marshal(&reqIR)
+	// The page ships only the IR its client can use (pageir.go).
+	irJSON, _ := s.pageIRJSON(pg)
 	// The server-render store (above) holds @private values and whole entity
 	// collections for server-side logic; the client bootstrap carries neither.
 	stateJSON, _ := json.Marshal(s.clientState(pg, store, rd))
@@ -1154,6 +1183,21 @@ func (s *Server) callServiceSync(sv ir.Service, op string, body map[string]any, 
 
 // coerceRet coerces a decoded service result to its declared return type — a
 // scalar via coerce, or each element of a list.
+// coerceRetDepth is coerceRet for a result that may be a nested list
+// (`-> [[T]]`, depth > 1): its elements are lists, handed on as they are
+// rather than coerced one by one to T.
+func (s *Server) coerceRetDepth(v any, ret string, list bool, depth int) any {
+	if depth > 1 {
+		if _, ok := v.([]any); ok || v == nil {
+			if v == nil {
+				return []any{}
+			}
+			return v
+		}
+	}
+	return s.coerceRet(v, ret, list)
+}
+
 func (s *Server) coerceRet(v any, ret string, list bool) any {
 	if _, isMap := v.(map[any]any); isMap {
 		// A proc's map return (`-> {K: V}`): its values were converted when
@@ -1287,19 +1331,43 @@ func (s *Server) firstEnterableScreen(exceptPath string, store map[string]any) s
 }
 
 // pageFor returns the page whose route matches path, plus the bound `:param`
-// values. An exact (static) route wins over a dynamic one.
+// values. An exact (static) route wins over a dynamic one, and among dynamic
+// routes the more specific wins (routeMoreSpecific) — so a site can serve
+// profiles at `/:handle` and `/:handle/followers` beside `/settings/:section`
+// without the order the views were declared in deciding which one a path
+// reaches.
 func (s *Server) pageFor(path string) (*ir.Page, map[string]string) {
 	for i := range s.ir.Pages {
 		if s.ir.Pages[i].Path == path {
 			return &s.ir.Pages[i], nil
 		}
 	}
+	var best *ir.Page
+	var bestParams map[string]string
 	for i := range s.ir.Pages {
 		if params, ok := matchRoute(s.ir.Pages[i].Path, path); ok {
-			return &s.ir.Pages[i], params
+			if best == nil || routeMoreSpecific(s.ir.Pages[i].Path, best.Path) {
+				best, bestParams = &s.ir.Pages[i], params
+			}
 		}
 	}
-	return nil, nil
+	return best, bestParams
+}
+
+// routeMoreSpecific reports whether pattern a outranks pattern b for a path
+// both match: read left to right, the first segment where one is literal and
+// the other a `:param` decides, for the literal. assets/facet.js's
+// routeFor applies the same rule.
+func routeMoreSpecific(a, b string) bool {
+	as := strings.Split(strings.Trim(a, "/"), "/")
+	bs := strings.Split(strings.Trim(b, "/"), "/")
+	for i := 0; i < len(as) && i < len(bs); i++ {
+		al, bl := !strings.HasPrefix(as[i], ":"), !strings.HasPrefix(bs[i], ":")
+		if al != bl {
+			return al
+		}
+	}
+	return false
 }
 
 // matchRoute matches a concrete path against a route pattern, binding each
@@ -1543,7 +1611,9 @@ func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	act := s.byAction[req.Action]
-	if act == nil {
+	if act == nil || act.Internal {
+		// An @internal action is not a client's to invoke: it answers exactly
+		// as a name that does not exist, so its presence is not probeable.
 		http.Error(w, "unknown action", http.StatusNotFound)
 		return
 	}
@@ -1733,7 +1803,18 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.ensureSession(sid) // so scope() and policies see the right actor (system → admin)
+	// The system and tool identities are minted on first use. Any other id
+	// that is not a live session here was ended between resolving the request
+	// and taking this lock — revoked, re-keyed or evicted by a peer — or is ""
+	// (a read with no session). The action runs as a guest in a session that
+	// is never cached under that id: minting one would resurrect an ended
+	// session as a guest that the same token then resolves to from here on.
+	var transient *sessionState
+	if sid == systemSID || sid == toolSID {
+		s.ensureSession(sid)
+	} else if s.sessions[sid] == nil {
+		transient = s.newSession("guest", "guest")
+	}
 	scope := s.scope(sid)
 	scope["sessionToken"] = sessionToken(sid)
 	given := map[string]bool{} // the parameters the caller actually sent (given(p))
@@ -1745,7 +1826,7 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 		}
 		if i < len(args) {
 			var ok bool
-			if v, ok = paramArg(args[i], p); !ok {
+			if v, ok = s.argFor(args[i], p); !ok {
 				return nil, nil, sid, http.StatusBadRequest, fmt.Sprintf(
 					"%s: parameter %q expects %s, got %v", act.Name, p.Name, paramTypeName(p), args[i])
 			}
@@ -1766,7 +1847,10 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 		}
 	}
 
-	ses := s.sessions[sid] // ensureSession guaranteed it exists, with the right actor
+	ses := s.sessions[sid]
+	if transient != nil {
+		ses = transient
+	}
 	sess := ses.state
 	ar := &actionRun{
 		act:        act,
@@ -1841,6 +1925,7 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 	if ar.rekey != "" {
 		delete(s.sessions, sid)
 		s.sessions[ar.rekey] = ses
+		ses.persisted = false // the new id has no row yet
 		s.dropSharedSession(sid)
 		after = ar.rekey
 	}
@@ -1959,6 +2044,20 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 		}
 	}()
 	for _, st := range body {
+		switch st.Op {
+		case "add", "set", "remove", "clear", "call", "run", "do":
+			// a statement that can write rows, or run something that does:
+			// the scope's row indexes may no longer describe its rows, and
+			// the database no longer holds what this request's rows hold
+			// (searchpush.go) — for the entity written, or, for a statement
+			// that can cascade or run anything, for every entity
+			dropRowIndexes(ar.scope)
+			if (st.Op == "add" || st.Op == "set") && st.Entity != "" {
+				markWritten(ar.scope, st.Entity)
+			} else {
+				markWritten(ar.scope, "")
+			}
+		}
 		switch st.Op {
 		case "check":
 			// Validation in body order — after a `let` bind so it can validate the
@@ -2100,6 +2199,7 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 					}
 					for _, fi := range st.Fields {
 						ar.undo.field(m, fi.Name)
+						dropRowIndexes(ar.scope)
 						m[fi.Name] = cand[fi.Name]
 					}
 					ar.ops = append(ar.ops, durOp{kind: "save", entity: st.Entity, row: m})
@@ -2137,6 +2237,7 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 						return http.StatusUnprocessableEntity, msg
 					}
 					ar.undo.field(m, st.Field)
+					dropRowIndexes(ar.scope)
 					m[st.Field] = nv
 					ar.ops = append(ar.ops, durOp{kind: "save", entity: st.Entity, row: m})
 					ar.entChanged[st.Entity] = true
@@ -2165,6 +2266,7 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 						id := m["id"]
 						if soft {
 							ar.undo.field(m, "archived")
+							dropRowIndexes(ar.scope)
 							m["archived"] = true
 							ar.ops = append(ar.ops, durOp{kind: "save", entity: st.Entity, row: m})
 						} else {
@@ -2200,6 +2302,7 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 					s.entities[st.Entity] = append(rows[:i:i], rows[i+1:]...)
 					if soft {
 						ar.undo.field(m, "archived")
+						dropRowIndexes(ar.scope)
 						m["archived"] = true
 						ar.ops = append(ar.ops, durOp{kind: "save", entity: st.Entity, row: m})
 					} else {
@@ -2290,7 +2393,7 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 					// The proc engine builds its struct-typed values as structVal; the
 					// action's world (its reply, its later expressions, rows) is
 					// records. Crossing back is the mirror of procArgValue.
-					ar.scope[st.Bind] = plainValue(s.coerceRet(res, st.Ret, st.RetList))
+					ar.scope[st.Bind] = plainValue(s.coerceRetDepth(res, st.Ret, st.RetList, st.RetDepth))
 				}
 			}
 		case "exprstmt":
@@ -2381,6 +2484,9 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 				delete(ar.scope, st.Var)
 			}
 			picked = sortRows(picked, st.Order, st.Desc)
+			if st.OrderBy != nil {
+				picked = sortRowsBy(picked, st.Var, st.OrderBy, st.Desc, ar.scope)
+			}
 			if st.Limit != nil {
 				lim := toInt(eval(st.Limit, ar.scope))
 				if lim <= 0 {
@@ -2742,7 +2848,7 @@ func (s *Server) scope(sid string) map[string]any {
 	if ses != nil {
 		visitor = ses.visitor
 	}
-	scope := map[string]any{"actor": actor, "role": role, "verified": verified, "session": visitor}
+	scope := map[string]any{"actor": actor, "role": role, "verified": verified, "session": visitor, pushdownKey: s}
 	// Phase 6: the session's active tenant and the actor's role within it, exposed
 	// to the graph like `actor`/`role` so policies can scope rows by `tenant`.
 	tid := activeTenant(ses)
@@ -2871,8 +2977,8 @@ func (s *Server) handleAPISchema(w http.ResponseWriter, r *http.Request) {
 	schema["derives"] = s.ir.Derives
 	var actions []apiAction
 	for _, a := range s.ir.Actions {
-		if a.Placement != ir.Server {
-			continue // client actions are not callable over the API
+		if a.Placement != ir.Server || a.Internal {
+			continue // client actions and @internal ones are not callable over the API
 		}
 		ap := apiAction{Name: a.Name}
 		for _, req := range a.Requires {
@@ -3018,7 +3124,7 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		act := s.byAction[name]
-		if act == nil {
+		if act == nil || act.Internal {
 			http.Error(w, "unknown action", http.StatusNotFound)
 			return
 		}
@@ -3860,8 +3966,22 @@ func (rd *renderer) node(b *strings.Builder, n ir.Node, scope map[string]any, pa
 		rd.children(b, n.Children, scope, path)
 		fmt.Fprintf(b, `<button type="submit">%s</button></form>`, s.attrText(n.Label, scope))
 	case "upload":
-		fmt.Fprintf(b, `<label%s>%s<input type="file" data-fa-upload="%s"></label>`,
-			nodeAttrs("fa-upload", n), s.attrText(n.Label, scope), n.Bind)
+		multiple := ""
+		if n.Multiple {
+			multiple = " multiple"
+		}
+		fmt.Fprintf(b, `<label%s>%s<input type="file" data-fa-upload="%s"%s></label>`,
+			nodeAttrs("fa-upload", n), s.attrText(n.Label, scope), n.Bind, multiple)
+	case "camera":
+		// The viewfinder and its shutter are the client's (assets/facet.js
+		// startCamera); the file input is what a browser with no camera, or
+		// one that refuses it, captures with instead.
+		label := s.attrText(n.Label, scope)
+		fmt.Fprintf(b, `<div%s data-fa-camera="%s"><video class="fa-camera-view" autoplay playsinline muted></video>`+
+			`<div class="fa-camera-controls"><button type="button" class="fa-camera-shutter" data-fa-camera-shutter aria-label="%s"></button>`+
+			`<button type="button" class="fa-camera-flip" data-fa-camera-flip aria-label="Flip camera">⟲</button></div>`+
+			`<label class="fa-upload fa-camera-fallback">%s<input type="file" accept="image/*" capture="environment" data-fa-upload="%s"></label></div>`,
+			nodeAttrs("fa-camera", n), n.Bind, label, label, n.Bind)
 	case "use":
 		comp := s.byComponent[n.Name]
 		if comp == nil {
@@ -3989,6 +4109,7 @@ func (s *Server) rotateSession(w http.ResponseWriter, old string) string {
 
 	delete(s.sessions, old)
 	s.sessions[fresh] = ses
+	ses.persisted = false // the new id has no row yet
 	s.obs.metrics.setSessions(int64(len(s.sessions)))
 	s.mu.Unlock()
 
@@ -4062,9 +4183,35 @@ func (s *Server) persistSession(sid string) {
 		return
 	}
 	ps := persistedFromSession(ses)
+	inserted := ses.persisted
 	s.mu.Unlock()
-	if err := s.store.SaveSession(sid, ps); err != nil {
+	if !inserted {
+		if err := s.store.SaveSession(sid, ps); err != nil {
+			s.obs.log.Warn("save session", slog_err(err))
+			return
+		}
+		s.mu.Lock()
+		if s.sessions[sid] == ses {
+			ses.persisted = true
+		}
+		s.mu.Unlock()
+		return
+	}
+	found, err := s.store.UpdateSession(sid, ps)
+	if err != nil {
 		s.obs.log.Warn("save session", slog_err(err))
+		return
+	}
+	if !found {
+		// A peer ended this session (the shared row is gone) before its
+		// announcement reached this instance: the ending wins. Drop the local
+		// copy rather than write the session back into existence.
+		s.mu.Lock()
+		if s.sessions[sid] == ses {
+			delete(s.sessions, sid)
+			s.obs.metrics.setSessions(int64(len(s.sessions)))
+		}
+		s.mu.Unlock()
 	}
 }
 
@@ -4155,6 +4302,7 @@ func sessionFromPersisted(ps *persistedSession) *sessionState {
 	return &sessionState{
 		state: state, actor: ps.Actor, role: ps.Role, verified: ps.Verified, visitor: visitor,
 		pendingMFA: ps.PendingMFA, expires: ps.Expires,
+		persisted: true, // read from the shared table: its row exists
 	}
 }
 
@@ -4246,6 +4394,9 @@ func selectRows(rows []any, n ir.Node, scope map[string]any) []any {
 		}
 	}
 	out := sortRows(filtered, n.Order, n.Desc)
+	if n.OrderBy != nil {
+		out = sortRowsBy(out, n.Var, n.OrderBy, n.Desc, scope)
+	}
 	if n.Limit != nil {
 		if lim := toInt(eval(n.Limit, scope)); lim > 0 && len(out) > lim {
 			out = out[:lim]
@@ -4275,10 +4426,24 @@ func sortRows(rows []any, order string, desc bool) []any {
 }
 
 // lessVal compares two field values: numeric if both are numbers, else string.
+// Two ints compare as ints (exact past 2^53); a float on either side compares
+// as floats — truncating to int ordered 0.9 and 0.1 as equal, where the
+// client's cmpVal (assets/facet.js) orders them.
 func lessVal(a, b any) bool {
 	_, aNum := numeric(a)
 	_, bNum := numeric(b)
 	if aNum && bNum {
+		af, aIsF := a.(float64)
+		bf, bIsF := b.(float64)
+		if aIsF || bIsF {
+			if !aIsF {
+				af = toFloat(a)
+			}
+			if !bIsF {
+				bf = toFloat(b)
+			}
+			return af < bf
+		}
 		return toInt(a) < toInt(b)
 	}
 	return toStr(a) < toStr(b)
@@ -4605,6 +4770,11 @@ func (s *Server) constraintError(entity string, row record, changedField string,
 // constraintError, which validates what was written (a @min length reads the
 // plaintext, not its hash). msg is non-empty when v cannot be stored.
 func (s *Server) storedValue(entity, field string, v any) (any, string) {
+	// A column holds its declared type — from the first write, so the working
+	// set and a store that reloads the row agree (columnValue).
+	if f, ok := s.cols[entity+"."+field]; ok {
+		v = columnValue(f, v)
+	}
 	if !s.hashed[entity+"."+field] {
 		return v, ""
 	}
@@ -4615,8 +4785,16 @@ func (s *Server) storedValue(entity, field string, v any) (any, string) {
 	return h, ""
 }
 
-// storeRow applies storedValue to every field of a row about to be inserted.
+// storeRow applies storedValue to every field of a row about to be inserted,
+// and gives every column the row does not name its empty value — nothing for
+// a nullable column, the type's zero otherwise — as a store that reloaded the
+// row would hand it back.
 func (s *Server) storeRow(entity string, row record) string {
+	for _, f := range s.colOrder[entity] {
+		if _, ok := row[f.Name]; !ok {
+			row[f.Name] = columnValue(f, nil)
+		}
+	}
 	for k, v := range row {
 		nv, msg := s.storedValue(entity, k, v)
 		if msg != "" {
@@ -4670,112 +4848,11 @@ func sameValue(a, b any) bool {
 // baseCSS is the runtime's own stylesheet: the one that makes any app render
 // legibly with no design work. It used to live inside the page template and was
 // therefore re-sent, uncompressed and uncacheable, with every page.
-const baseCSS = `
-  :root {
-    --fa-bg: #fff; --fa-fg: #111; --fa-muted: #666; --fa-accent: #1a56db;
-    --fa-border: #888; --fa-card-border: #e3e3e3; --fa-radius: 8px;
-    --fa-font: 16px/1.5 system-ui, sans-serif; --fa-maxwidth: 34rem;
-  }
-  body { font: var(--fa-font); margin: 2.5rem auto; max-width: var(--fa-maxwidth);
-         color: var(--fa-fg); background: var(--fa-bg); padding: 0 1rem; }
-  .fa-box { display: flex; flex-direction: column; gap: .5rem; align-items: stretch; }
-  .fa-box .fa-box { border: 1px solid var(--fa-card-border); border-radius: calc(var(--fa-radius) + 2px); padding: .6rem .8rem; }
-  /* A row lays its children out horizontally. A box directly inside a row is a
-     structural column (a wireframe region) and stretches; inline items (buttons,
-     text, images — e.g. an action bar) stay compact. */
-  .fa-row { display: flex; flex-direction: row; gap: .75rem; align-items: flex-start; flex-wrap: wrap; }
-  .fa-row > * { min-width: 0; }
-  .fa-row > .fa-box { flex: 1 1 0; border: none; background: transparent; padding: 0; }
-  .fa-row > button, .fa-row > .fa-text, .fa-row > .fa-image { flex: 0 0 auto; }
-  /* Action-bar buttons: muted, borderless, highlight on hover — X-style. */
-  .fa-row > button { background: transparent; border: none; color: var(--fa-muted); padding: .25rem .5rem; align-self: center; }
-  .fa-row > button:hover { color: var(--fa-accent); }
-  /* Only a row of structural columns collapses to a stack on a narrow viewport; an
-     action bar (no box children) stays horizontal. */
-  @media (max-width: 720px) {
-    .fa-row:has(> .fa-box) { flex-direction: column; }
-    .fa-row:has(> .fa-box) > .fa-box { width: 100%; flex-basis: 100%; }
-  }
-  /* image: avatars by default — a rounded, fixed square that sits inline. */
-  .fa-image { width: 44px; height: 44px; border-radius: 50%; object-fit: cover; background: var(--fa-card-border); }
-  .fa-text { font-variant-numeric: tabular-nums; }
-  .fa-icon { display: inline-block; width: 1.15em; height: 1.15em; vertical-align: -.18em;
-             background: var(--fa-icon-bg, none) center/contain no-repeat; }
-  .fa-video { max-width: 100%; border-radius: var(--fa-radius); background: #000; }
-  .fa-richtext { line-height: 1.6; }
-  .fa-richtext h1, .fa-richtext h2, .fa-richtext h3 { margin: .6em 0 .3em; line-height: 1.25; }
-  .fa-richtext h1 { font-size: 1.5rem; } .fa-richtext h2 { font-size: 1.25rem; } .fa-richtext h3 { font-size: 1.1rem; }
-  .fa-richtext p { margin: .5em 0; } .fa-richtext ul { margin: .5em 0; padding-left: 1.25rem; }
-  .fa-richtext code { font-family: ui-monospace, monospace; font-size: .9em;
-                      background: var(--fa-card-border); padding: .1em .3em; border-radius: 4px; }
-  .fa-richtext pre { background: var(--fa-card-border); padding: .7rem .9rem; border-radius: var(--fa-radius); overflow:auto; }
-  .fa-richtext pre code { background: none; padding: 0; }
-  .fa-richtext blockquote { margin: .5em 0; padding: .1em 0 .1em .9rem;
-                            border-left: 3px solid var(--fa-border); color: var(--fa-muted); }
-  .fa-richtext ol { margin: .5em 0; padding-left: 1.5rem; }
-  .fa-richtext hr { border: none; border-top: 1px solid var(--fa-border); margin: 1em 0; }
-  .fa-richtext a { color: var(--fa-accent); }
-  .fa-richtext del { color: var(--fa-muted); }
-  /* more: the infinite-scroll control after a cut-off list. A quiet, full-width
-     row — it is mostly scrolled past, and only read when the observer is off. */
-  .fa-more { display: block; width: 100%; margin: .5rem 0 0; padding: .6rem; background: transparent;
-             border: 1px solid var(--fa-border); border-radius: var(--fa-radius); color: var(--fa-muted);
-             cursor: pointer; align-self: stretch; }
-  .fa-more:hover { color: var(--fa-fg); }
-  /* heading: the browser's own scale per level IS the semantics, so nothing is
-     imposed on it; only the margin, which a flex box/row would read as a gap. */
-  .fa-heading { margin: 0; }
-  .fa-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 1.2rem; padding: 0 .4rem;
-              font-size: .72rem; font-weight: 700; line-height: 1.5; border-radius: 999px;
-              background: var(--fa-accent); color: #fff; }
-  .fa-tabs { display: flex; flex-direction: column; gap: .6rem; }
-  .fa-tabstrip { display: flex; flex-direction: row; gap: .25rem; border-bottom: 1px solid var(--fa-border); }
-  .fa-tab { background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0;
-            color: var(--fa-muted); padding: .5rem .9rem; cursor: pointer; align-self: auto; font-weight: 600; }
-  .fa-tab:hover { color: var(--fa-fg); }
-  .fa-tab[aria-selected=true] { color: var(--fa-fg); border-bottom-color: var(--fa-accent); }
-  .fa-form { display: flex; flex-direction: column; gap: .5rem; align-items: stretch; }
-  .fa-use { display: contents; }
-  /* overlay: a dimmed backdrop centering a card panel. */
-  .fa-overlay-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.45);
-    display: flex; align-items: center; justify-content: center; padding: 1rem; z-index: 50; }
-  .fa-overlay-panel { background: var(--fa-bg); color: var(--fa-fg); border-radius: calc(var(--fa-radius) + 4px);
-    border: 1px solid var(--fa-card-border); padding: 1.1rem 1.25rem; max-width: 32rem; width: 100%;
-    max-height: 85vh; overflow: auto; box-shadow: 0 12px 40px rgba(0,0,0,.3); }
-  /* popover: an anchored layer beside a sibling instead of centered — nothing
-     dimmed, a catcher the same size as overlay's backdrop for the outside
-     click, and a panel that starts hidden at a neutral spot until
-     runtime/assets/facet.js measures its anchor and places it (see
-     positionPopover there and server.go's popover/rd.popover comments). */
-  .fa-popover-backdrop { position: fixed; inset: 0; z-index: 50; }
-  .fa-popover-panel { position: fixed; top: 0; left: 0; visibility: hidden; z-index: 51;
-    background: var(--fa-bg); color: var(--fa-fg); border-radius: var(--fa-radius);
-    border: 1px solid var(--fa-card-border); padding: .5rem; min-width: 10rem; max-width: 20rem;
-    max-height: 70vh; overflow: auto; box-shadow: 0 12px 32px rgba(0,0,0,.28); }
-  .fa-typeahead { width: 100%; }
-  /* controls: a textarea fills its row; a checkbox/toggle/radio option is a
-     clickable label whose box sits before its words. */
-  .fa-textarea { font: inherit; width: 100%; min-height: 5rem; resize: vertical;
-                 padding: .4rem .6rem; border: 1px solid var(--fa-border);
-                 border-radius: var(--fa-radius); background: var(--fa-bg); color: var(--fa-fg); }
-  .fa-checkbox, .fa-toggle, .fa-radio-option { display: inline-flex; gap: .45rem; align-items: center; cursor: pointer; }
-  .fa-checkbox input, .fa-toggle input, .fa-radio-option input { accent-color: var(--fa-accent); }
-  .fa-toggle input { width: 2.2rem; height: 1.2rem; }
-  .fa-radio { display: flex; flex-direction: column; gap: .35rem; }
-  button { font: inherit; padding: .4rem .8rem; border: 1px solid var(--fa-border); border-radius: var(--fa-radius);
-           background: var(--fa-bg); color: var(--fa-fg); cursor: pointer; align-self: flex-start; }
-  button[type=submit] { background: var(--fa-accent); color: #fff; border-color: var(--fa-accent); }
-  button:active { transform: translateY(1px); }
-  button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible {
-    outline: 2px solid var(--fa-accent); outline-offset: 2px; }
-  input, select { font: inherit; padding: .4rem .6rem; border: 1px solid var(--fa-border);
-                  border-radius: var(--fa-radius); background: var(--fa-bg); color: var(--fa-fg); }
-  .fa-upload { display: inline-flex; gap: .4rem; align-items: center; cursor: pointer; }
-  .fa-link { color: var(--fa-accent); }
-  .fa-error { color: #b00020; font-size: .9em; }
-  [data-fa-bind] { font-weight: 600; }
-  [aria-busy=true] { opacity: .6; }
-`
+// It lives in assets/facet-base.css, embedded: the one copy the Go runtime
+// serves and hands (BaseCSS) to any other runtime serving the same app.
+//
+//go:embed assets/facet-base.css
+var baseCSS string
 
 const page = `<!doctype html>
 <html lang="en"%s>
@@ -4831,7 +4908,7 @@ func (s *Server) runNested(st ir.Stmt, ar *actionRun) (int, string) {
 		var v any
 		if i < len(st.Args) {
 			var ok bool
-			if v, ok = paramArg(eval(st.Args[i], ar.scope), p); !ok {
+			if v, ok = s.argFor(eval(st.Args[i], ar.scope), p); !ok {
 				return http.StatusBadRequest, fmt.Sprintf("%s: parameter %q expects %s", callee.Name, p.Name, paramTypeName(p))
 			}
 		} else {

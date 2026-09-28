@@ -23,12 +23,18 @@ type fabricCoverageRow struct {
 	file   string // the Rust file, relative to the crate
 	test   string // the #[test] fn, or "" for a module with no tests
 	port   string // the .fct file in selfhost, or "" when not ported
-	goTest string // the Go test here that checks the port against the crate
+	goTest string // the Go test here that checks the port against the crate; for an unported row, why
 }
 
 var fabricCoverage = []fabricCoverageRow{
 	// fabric-cli
 	{"fabric-cli", "src/args.rs", "a_non_numeric_liveness_flag_errors", "fabric_cli.fct", "TestFabricCli"},
+	{"fabric-cli", "src/args.rs", "daemon_commands_parse", "fabric_cli.fct", "TestFabricCliDaemon"},
+	{"fabric-cli", "src/args.rs", "daemon_commands_refuse_what_they_cannot_mean", "fabric_cli.fct", "TestFabricCliDaemon"},
+	{"fabric-cli", "src/daemon.rs", "a_response_is_read_by_its_framing", "fabric_cli_daemon.fct", "TestFabricCliDaemon"},
+	{"fabric-cli", "src/daemon.rs", "only_a_plain_http_authority_is_an_operator_port", "fabric_cli_daemon.fct", "TestFabricCliDaemon"},
+	{"fabric-cli", "src/daemon.rs", "placements_render_one_row_per_cell", "fabric_cli_daemon.fct", "TestFabricCliDaemon"},
+	{"fabric-cli", "src/daemon.rs", "the_token_is_never_optional_and_the_port_never_guessed", "fabric_cli_daemon.fct", "TestFabricCliDaemon"},
 	{"fabric-cli", "src/args.rs", "bare_subcommand_defaults", "fabric_cli.fct", "TestFabricCli"},
 	{"fabric-cli", "src/args.rs", "every_subcommand_parses", "fabric_cli.fct", "TestFabricCli"},
 	{"fabric-cli", "src/args.rs", "help_and_version_flags", "fabric_cli.fct", "TestFabricCli"},
@@ -64,6 +70,9 @@ var fabricCoverage = []fabricCoverageRow{
 	{"fabric-controller", "src/controller.rs", "a_stale_decision_is_refused_with_its_evidence", "fabric_controller_core.fct", "TestFabricControllerCore"},
 	{"fabric-controller", "src/controller.rs", "an_action_that_helped_nothing_is_reported_as_such", "fabric_controller_core.fct", "TestFabricControllerCore"},
 	{"fabric-controller", "src/controller.rs", "an_executed_action_is_not_complete_until_it_is_measured", "fabric_controller_core.fct", "TestFabricControllerCore"},
+	{"fabric-controller", "src/controller.rs", "an_operator_request_is_held_to_every_safety_check", "fabric_controller_core.fct", "TestFabricControllerCoreOperatorRequest"},
+	{"fabric-controller", "src/controller.rs", "an_operator_request_is_not_held_to_the_models_threshold", "fabric_controller_core.fct", "TestFabricControllerCoreOperatorRequest"},
+	{"fabric-controller", "src/controller.rs", "an_optimizer_envelope_serializes_as_before", "", "DecisionEnvelope's serde shape: nothing in the crates or the port puts an envelope on a wire, so the port has no JSON of it to hold to the crate's"},
 	{"fabric-controller", "src/controller.rs", "an_unhealthy_destination_is_refused", "fabric_controller_core.fct", "TestFabricControllerCore"},
 	{"fabric-controller", "src/controller.rs", "losing_the_destination_mid_flight_tears_the_action_down", "fabric_controller_core.fct", "TestFabricControllerCore"},
 	{"fabric-controller", "src/controller.rs", "two_actions_cannot_run_on_one_target", "fabric_controller_core.fct", "TestFabricControllerCore"},
@@ -98,6 +107,7 @@ var fabricCoverage = []fabricCoverageRow{
 	{"fabric-daemon", "src/config.rs", "a_missing_secret_names_the_variable_and_never_a_value", "fabric_daemon_config.fct", "TestFabricDaemonConfigRustTests"},
 	{"fabric-daemon", "src/config.rs", "a_placement_store_without_a_credential_is_refused", "fabric_daemon_config.fct", "TestFabricDaemonConfigRustTests"},
 	{"fabric-daemon", "src/config.rs", "a_silence_budget_shorter_than_a_probe_interval_is_refused", "fabric_daemon_config.fct", "TestFabricDaemonConfigRustTests"},
+	{"fabric-daemon", "src/config.rs", "a_probe_timeout_not_shorter_than_the_silence_budget_is_refused", "fabric_daemon_config.fct", "TestFabricDaemonConfig"},
 	{"fabric-daemon", "src/config.rs", "an_unknown_key_is_a_startup_error", "fabric_daemon_config.fct", "TestFabricDaemonConfigRustTests"},
 	{"fabric-daemon", "src/config.rs", "debug_never_prints_a_secret", "fabric_daemon_config.fct", "TestFabricDaemonConfigRustTests"},
 	{"fabric-daemon", "src/config.rs", "one_cell_may_not_be_declared_on_two_instances", "fabric_daemon_config.fct", "TestFabricDaemonConfigRustTests"},
@@ -114,7 +124,10 @@ var fabricCoverage = []fabricCoverageRow{
 	{"fabric-daemon", "src/mover.rs", "concluded_actions_are_forgotten", "fabric_daemon_mover.fct", "TestFabricDaemonMoversGoldenMatchesRust"},
 	{"fabric-daemon", "src/status.rs", "", "fabric_daemon_status.fct", "TestFabricDaemonStatusGoldenMatchesRust"},
 	{"fabric-daemon", "src/telemetry.rs", "", "fabric_daemon_telemetry.fct", "TestFabricDaemonTelemetry"},
+	{"fabric-daemon", "tests/daemon.rs", "an_operator_can_ask_for_a_move_and_is_held_to_the_controllers_checks", "fabricd_lib.fct", "TestFabricDaemonOperatorMigrate"},
 	{"fabric-daemon", "tests/daemon.rs", "shutdown_rolls_back_an_action_that_has_not_cut_over", "fabric_daemon_control.fct", "TestFabricDaemonControlGoldenMatchesRust"},
+	{"fabric-daemon", "tests/daemon.rs", "the_status_names_the_ports_actually_bound", "fabricd_lib.fct", "TestFabricDaemonProcess"},
+	{"fabric-daemon", "tests/daemon.rs", "a_slow_stats_read_does_not_lose_nodes_that_answer_their_probes", "fabricd_lib.fct", "TestFabricDaemonSlowStatsKeepsNodesLive"},
 	{"fabric-daemon", "tests/daemon.rs", "the_daemon_boots_routes_traffic_and_follows_a_control_loop_decision", "fabric_daemon_control.fct", "TestFabricDaemonControlGoldenMatchesRust"},
 	{"fabric-daemon", "tests/mover.rs", "a_loaded_cell_crosses_the_pressure_threshold_from_real_facetql_stats", "fabric_facetql_poller.fct", "TestFabricDaemonLoadedCellCrossesThreshold"},
 	{"fabric-daemon", "tests/mover.rs", "the_daemon_moves_a_cells_data_between_two_real_facetql_instances", "fabricd_lib.fct", "TestFabricDaemonMoverLive"},
@@ -122,6 +135,7 @@ var fabricCoverage = []fabricCoverageRow{
 	// fabric-facetql
 	{"fabric-facetql", "src/client.rs", "a_query_request_encodes_to_the_contract_body", "fabric_facetql_client.fct", "TestFabricFacetqlClientUnitsAgainstRust"},
 	{"fabric-facetql", "src/client.rs", "debug_of_a_client_does_not_print_the_token", "fabric_facetql_client.fct", "TestFabricFacetqlClientUnitsAgainstRust"},
+	{"fabric-facetql", "src/client.rs", "retry_after_is_read_as_delay_seconds_only", "fabric_facetql_client.fct", "TestFabricFacetqlRetryAfterMatchesRust"},
 	{"fabric-facetql", "src/client.rs", "the_token_travels_in_the_header_and_never_in_the_url", "fabric_facetql_client.fct", "TestFabricFacetqlClientTraceAgainstRust"},
 	{"fabric-facetql", "src/endpoint.rs", "a_missing_env_var_names_the_variable_not_a_value", "fabric_facetql_client.fct", "TestFabricFacetqlClientUnitsAgainstRust"},
 	{"fabric-facetql", "src/endpoint.rs", "a_non_http_base_url_is_refused", "fabric_facetql_client.fct", "TestFabricFacetqlClientUnitsAgainstRust"},
@@ -144,6 +158,7 @@ var fabricCoverage = []fabricCoverageRow{
 	{"fabric-facetql", "src/frontdoor/keyspace.rs", "an_unmapped_request_is_refused_rather_than_guessed", "fabric.fct", "TestFabricLeafBKeyspace"},
 	{"fabric-facetql", "src/frontdoor/keyspace.rs", "the_longest_declared_prefix_wins", "fabric.fct", "TestFabricLeafBKeyspace"},
 	{"fabric-facetql", "src/frontdoor/plan.rs", "a_body_that_is_not_the_contract_is_a_400_not_a_misroute", "fabric_plan.fct", "TestFabricLeafBPlan"},
+	{"fabric-facetql", "src/frontdoor/plan.rs", "a_kind_scoped_aggregate_routes_by_its_kind", "fabric_plan.fct", "TestFabricLeafBPlan"},
 	{"fabric-facetql", "src/frontdoor/plan.rs", "a_kind_scoped_query_routes_by_its_kind", "fabric_plan.fct", "TestFabricLeafBPlan"},
 	{"fabric-facetql", "src/frontdoor/plan.rs", "a_multiget_names_every_address_it_asks_about", "fabric_plan.fct", "TestFabricLeafBPlan"},
 	{"fabric-facetql", "src/frontdoor/plan.rs", "a_percent_encoded_address_routes_the_same_as_a_bare_one", "fabric_plan.fct", "TestFabricLeafBPlan"},
@@ -475,7 +490,7 @@ func TestFabricCoverage(t *testing.T) {
 				t.Fatalf("no module fabric/crates/%s/%s", r.crate, r.file)
 			}
 			if r.port == "" {
-				t.Skip("not ported")
+				t.Skip("not ported: " + r.goTest)
 			}
 			if _, err := os.Stat(r.port); err != nil {
 				t.Fatalf("port %s: %v", r.port, err)

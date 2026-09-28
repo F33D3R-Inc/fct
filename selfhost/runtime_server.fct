@@ -1,5 +1,9 @@
 import "runtime_page.fct"
 import "streams_webhooks.fct"
+import "runtime_ops.fct"
+import "runtime_admin.fct"
+import "runtime_compliance.fct"
+import "runtime_cluster.fct"
 
 app RuntimeServer:
     # runtime_server.fct — the facet web runtime as a service written in
@@ -77,8 +81,11 @@ app RuntimeServer:
 
     # A response: ["R", status, body, h1name, h1value, …]; a stream:
     # ["S", chan, status, h1name, h1value, …] followed by frames on chan.
+    # rtRespFields: a whole response's head — its body follows as a message
+    # of its own, never framed (a page is megabytes; framing it cost a rune
+    # count and a rune-indexed slice of the whole body on each side).
     proc rtRespFields(r: HttpServerResponse) -> [text]:
-        let mut f = ["R", "" + r.status, r.body]
+        let mut f = ["R", "" + r.status]
         let mut i = 0
         loop i < len(r.headers):
             f = append(f, r.headers[i].name)
@@ -103,6 +110,7 @@ app RuntimeServer:
             if f[0] == "Q":
                 let reply = toInt(f[1])
                 let req = do rtReqAt(f)
+                let t0 = monoMs()
                 let before = w
                 let mut out = do rtRoute(w, req, js, reply)
                 w = out.w
@@ -119,6 +127,10 @@ app RuntimeServer:
                     # defaults, and its cookie rides the 500.
                     let failedW = out.w
                     w = before
+                    # the actions it ran are metered as refused writes
+                    # ("error"), not the "ok" they reported
+                    w.met = do rtMetRefused(before.met, failedW.met)
+                    w.audit = do rtAuditRefused(before.audit, failedW.audit, committed.err)
                     w.pendingOps = []
                     w.pendingChanged = []
                     w.pendingEvents = []
@@ -147,13 +159,36 @@ app RuntimeServer:
                     if len(changed) > 0:
                         w = do rtBroadcast(w, changed)
                     w = do rtFanoutEvents(w)
+                    w = do rtClusterSync(w)
+                # observeRequest: a whole answer now; a stream when it ends,
+                # as Go's handler returns only then.
+                if out.stream:
+                    w.met.openChans = append(w.met.openChans, out.chan)
+                    w.met.openMethods = append(w.met.openMethods, req.method)
+                    w.met.openPaths = append(w.met.openPaths, rtPathUnescape(req.path))
+                    w.met.openStatus = append(w.met.openStatus, out.resp.status)
+                    w.met.openStart = append(w.met.openStart, t0)
+                else:
+                    # the route label reads the decoded path (r.URL.Path)
+                    w.met = do rtMetRequest(w.met, req.method, rtPathUnescape(req.path), out.resp.status, monoMs() - t0)
                 if out.stream:
                     let sent = send(reply, rtPack(["S", "" + out.chan, "" + out.resp.status] + rtHeaderPairs(out.resp.headers)))
                     let sent2 = send(out.chan, out.resp.body)
                 else:
                     let sent3 = send(reply, rtPack(rtRespFields(out.resp)))
+                    let sentBody = send(reply, out.resp.body)
+            # a peer's announcement, a lost feed position, the hourly purge
+            if f[0] == "C":
+                w = do rtClusterApply(w, f[1])
+            if f[0] == "E":
+                w = do rtEvictWhere(w, ["*"], [], [])
+            if f[0] == "P":
+                let purged = do rtPurgeSessions(w)
+            if f[0] == "T":
+                w = do rtRunPeriodicJob(w, toInt(f[1]))
             if f[0] == "U":
                 let gone = toInt(f[1])
+                w.met = do rtMetStreamEnded(w.met, gone)
                 let isStream = do rtIsStreamSub(w, gone)
                 if isStream:
                     w = do rtStreamGone(w, gone)
@@ -165,6 +200,7 @@ app RuntimeServer:
                         if len(ch2) > 0:
                             w = do rtBroadcast(w, ch2)
                         w = do rtFanoutEvents(w)
+                        w = do rtClusterSync(w)
                     else:
                         w.pendingOps = []
                         w.pendingChanged = []
@@ -219,7 +255,9 @@ app RuntimeServer:
             let ev = do rtHandleEvent(w, req)
             let evr = do rtWhole(ev.w, ev.resp)
             return evr
-        if path == "/live":
+        # The change stream lives in the runtime's own namespace, /api/_live;
+        # /live is an ordinary path an app's page may take.
+        if path == "/api/_live":
             let lv = do rtHandleLive(w, req)
             return RtRouted{resp: lv.resp, w: lv.w, stream: lv.ok, chan: lv.chan}
         # ServeMux's most specific pattern wins: a declared stream or webhook
@@ -260,6 +298,30 @@ app RuntimeServer:
             let sch = do rtHandleAPISchema(w, req)
             let schr = do rtWhole(w, sch)
             return schr
+        # handleAPI's own names, ahead of every entity and action
+        if path == "/api/_i18n":
+            let i18 = do rtWhole(w, rtHandleI18n(w, req))
+            return i18
+        if path == "/api/_audit":
+            let au = do rtHandleAudit(w, req)
+            let aur = do rtWhole(au.w, au.resp)
+            return aur
+        if path == "/api/_export":
+            let ex = do rtHandleGDPRExport(w, req)
+            let exr = do rtWhole(ex.w, ex.resp)
+            return exr
+        if path == "/api/_erase":
+            let er = do rtHandleGDPRErase(w, req)
+            let err = do rtWhole(er.w, er.resp)
+            return err
+        if path == "/api/_contract":
+            let ct = do rtHandleContractAPI(w, req)
+            let ctr = do rtWhole(ct.w, ct.resp)
+            return ctr
+        if path == "/api/_billing":
+            let bl = do rtHandleBillingAPI(w, req)
+            let blr = do rtWhole(bl.w, bl.resp)
+            return blr
         let apiSub = do rtHasPrefix(path, "/api/")
         if apiSub:
             let ap = do rtHandleAPI(w, req)
@@ -268,12 +330,28 @@ app RuntimeServer:
         if path == "/healthz":
             let hz = do rtWhole(w, rtJSONResponse(200, "{\"app\":" + jsonQuote(w.g.app) + ",\"status\":\"ok\"}\n"))
             return hz
+        let adminSub = do rtHasPrefix(path, "/admin/")
+        if path == "/admin" || adminSub:
+            let ad = do rtHandleAdmin(w, req)
+            let adr = do rtWhole(ad.w, ad.resp)
+            return adr
+        let assetSub = do rtHasPrefix(path, "/assets/")
+        if assetSub:
+            let asr = do rtWhole(w, rtHandleAssets(w, req))
+            return asr
+        if path == "/metrics":
+            let mr = do rtWhole(w, rtHandleMetrics(w))
+            return mr
         if path == "/readyz":
             let rz = do rtWhole(w, rtJSONResponse(200, "{\"status\":\"ready\"}\n"))
             return rz
         let pg = do rtHandlePage(w, req)
         let pr = do rtWhole(pg.w, pg.resp)
         return pr
+
+    proc rtEnvOn(key: text) -> bool uses io.env:
+        let v = lower(envVar(key))
+        return v == "1" || v == "true" || v == "on" || v == "yes"
 
     proc rtIsStreamSub(w: RtWorld, ch: int) -> bool:
         let mut i = 0
@@ -355,10 +433,17 @@ app RuntimeServer:
                         else:
                             let frame = recv(frames)
                             ok = do httpServerWriteChunk(c, textToBytes(frame))
+                    # The client is gone: close its frame channel first, so a
+                    # frame the loop sends before it hears "U" is refused at
+                    # once instead of waiting forever for a reader that has
+                    # left — the loop serves every connection, and must never
+                    # block on one.
+                    let dropped = closeChannel(frames)
                     let un = send(ch, rtPack(["U", "" + frames]))
                     open = false
                 else:
-                    let mut resp = HttpServerResponse{status: toInt(f[1]), reason: "", headers: rtHeadersAt(f, 3), body: f[2]}
+                    let body = recv(reply)
+                    let mut resp = HttpServerResponse{status: toInt(f[1]), reason: "", headers: rtHeadersAt(f, 2), body: body}
                     if resp.status == 304:
                         # net/http's own rule for 304: no body, and the
                         # Content-Type/Content-Length a handler set are dropped.
@@ -383,25 +468,32 @@ app RuntimeServer:
     # /api/rtConfigure instead. The environment is read first: a shared
     # cell nothing assigned may not be read.
     struct RtConfig:
+        fromEnv: bool
         port: int
         irPath: text
 
+    # RT_PORT=0 is a real setting (any free port), so "configured by the
+    # environment" is whether RT_PORT is set at all, not whether it is 0.
     proc rtConfigFromEnv() -> RtConfig uses io.env:
         let envPort = envSet("RT_PORT")
         if envPort:
-            return RtConfig{port: toInt(envVar("RT_PORT")), irPath: envVar("RT_IR")}
-        return RtConfig{port: 0, irPath: ""}
+            return RtConfig{fromEnv: true, port: toInt(envVar("RT_PORT")), irPath: envVar("RT_IR")}
+        return RtConfig{fromEnv: false, port: 0, irPath: ""}
 
     daemon RuntimeServe uses io.file, io.net.listen, io.env, io.console, io.net:
         let cfg = do rtConfigFromEnv()
         let mut port = cfg.port
         let mut irPath = cfg.irPath
-        if port == 0:
+        if !cfg.fromEnv:
             port = rtPort
             irPath = rtIRPath
         let src = readFile(irPath)
         let jv = do jsonParse(src)
         let g0 = do irGraphFromJVal(jv)
+        # the name tables exist before anything looks a name up
+        let preIndexed = do rtIndexNames(g0, [])
+        rtCollsCache = RtCollsCache{ok: false, pages: 0, colls: RtColls{names: [], all: [], fields: [], logOps: false, ops: []}}
+        rtAppColls = RtAppColls{ok: false, comps: 0, acts: 0, ops: []}
         let g = do rtInjectContractEntity(g0)
         let mut master = envVar("FACET_SECRET")
         if master == "":
@@ -410,7 +502,13 @@ app RuntimeServer:
         do rtSetProcTable(g.procs)
         do rtSetStoreEntities(g)
         do rtSetReadRules(g)
-        let mut w = do rtWorldNew(g, master, envVar("FACET_API_READ"))
+        # the base stylesheet the host handed over (facet-base.css, beside
+        # facet.js in the data directory): the Go build's own copy
+        let baseCSS = readFile("facet-base.css")
+        let mut w = do rtWorldNew(g, master, envVar("FACET_API_READ"), baseCSS)
+        let indexed = do rtIndexNames(g, w.entNames)
+        let appCollsIndexed = do rtIndexAppColls(g)
+        let streamIndexed = do rtIndexStream(g)
         w.secure = envVar("FACET_SECURE_COOKIES") == "1"
         let rc = do rtRateConfig()
         let hasUp = envSet("FACET_UPLOAD_DIR")
@@ -422,6 +520,11 @@ app RuntimeServer:
         let hasTotal = envSet("FACET_MAX_MEDIA_MB")
         if hasTotal && toInt(envVar("FACET_MAX_MEDIA_MB")) > 0:
             w.uploadTotalCap = toInt(envVar("FACET_MAX_MEDIA_MB")) * 1024 * 1024
+        w.multiTenant = do rtEnvOn("FACET_MULTI_TENANT")
+        w.billing = do rtEnvOn("FACET_BILLING")
+        w = do rtLoadI18n(w)
+        # adminEnabled: the console is on unless FACET_ADMIN is exactly "0"
+        w.adminOn = envVar("FACET_ADMIN") != "0"
         let hasIdem = envSet("FACET_WEBHOOK_IDEM_TTL")
         if hasIdem && toInt(envVar("FACET_WEBHOOK_IDEM_TTL")) > 0:
             w.idemTTL = toInt(envVar("FACET_WEBHOOK_IDEM_TTL"))
@@ -446,6 +549,21 @@ app RuntimeServer:
                 let e0 = writeStderr("facet: " + opened.err + "\n")
                 let x0 = exitProcess(1)
             w = opened.w
+        # startCluster: FACET_CLUSTER=1 joins the instances sharing this
+        # store — which must be a shared one — and subscribes to the feed
+        # before serving anything, so no peer's announcement is missed.
+        let noFeed = do httpStreamFailed("")
+        let mut feed = RtFeed{ok: false, gone: false, err: "", stream: noFeed}
+        if envVar("FACET_CLUSTER") == "1":
+            if !w.storeOn:
+                let ce = writeStderr("facet: FACET_CLUSTER=1 requires the facetql:// store — clustering has no shared bus over the in-memory store, since each process would only ever hear its own publishes\n")
+                let cx = exitProcess(1)
+            feed = do rtOpenFeed(w.fqlBase, w.fqlToken, 0, 15000)
+            if !feed.ok:
+                let fe = writeStderr("facet: subscribe to the FacetQL event feed: " + feed.err + "\n")
+                let fx = exitProcess(1)
+            w.clusterOn = true
+            w.instanceID = toHex(randomBytes(8))
         w = do cRecordContractVersion(w)
         w = do rtRunOnStartJobs(w)
         let booted = do rtStoreCommit(w)
@@ -462,11 +580,85 @@ app RuntimeServer:
         w = do rtFanoutEvents(w)
         let js = readFile("facet.js")
         let ch = channel()
+        if w.clusterOn:
+            detach rtClusterReceiver(ch, w.fqlBase, w.fqlToken, feed.stream)
+            detach rtClusterPurger(ch)
+        # schedule: each `every Ns` job ticks on its own interval (the first
+        # tick one interval out), and the loop runs it
+        let mut ji = 0
+        loop ji < len(w.g.jobs):
+            if w.g.jobs[ji].every > 0:
+                detach rtJobTicker(ch, ji, w.g.jobs[ji].every)
+            ji = ji + 1
         detach rtLoop(ch, w, js)
         let l = listen(port)
+        # The port actually bound — RT_PORT=0 asks the kernel for one — is
+        # announced, so whoever started this process can reach it without
+        # choosing a port for it first (and racing another process for it).
+        let bound = listenerPort(l)
+        let banner = writeStdout("Facet runtime serving " + w.g.app + " on port " + bound + "\n")
         loop true:
             let c = accept(l)
             detach rtServeConn(c, ch)
+
+    # rtJobTicker: schedule's ticker — a "T" to the loop every interval
+    # (in the ten-minute steps sleepMs allows).
+    proc rtJobTicker(ch: int, at: int, everySecs: int):
+        loop true:
+            let mut left = everySecs * 1000
+            loop left > 0:
+                let mut step = left
+                if step > 600000:
+                    step = 600000
+                let slept = sleepMs(step)
+                left = left - step
+            let sent = send(ch, rtPack(["T", "" + at]))
+
+    # rtRunPeriodicJob: one tick of an `every Ns` job — clustered, only the
+    # instance that wins the tick's cron reservation runs it (ReserveCron);
+    # the action runs under the system session and commits like any other
+    # (work: done, or — a cron job carries no retries — dead-lettered).
+    proc rtRunPeriodicJob(w0: RtWorld, at: int) -> RtWorld uses io.net, io.console:
+        let mut w = w0
+        let j = w.g.jobs[at]
+        if w.clusterOn:
+            let won = do rtReserveCron(w, j.name, j.every)
+            if !won:
+                return w
+        let ai = do rtActionIndex(w.g, j.action)
+        if ai < 0:
+            w.met = do rtMetJob(w.met, "dead")
+            return w
+        let si = do rtSessionIndex(w, "__system")
+        if si < 0:
+            let mut sys = do rtNewSession(w, "__system", "system", "admin")
+            sys.verified = true
+            w = do rtPutSession(w, sys)
+        let before = w
+        let run = do rtRunActionValue(w, "__system", w.g.actions[ai], [])
+        w = run.w
+        if run.status != 200:
+            let e = writeStderr("facet: job dead-lettered: " + j.action + ": " + run.msg + "\n")
+            w.met = do rtMetJob(w.met, "dead")
+            let failedDone = do rtStoreCommit(w)
+            if failedDone.ok:
+                w = failedDone.w
+            return w
+        let done = do rtStoreCommit(w)
+        if !done.ok:
+            let e2 = writeStderr("facet: job " + j.action + ": the store refused the write: " + done.err + "\n")
+            let mut back = before
+            back.met = do rtMetJob(before.met, "dead")
+            return back
+        w = done.w
+        let changed = w.pendingChanged
+        w.pendingChanged = []
+        if len(changed) > 0:
+            w = do rtBroadcast(w, changed)
+        w = do rtFanoutEvents(w)
+        w = do rtClusterSync(w)
+        w.met = do rtMetJob(w.met, "done")
+        return w
 
     # rtRunOnStartJobs: runOnStartJobs — the system session exists, then
     # every `on start` job's action runs under it, in order, before the

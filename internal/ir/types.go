@@ -223,6 +223,11 @@ func (e *env) exprType(ex ast.Expr, sc scope) vtype {
 				if f, ok := e.records[rb.rec][t.Field]; ok {
 					return vtype{core: f.typ, list: f.list}
 				}
+				// a proc struct an action bound (it arrives as the record
+				// its fields spell): a field that is a scalar or a list of one
+				if f, ok := e.structs[rb.rec][t.Field]; ok && !f.mapped && f.depth <= 1 {
+					return vtype{core: f.typ, list: f.list}
+				}
 				return vtype{}
 			}
 		}
@@ -273,7 +278,15 @@ func (e *env) exprType(ex ast.Expr, sc scope) vtype {
 			return fn.ret
 		}
 		switch t.Name {
-		case "upper", "lower", "trim", "ago", "compact", "commas", "take", "replace", "slug":
+		case "take":
+			// A list's prefix is that list's type; a text's, text.
+			if len(t.Args) == 2 {
+				if at := e.exprType(t.Args[0], sc); at.list {
+					return at
+				}
+			}
+			return vtype{core: "text"}
+		case "upper", "lower", "trim", "ago", "compact", "commas", "replace", "slug":
 			return vtype{core: "text"}
 		case "money":
 			// money() is the *formatter*: it renders int cents as text. The `money`

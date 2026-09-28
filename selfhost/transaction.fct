@@ -177,6 +177,10 @@ app TransactionSelfHost:
         name: text
         kind: text
         field: text
+        # a folded index (text.rs's TextIndexDef::folded): postings of the
+        # field lowered, serving `op(lower(item.f), "…")`. Not in the
+        # definition's bytes — the record carrying it says which it is.
+        folded: bool
 
     # `Declared { data: Vec<IndexDef>, text: Vec<TextIndexDef> }`.
     struct Declared:
@@ -187,7 +191,10 @@ app TransactionSelfHost:
         return IndexDef{name: name, kind: kind, field: field, unique: unique}
 
     proc textIndexDefNew(name: text, kind: text, field: text) -> TextIndexDef:
-        return TextIndexDef{name: name, kind: kind, field: field}
+        return TextIndexDef{name: name, kind: kind, field: field, folded: false}
+
+    proc textIndexDefFolded(d: TextIndexDef) -> TextIndexDef:
+        return TextIndexDef{name: d.name, kind: d.kind, field: d.field, folded: true}
 
     proc declaredEmpty() -> Declared:
         return Declared{dataDefs: [], textDefs: []}
@@ -311,7 +318,11 @@ app TransactionSelfHost:
             let def = defs[i]
             let value = do jsonObjectGet(decoded, def.field)
             if value.kind == "text":
-                let textLen = byteLen(value.textVal)
+                # the bound is on what the index stores: a folded index
+                # stores the lowered text
+                let mut textLen = byteLen(value.textVal)
+                if def.folded:
+                    textLen = byteLen(lower(value.textVal))
                 if textLen > maxTextLen:
                     let msg = "field '" + def.field + "' holds " + textLen + " bytes of text, over the " + maxTextLen + "-byte maximum for the inverted index '" + def.name + "'. Every byte is a posting, so the bound is a bound on how much index writing one request may impose."
                     return CheckResult{ok: false, err: msg}

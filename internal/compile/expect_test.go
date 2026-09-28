@@ -263,3 +263,54 @@ app Host:
 		t.Fatalf("a differing signature must be refused, got %v", err)
 	}
 }
+
+// An expected action stands for the host's server action: a fragment may
+// `run` it standalone (the stand-in is placed on the authority), and a host
+// whose action differs in @internal from the expectation is refused.
+func TestExpectActionRunnableAndInternal(t *testing.T) {
+	frag := `app Host:
+    expect action recordReport(user: text) @internal
+    entity R:
+        id: int
+        who: text
+    action report(who: text):
+        add R { who: who }
+        run recordReport(who)
+`
+	if _, err := String(frag); err != nil {
+		t.Fatalf("a fragment must run its expected action standalone: %v", err)
+	}
+	host := func(mod string) string {
+		return "import \"frag.fct\"\n\napp Host:\n    entity Standing:\n        id: int\n        who: text\n    action recordReport(user: text)" + mod + ":\n        add Standing { who: user }\n    view Home at \"/\":\n        text \"hi\"\n"
+	}
+	if _, err := File(writeModules(t, map[string]string{"main.fct": host(" @internal"), "frag.fct": frag})); err != nil {
+		t.Fatalf("a matching @internal host action discharges it: %v", err)
+	}
+	_, err := File(writeModules(t, map[string]string{"main.fct": host(""), "frag.fct": frag}))
+	if err == nil || !strings.Contains(err.Error(), "to be @internal, but this app's action (line 7) is client-callable") {
+		t.Fatalf("a client-callable host action must be refused, got %v", err)
+	}
+}
+
+// A host action whose parameters extend the expected ones with optional
+// parameters only — and whose reply the fragment does not read — serves
+// the fragment's calls; a required extra parameter, a renamed or retyped
+// one, or an optional one the host makes required does not.
+func TestExpectActionOptionalTail(t *testing.T) {
+	frag := "app Frag:\n    expect action post(body: text)\n    state draft: text = \"\" @client\n    component Box():\n        button \"Post\" -> post(draft)\n"
+	host := func(sig string) string {
+		return "import \"frag.fct\"\napp Host:\n    type Out:\n        id: int\n    action " + sig + ":\n        return Out{id: 1}\n    view V at \"/\":\n        use Box()\n"
+	}
+	if _, err := File(writeModules(t, map[string]string{"main.fct": host("post(body: text, is_nsfw: bool?, tags: [text]?) -> Out"), "frag.fct": frag})); err != nil {
+		t.Fatalf("an optional tail must fit: %v", err)
+	}
+	for _, sig := range []string{"post(body: text, is_nsfw: bool) -> Out", "post(text: text) -> Out", "post(body: int) -> Out"} {
+		if _, err := File(writeModules(t, map[string]string{"main.fct": host(sig), "frag.fct": frag})); err == nil || !strings.Contains(err.Error(), "expects action post(body: text)") {
+			t.Errorf("%s: err = %v, want a refusal", sig, err)
+		}
+	}
+	optFrag := strings.Replace(frag, "post(body: text)", "post(body: text?)", 1)
+	if _, err := File(writeModules(t, map[string]string{"main.fct": host("post(body: text) -> Out"), "frag.fct": optFrag})); err == nil {
+		t.Error("a host requiring what the fragment may omit must not fit")
+	}
+}

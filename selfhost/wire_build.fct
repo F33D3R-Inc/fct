@@ -32,6 +32,8 @@ app WireBuildSelfHost:
         name: text
         schema: text
         query: bool
+        # internal: `type Name @internal:` — never on the wire
+        internal: bool
         fields: [WField]
 
     struct WVariant:
@@ -142,7 +144,7 @@ app WireBuildSelfHost:
         return WFieldR{err: "", field: WField{name: fn, type: core, list: list, optional: optional, hasDefault: hasDef, default: def, description: "", aliases: [], enum: [], into: "", nullable: nullable, map: isMap, depth: depth}, skip: false}
 
     proc wTypeErr(msg: text) -> WType:
-        return WType{err: msg, name: "", schema: "", query: false, fields: []}
+        return WType{err: msg, name: "", schema: "", query: false, internal: false, fields: []}
 
     proc wParseType(header: text, bodySrc: text) -> WType:
         let h0 = do vpTrimPrefix(trim(header), "type")
@@ -167,6 +169,11 @@ app WireBuildSelfHost:
                 return e1
             schema = sn
             name = trim(slice(name, 0, ai))
+        let mut internal = false
+        let isI = do vpHasSuffix(name, " @internal")
+        if isI:
+            internal = true
+            name = trim(slice(name, 0, len(name) - 10))
         let mut query = false
         let isQ = do vpHasSuffix(name, " query")
         if isQ:
@@ -204,7 +211,7 @@ app WireBuildSelfHost:
         if len(fields) == 0:
             let e5 = do wTypeErr("type \"" + name + "\" has no fields")
             return e5
-        return WType{err: "", name: name, schema: schema, query: query, fields: fields}
+        return WType{err: "", name: name, schema: schema, query: query, internal: internal, fields: fields}
 
     proc vpIndexOutside(s: text, sep: text) -> int:
         let cs = split(s, "")
@@ -714,7 +721,7 @@ app WireBuildSelfHost:
             if rf.err != "":
                 let e6 = do wBuiltErr(rf.err)
                 return e6
-            irTypes = append(irTypes, IRWireType{name: t4.name, schema: t4.schema, query: t4.query, fields: rf.fields})
+            irTypes = append(irTypes, IRWireType{name: t4.name, schema: t4.schema, query: t4.query, internal: t4.internal, fields: rf.fields})
             p = p + 1
         let mut irMsgs = []
         let mut q = 0
@@ -1444,6 +1451,13 @@ app WireBuildSelfHost:
     proc wRoutesErr(msg: text) -> WRoutes:
         return WRoutes{err: msg, actions: [], apis: [], contract: [], streams: []}
 
+    # wRoutesErrAt: a route's refusal at its declaration's line — "line N:
+    # …", as build.go's BuildError{ap.Line, …} — unless msg names one.
+    proc wRoutesErrAt(line: int, msg: text) -> WRoutes:
+        if line > 0 && !hasPrefixText(msg, "line "):
+            return WRoutes{err: "line " + line + ": " + msg, actions: [], apis: [], contract: [], streams: []}
+        return WRoutes{err: msg, actions: [], apis: [], contract: [], streams: []}
+
     proc wFindAction(actions: [IRAction], name: text) -> int:
         let n = len(actions)
         let mut i = 0
@@ -1519,6 +1533,8 @@ app WireBuildSelfHost:
             if ai < 0:
                 return WDispatch{err: "line " + line + ": " + msg.name + " variant " + wq + " runs unknown action " + aq, actions: actions0}
             let act = actions[ai]
+            if act.internal:
+                return WDispatch{err: "line " + line + ": " + msg.name + " variant " + wq + " runs @internal action " + aq + " — an internal action is never reached over HTTP", actions: actions0}
             let mut bound = []
             if v.bodyParam != "":
                 let mut ok = false
@@ -1566,7 +1582,7 @@ app WireBuildSelfHost:
                     return WDispatch{err: "line " + line + ": " + msg.name + " variant " + wq + " does not carry action " + aq + "'s required parameter " + rq, actions: actions0}
                 pk = pk + 1
             if act.placement != "server":
-                actions[ai] = IRAction{name: act.name, params: act.params, requires: act.requires, optimistic: act.optimistic, ret: act.ret, retList: act.retList, placement: "server", reason: "serves " + ap.method + " " + ap.path + " (" + wn + ") — an endpoint runs on the authority", writes: act.writes, reads: act.reads, seal: act.seal, body: act.body, builtin: act.builtin}
+                actions[ai] = IRAction{name: act.name, params: act.params, requires: act.requires, optimistic: act.optimistic, ret: act.ret, retList: act.retList, placement: "server", reason: "serves " + ap.method + " " + ap.path + " (" + wn + ") — an endpoint runs on the authority", writes: act.writes, reads: act.reads, seal: act.seal, body: act.body, builtin: act.builtin, internal: act.internal}
             vi = vi + 1
         return WDispatch{err: "", actions: actions}
 
@@ -1595,20 +1611,20 @@ app WireBuildSelfHost:
                     # `api POST "/events" -> Mutation`: a dispatching route.
                     let dr = do wDispatchRoute(ap, messages[mi], actions, apiKeys, rd.line)
                     if dr.err != "":
-                        let ed = do wRoutesErr(dr.err)
+                        let ed = do wRoutesErrAt(rd.line, dr.err)
                         return ed
                     actions = dr.actions
                     apiKeys = append(apiKeys, ap.method + " " + ap.path)
                     apiLines = append(apiLines, rd.line)
                     if docs.body != "" || len(docs.errors) > 0 || len(docs.paramDocs) > 0:
-                        let edd = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\" -> " + messages[mi].name + ": a dispatching route documents its variants in the message — its block takes only summary, description and operation")
+                        let edd = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\" -> " + messages[mi].name + ": a dispatching route documents its variants in the message — its block takes only summary, description and operation")
                         return edd
                     apis = append(apis, IRAPI{method: ap.method, path: ap.path, params: [], action: "", status: 200, rate: ap.rate, since: ap.since, auth: "none", ret: "", retList: false, bearer: "", basicId: "", basicSecret: "", form: false, dispatch: messages[mi].name, summary: docs.summary, description: docs.description, body: "", errors: [], operation: docs.operation, paramDocs: []})
                     ri = ri + 1
                     continue
                 let ai = do wFindAction(actions, ap.action)
                 if ai < 0:
-                    let e1 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\" targets unknown action \"" + ap.action + "\"")
+                    let e1 = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\" targets unknown action \"" + ap.action + "\"")
                     return e1
                 let act = actions[ai]
                 if act.placement != "server":
@@ -1617,13 +1633,28 @@ app WireBuildSelfHost:
                     let mut ti = 0
                     loop ti < nt:
                         if touched[ti] in clientStates:
-                            let e2 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\" targets action \"" + ap.action + "\", which reads or writes client-only state \"" + touched[ti] + "\"; an endpoint runs on the authority, which cannot see ephemeral client state")
+                            let e2 = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\" targets action \"" + ap.action + "\", which reads or writes client-only state \"" + touched[ti] + "\"; an endpoint runs on the authority, which cannot see ephemeral client state")
                             return e2
                         ti = ti + 1
-                    actions[ai] = IRAction{name: act.name, params: act.params, requires: act.requires, optimistic: act.optimistic, ret: act.ret, retList: act.retList, placement: "server", reason: "serves api " + ap.method + " " + ap.path + " — an endpoint runs on the authority", writes: act.writes, reads: act.reads, seal: act.seal, body: act.body, builtin: act.builtin}
+                    actions[ai] = IRAction{name: act.name, params: act.params, requires: act.requires, optimistic: act.optimistic, ret: act.ret, retList: act.retList, placement: "server", reason: "serves api " + ap.method + " " + ap.path + " — an endpoint runs on the authority", writes: act.writes, reads: act.reads, seal: act.seal, body: act.body, builtin: act.builtin, internal: act.internal}
+                # an internal type is never an api route's parameter or reply
+                let nwt = len(wireTypes)
+                let mut wti = 0
+                loop wti < nwt:
+                    let it = wireTypes[wti]
+                    if it.internal:
+                        let mut usesIt = act.ret == it.name
+                        let mut pi2 = 0
+                        loop pi2 < len(act.params):
+                            usesIt = usesIt || act.params[pi2].type == it.name
+                            pi2 = pi2 + 1
+                        if usesIt:
+                            let ein2 = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\" -> " + ap.action + " takes or answers " + it.name + ", a `type " + it.name + " @internal` — an internal type is never on the wire; declare it without @internal to publish it")
+                            return ein2
+                    wti = wti + 1
                 let key = ap.method + " " + ap.path
                 if key in apiKeys:
-                    let e3 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\" redeclared")
+                    let e3 = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\" redeclared")
                     return e3
                 apiKeys = append(apiKeys, key)
                 apiLines = append(apiLines, rd.line)
@@ -1645,15 +1676,15 @@ app WireBuildSelfHost:
                                 found = pi
                             pi = pi + 1
                         if found < 0:
-                            let e4 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": path parameter {" + pn + "} is not a parameter of action \"" + ap.action + "\"")
+                            let e4 = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\": path parameter {" + pn + "} is not a parameter of action \"" + ap.action + "\"")
                             return e4
                         if act.params[found].list:
-                            let e5 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": path parameter {" + pn + "} is a list — a path segment carries one value; take the list from the query or body instead")
+                            let e5 = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\": path parameter {" + pn + "} is a list — a path segment carries one value; take the list from the query or body instead")
                             return e5
                         pathParams = append(pathParams, pn)
                     else:
                         if contains(sg, "{") || contains(sg, "}"):
-                            let e6 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": a path parameter is a whole segment, {name}")
+                            let e6 = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\": a path parameter is a whole segment, {name}")
                             return e6
                     si = si + 1
                 if ap.method == "GET" || ap.method == "DELETE":
@@ -1661,21 +1692,21 @@ app WireBuildSelfHost:
                     let mut bj = 0
                     loop bj < np2:
                         if act.params[bj].type == "bytes" && !(act.params[bj].name in pathParams):
-                            let e7 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": action \"" + ap.action + "\" has a `bytes` parameter \"" + act.params[bj].name + "\", which uploads a file — GET and DELETE carry no request body to upload it in")
+                            let e7 = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\": action \"" + ap.action + "\" has a `bytes` parameter \"" + act.params[bj].name + "\", which uploads a file — GET and DELETE carry no request body to upload it in")
                             return e7
                         bj = bj + 1
                 let mut status = ap.status
                 if status == 0:
                     status = 200
                 if status == 204 && act.ret != "":
-                    let e8 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\" answers 204 (no content) but action \"" + ap.action + "\" returns a value")
+                    let e8 = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\" answers 204 (no content) but action \"" + ap.action + "\" returns a value")
                     return e8
                 let mut auth = "none"
                 if len(act.requires) > 0:
                     auth = "session"
                 if ap.bearer != "":
                     if len(act.requires) > 0:
-                        let e9 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\" authenticates with " + ap.authScheme + " bearer tokens, so action \"" + ap.action + "\" cannot also require a session policy")
+                        let e9 = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\" authenticates with " + ap.authScheme + " bearer tokens, so action \"" + ap.action + "\" cannot also require a session policy")
                         return e9
                     let mut bok = false
                     let np3 = len(act.params)
@@ -1685,20 +1716,23 @@ app WireBuildSelfHost:
                             bok = true
                         bk = bk + 1
                     if !bok:
-                        let e10 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": bearer parameter \"" + ap.bearer + "\" must be a text parameter of action \"" + ap.action + "\"")
+                        let e10 = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\": bearer parameter \"" + ap.bearer + "\" must be a text parameter of action \"" + ap.action + "\"")
                         return e10
                     if ap.bearer in pathParams:
-                        let e11 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": {" + ap.bearer + "} is a path parameter, not the bearer credential")
+                        let e11 = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\": {" + ap.bearer + "} is a path parameter, not the bearer credential")
                         return e11
                     if ap.authScheme == "none" || ap.authScheme == "session":
-                        let e12 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": auth scheme \"" + ap.authScheme + "\" is reserved; name the credential (e.g. dev_token)")
+                        let e12 = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\": auth scheme \"" + ap.authScheme + "\" is reserved; name the credential (e.g. dev_token)")
                         return e12
                     auth = ap.authScheme
+                if act.internal:
+                    let ein = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\" routes to @internal action \"" + ap.action + "\" — an internal action is reached only from the authority (run, job, trigger), never over HTTP")
+                    return ein
                 if ap.basicId != "":
                     # The Basic credential is the app's own client id and
                     # secret, verified by the action — never a session.
                     if len(act.requires) > 0:
-                        let e9b = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\" authenticates with " + ap.authScheme + " basic credentials, so action \"" + ap.action + "\" cannot also require a session policy")
+                        let e9b = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\" authenticates with " + ap.authScheme + " basic credentials, so action \"" + ap.action + "\" cannot also require a session policy")
                         return e9b
                     let creds = [ap.basicId, ap.basicSecret]
                     let mut ci = 0
@@ -1712,36 +1746,36 @@ app WireBuildSelfHost:
                                 cok = true
                             ck = ck + 1
                         if !cok:
-                            let e10b = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": basic credential parameter \"" + cname + "\" must be a text parameter of action \"" + ap.action + "\"")
+                            let e10b = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\": basic credential parameter \"" + cname + "\" must be a text parameter of action \"" + ap.action + "\"")
                             return e10b
                         if cname in pathParams:
-                            let e11b = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": {" + cname + "} is a path parameter, not a basic credential")
+                            let e11b = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\": {" + cname + "} is a path parameter, not a basic credential")
                             return e11b
                         ci = ci + 1
                     if ap.basicId == ap.basicSecret:
-                        let e12b = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": the basic id and secret bind to two different parameters")
+                        let e12b = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\": the basic id and secret bind to two different parameters")
                         return e12b
                     if ap.authScheme == "none" || ap.authScheme == "session" || ap.authScheme == "bearer":
-                        let e13b = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": auth scheme \"" + ap.authScheme + "\" is reserved; name the credential (e.g. dev_client)")
+                        let e13b = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\": auth scheme \"" + ap.authScheme + "\" is reserved; name the credential (e.g. dev_client)")
                         return e13b
                     auth = ap.authScheme
                 if docs.form:
                     if ap.method == "GET":
-                        let ef1 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": a GET carries no request body — drop `body form`")
+                        let ef1 = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\": a GET carries no request body — drop `body form`")
                         return ef1
                     if docs.body != "":
-                        let ef2 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": `body form` and `body " + docs.body + "` name two different request bodies")
+                        let ef2 = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\": `body form` and `body " + docs.body + "` name two different request bodies")
                         return ef2
                     let npf = len(act.params)
                     let mut fk = 0
                     loop fk < npf:
                         if act.params[fk].type == "bytes":
-                            let ef3 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": a `bytes` parameter (\"" + act.params[fk].name + "\") already makes the request a multipart form — drop `body form`")
+                            let ef3 = do wRoutesErrAt(rd.line, "api " + ap.method + " \"" + ap.path + "\": a `bytes` parameter (\"" + act.params[fk].name + "\") already makes the request a multipart form — drop `body form`")
                             return ef3
                         fk = fk + 1
                 let adc = do wAPIDocsCheck(ap, docs, act, pathParams, wireTypes)
                 if adc.err != "":
-                    let eadc = do wRoutesErr(adc.err)
+                    let eadc = do wRoutesErrAt(rd.line, adc.err)
                     return eadc
                 apis = append(apis, IRAPI{method: ap.method, path: ap.path, params: pathParams, action: ap.action, status: status, rate: ap.rate, since: ap.since, auth: auth, ret: act.ret, retList: act.retList, bearer: ap.bearer, basicId: ap.basicId, basicSecret: ap.basicSecret, form: docs.form, dispatch: "", summary: docs.summary, description: docs.description, body: docs.body, errors: docs.errors, operation: docs.operation, paramDocs: adc.docs})
             ri = ri + 1
@@ -1868,7 +1902,7 @@ app WireBuildSelfHost:
                                 let e29 = do wRoutesErr("stream \"" + st.path + "\" " + kind + " -> " + hname + ": parameter \"" + ha.params[hp].name + "\" is not one of the path's {params}")
                                 return e29
                             hp = hp + 1
-                        actions[hi] = IRAction{name: ha.name, params: ha.params, requires: ha.requires, optimistic: ha.optimistic, ret: ha.ret, retList: ha.retList, placement: "server", reason: "runs on " + kind + " of stream " + st.path + " — the authority holds the connection", writes: ha.writes, reads: ha.reads, seal: ha.seal, body: ha.body, builtin: ha.builtin}
+                        actions[hi] = IRAction{name: ha.name, params: ha.params, requires: ha.requires, optimistic: ha.optimistic, ret: ha.ret, retList: ha.retList, placement: "server", reason: "runs on " + kind + " of stream " + st.path + " — the authority holds the connection", writes: ha.writes, reads: ha.reads, seal: ha.seal, body: ha.body, builtin: ha.builtin, internal: ha.internal}
                         if hevent != "":
                             let mut evType = ""
                             let ne2 = len(st.events)

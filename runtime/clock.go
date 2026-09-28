@@ -23,12 +23,36 @@ func ioMonoMs() (any, error) {
 	return int(time.Since(monoEpoch).Milliseconds()), nil
 }
 
-func ioSleepMs(ms int) (any, error) {
+func (s *Server) ioSleepMs(ms int) (any, error) {
 	if ms < 0 || ms > maxSleepMs {
 		return nil, fmt.Errorf("sleepMs: %d ms is out of range (must be 0-%d)", ms, maxSleepMs)
 	}
-	time.Sleep(time.Duration(ms) * time.Millisecond)
-	return true, nil
+	t := time.NewTimer(time.Duration(ms) * time.Millisecond)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true, nil
+	case <-s.halted:
+		return nil, errProgramHalted
+	}
+}
+
+// errProgramHalted ends a task that sleeps once its server has shut down.
+var errProgramHalted = fmt.Errorf("the program has been shut down")
+
+// haltProgram ends what a program running on this server left running
+// (Shutdown): a daemon or detached task blocked in accept, a read, recv or
+// sleepMs returns — every listener and connection closed, every channel
+// closed, every sleep cut short — and each task, failing, ends. Without it
+// a host that shut a program down (a test, `facet exec` embedders) kept its
+// daemons serving, its tickers ticking and its sockets open for the rest of
+// the process.
+func (s *Server) haltProgram() {
+	s.haltOnce.Do(func() {
+		close(s.halted)
+		s.channels.closeAll()
+		s.netConns.closeAll()
+	})
 }
 
 // ioNowMs implements nowMs(): the wall clock in milliseconds since the Unix

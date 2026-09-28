@@ -321,6 +321,10 @@ func TestFabricFacetqlClientUnitsAgainstRust(t *testing.T) {
 		"NotFound\t0\tgone\t",
 		"Status\t500\tdisk\t",
 		"Decode\t0\tGET /stats\tmissing field `x`",
+		// A Status carrying the engine's Retry-After (b), and one whose
+		// Retry-After is no delay-seconds.
+		"Status\t429\trate limited\t3",
+		"Status\t503\tbusy\tWed, 21 Oct 2015 07:28:00 GMT",
 	}
 	port = nil
 	for _, in := range errorInputs {
@@ -332,7 +336,7 @@ func TestFabricFacetqlClientUnitsAgainstRust(t *testing.T) {
 	fqltCompare(t, "error", errorInputs, port, laRust(t, "fql-error", errorInputs))
 	// a_lost_race_does_not_condemn_the_instance /
 	// unreachable_and_unauthenticated_both_fail_closed
-	for i, want := range []string{"true", "true", "true", "false", "false", "false", "true", "true"} {
+	for i, want := range []string{"true", "true", "true", "false", "false", "false", "true", "true", "true", "true"} {
 		if got := strings.Fields(port[i])[2]; got != want {
 			t.Errorf("%s implies_unhealthy = %s, want %s", errorInputs[i], got, want)
 		}
@@ -357,8 +361,9 @@ type fqltRecorder struct {
 }
 
 type fqltReply struct {
-	status int
-	body   string
+	status     int
+	body       string
+	retryAfter string // a Retry-After header to answer with, when set
 }
 
 func (r *fqltRecorder) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -373,12 +378,15 @@ func (r *fqltRecorder) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	sort.Strings(hs)
 	r.mu.Lock()
 	r.seen = append(r.seen, fmt.Sprintf("%s %s host=%s [%s] %s", req.Method, req.RequestURI, req.Host, strings.Join(hs, "; "), body))
-	reply := fqltReply{599, "no canned reply"}
+	reply := fqltReply{599, "no canned reply", ""}
 	if r.next < len(r.replies) {
 		reply = r.replies[r.next]
 	}
 	r.next++
 	r.mu.Unlock()
+	if reply.retryAfter != "" {
+		w.Header().Set("Retry-After", reply.retryAfter)
+	}
 	w.WriteHeader(reply.status)
 	io.WriteString(w, reply.body)
 }
@@ -407,39 +415,39 @@ func fqltTraceReplies() []fqltReply {
 		return `{"nodes":[` + strings.Join(nodes, ",") + `],"next":"` + next + `"}`
 	}
 	return []fqltReply{
-		{200, fqltStatsFull},
-		{200, fqltStatsOld},
-		{200, "[" + fqltNodeA + "]"},
-		{200, "[]"},
-		{200, "[]"},
-		{200, page("abc", fqltNodeA)},
-		{200, page("c1", fqltNodeA)},
-		{200, page("", nodeB)},
-		{200, fqltNodeA},
-		{404, "node not found"},
-		{200, "[" + nodeB + "]"},
-		{200, `{"count":42}`},
-		{409, "address exists"},
-		{412, "stale"},
-		{200, `{"claimed":true}`},
-		{409, "already claimed"},
-		{404, "nope"},
-		{403, "admin only"},
-		{500, "disk"},
-		{200, "{\n  \"address\": \"a\",\n  \"value\": \"7\"\n}"},
-		{200, "{}"},
-		{200, `{"nodes":[{"address":1}],"next":""}`},
-		{200, `{"count":-1}`},
-		{200, "{}"},
-		{200, `{"ok":true}`},
-		{412, "version mismatch"},
-		{200, page("", p1, p2)},
-		{200, page("", p2, p1)},
-		{200, page("", p1)},
-		{200, page("", p1, bad)},
-		{200, page("", p1, p2)},
-		{404, "no such route"},
-		{200, "data: {}\n\n"},
+		{200, fqltStatsFull, ""},
+		{200, fqltStatsOld, ""},
+		{200, "[" + fqltNodeA + "]", ""},
+		{200, "[]", ""},
+		{200, "[]", ""},
+		{200, page("abc", fqltNodeA), ""},
+		{200, page("c1", fqltNodeA), ""},
+		{200, page("", nodeB), ""},
+		{200, fqltNodeA, ""},
+		{404, "node not found", ""},
+		{200, "[" + nodeB + "]", ""},
+		{200, `{"count":42}`, ""},
+		{409, "address exists", ""},
+		{412, "stale", ""},
+		{200, `{"claimed":true}`, ""},
+		{409, "already claimed", ""},
+		{404, "nope", ""},
+		{403, "admin only", ""},
+		{500, "disk", "2"}, // the engine's Retry-After reaches the error (retry-after=2)
+		{200, "{\n  \"address\": \"a\",\n  \"value\": \"7\"\n}", ""},
+		{200, "{}", ""},
+		{200, `{"nodes":[{"address":1}],"next":""}`, ""},
+		{200, `{"count":-1}`, ""},
+		{200, "{}", ""},
+		{200, `{"ok":true}`, ""},
+		{412, "version mismatch", ""},
+		{200, page("", p1, p2), ""},
+		{200, page("", p2, p1), ""},
+		{200, page("", p1), ""},
+		{200, page("", p1, bad), ""},
+		{200, page("", p1, p2), ""},
+		{404, "no such route", ""},
+		{200, "data: {}\n\n", ""},
 	}
 }
 
@@ -545,4 +553,17 @@ func TestFabricFacetqlMoverFeedFailures(t *testing.T) {
 	if got != "subscribe='src': facetql refused the token (403): admin only\n" {
 		t.Errorf("refused subscription: %q", got)
 	}
+}
+
+// client.rs retry_after_secs: a Retry-After header read as delay-seconds
+// only, the crate and the port agreeing on every value.
+func TestFabricFacetqlRetryAfterMatchesRust(t *testing.T) {
+	ts := fqltApp(t, "fabric_facetql_client.fct")
+	values := []string{"-", "3", " 7 ", "\t9", "0", "007", "18446744073709551615", "18446744073709551616", "+3", "-1", "1.5",
+		"3s", "", " ", "Wed, 21 Oct 2015 07:28:00 GMT", "1 2", "\u00a03"}
+	var port []string
+	for _, v := range values {
+		port = append(port, fqltCall(t, ts, "fqlClientOut", "fqlRetryAfterRun", v))
+	}
+	fqltCompare(t, "retry-after", values, port, laRust(t, "fql-retry-after", values))
 }

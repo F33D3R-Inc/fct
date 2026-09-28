@@ -225,12 +225,12 @@ var checkCases = []checkCase{
 	{`writeFile("u")`, "derive", "text", "writeFile(...) takes exactly two arguments"},
 	{"listen()", "derive", "int", "listen(...) takes exactly one argument"},
 	{"readBytes(1)", "derive", "int", "readBytes(...) takes exactly two arguments"},
-	{"channel(1)", "derive", "int", "channel() takes no arguments"},
+	{"channel(1, 2)", "derive", "int", "channel() takes no arguments, or one"},
 	{"recv()", "derive", "int", "recv(ch) takes exactly one argument (the channel)"},
 	{"send(count)", "derive", "int", "send(ch, value) takes exactly two arguments"},
 
 	// ---- rejected: aggregate rules ----
-	{"count(draft)", "derive", "int", "count(...) needs a collection to range over; \"draft\" is neither an entity nor a `[T]` list state"},
+	{"count(draft)", "derive", "int", "count(...) needs a collection to range over; \"draft\" is neither an entity, a `[T]` list state, nor an action's list local"},
 	{"sum(Post.nope)", "derive", "int", `entity "Post" has no field "nope" to sum`},
 	{"exists(Post)", "derive", "bool", "exists needs a filtered form: exists(x in Post where <cond>)"},
 	{"Post(1).nope", "derive", "int", `entity "Post" has no field "nope" (in ` + "`Post(…).nope`" + ")"},

@@ -240,12 +240,12 @@ func checkDatastore(graph *ir.IR) check {
 	url := os.Getenv("FACET_DATABASE_URL")
 	where := runtime.StoreDescription("")
 	if err := probeFacetQL(url); err != nil {
-		state, fix := statusWarn, "start FacetQL, or set FACET_DATABASE_URL — `facet dev` works without one (in-memory)"
+		state, fix := statusWarn, "start FacetQL (`facet facetql`), or set FACET_DATABASE_URL — `facet dev` works without one (in-memory)"
 		if url != "" {
 			// An explicitly configured store that cannot be reached is a real
 			// misconfiguration, not a laptop default.
 			state = statusFail
-			fix = "check FACET_DATABASE_URL and that FacetQL is running"
+			fix = "check FACET_DATABASE_URL and that FacetQL is running (`facet facetql`)"
 		}
 		return check{state, "datastore", where + " unreachable: " + err.Error(), fix}
 	}

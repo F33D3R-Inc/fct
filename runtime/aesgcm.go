@@ -13,8 +13,9 @@ package runtime
 //	                                             caller that can meet a bad
 //	                                             one asks aesGcmAuthentic first
 //
-// The key is 32 bytes and the nonce 12 (AES-256, the 96-bit nonce GCM is
-// specified around); anything else is a runtime error. selfhost/aes_gcm.fct
+// The key is 32 bytes (AES-256) or 16 (AES-128, RFC 8291's aes128gcm) and
+// the nonce 12 (the 96-bit nonce GCM is specified around); anything else is
+// a runtime error. selfhost/aes_gcm.fct
 // keeps the cipher written in fct as the conformance reference these are
 // tested against.
 
@@ -52,8 +53,10 @@ func aesGcmFor(name string, keyV, nonceV any) (cipher.AEAD, []byte, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(key) != 32 {
-		return nil, nil, fmt.Errorf("%s: key is %d bytes; AES-256 takes 32", name, len(key))
+	if len(key) != 32 && len(key) != 16 {
+		// AES-256 (32 bytes) or AES-128 (16): RFC 8291's aes128gcm content
+		// encoding is the latter.
+		return nil, nil, fmt.Errorf("%s: key is %d bytes; AES-GCM takes 16 (AES-128) or 32 (AES-256)", name, len(key))
 	}
 	nonce, err := byteArg(name, "nonce", nonceV)
 	if err != nil {

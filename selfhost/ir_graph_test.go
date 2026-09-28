@@ -16,6 +16,7 @@ import (
 // must round-trip byte for byte: json.Marshal(graph) in, the port's
 // irGraphJSON out, identical.
 var irGraphApps = []string{
+	"testdata/jsonescapes/app.fct",
 	"../examples/overlay.fct", "../examples/ledger.fct", "../examples/social.fct",
 	"../examples/stage.fct", "../examples/timer.fct", "../examples/metadata.fct",
 	"../examples/media.fct", "../examples/secure.fct", "../examples/popover.fct",
@@ -28,7 +29,7 @@ var irGraphApps = []string{
 // ports at 200-450 KB) are round-tripped by TestIRGraphRoundTripsLargeApps,
 // which is what the runtime's text-builtin performance is measured against.
 var irGraphLargeApps = []string{
-	"../../facets/f33d3r.fct", "action_stmt.fct", "lower.fct", "database.fct", "ir_view.fct",
+	"../../facets/layered_demo.fct", "action_stmt.fct", "lower.fct", "database.fct", "ir_view.fct",
 }
 
 func loadIRGraphApp(t *testing.T) *httptest.Server {

@@ -36,6 +36,11 @@ app PagerSelfHost:
         # HashMap<page id, frame>): a lookup is one map read, not a scan
         # of the cache per page read.
         at: {int: int}
+        # touch: a cache hit records its use (Pager::read's LRU touch).
+        # False on a read-only view (pgrReadOnly) — a read task's copy of
+        # the writer's snapshot, discarded when the request ends, whose
+        # touches no later read could ever observe.
+        touch: bool
         tick: int
         key: [int]
         nonceBase: int
@@ -59,10 +64,10 @@ app PagerSelfHost:
     # pgrWith: the pager with these entries at the same positions (the
     # index is kept); pgrWithAt when positions changed.
     proc pgrWith(p: FqPager, pageCount: int, entries: [FqPgEntry], tick: int, nonceCounter: int) -> FqPager:
-        return FqPager{path: p.path, pageCount: pageCount, capacity: p.capacity, entries: entries, at: p.at, tick: tick, key: p.key, nonceBase: p.nonceBase, nonceCounter: nonceCounter}
+        return FqPager{path: p.path, pageCount: pageCount, capacity: p.capacity, entries: entries, at: p.at, touch: p.touch, tick: tick, key: p.key, nonceBase: p.nonceBase, nonceCounter: nonceCounter}
 
     proc pgrWithAt(p: FqPager, entries: [FqPgEntry], at: {int: int}, tick: int) -> FqPager:
-        return FqPager{path: p.path, pageCount: p.pageCount, capacity: p.capacity, entries: entries, at: at, tick: tick, key: p.key, nonceBase: p.nonceBase, nonceCounter: p.nonceCounter}
+        return FqPager{path: p.path, pageCount: p.pageCount, capacity: p.capacity, entries: entries, at: at, touch: p.touch, tick: tick, key: p.key, nonceBase: p.nonceBase, nonceCounter: p.nonceCounter}
 
     # pgrOpen: Pager::open — create the file when absent; a trailing
     # partial page (a torn extension) rounds the page count down.
@@ -74,7 +79,7 @@ app PagerSelfHost:
         let mut cap = capacity
         if cap <= 0:
             cap = 256
-        return FqPager{path: path, pageCount: size / 16384, capacity: cap, entries: [], at: {}, tick: 0, key: key, nonceBase: nonceBase, nonceCounter: 0}
+        return FqPager{path: path, pageCount: size / 16384, capacity: cap, entries: [], at: {}, touch: true, tick: 0, key: key, nonceBase: nonceBase, nonceCounter: 0}
 
     proc pgrPageCount(p: FqPager) -> int:
         return p.pageCount
@@ -89,6 +94,10 @@ app PagerSelfHost:
         let id = p.pageCount
         let q = do pgrWith(p, p.pageCount + 1, p.entries, p.tick, p.nonceCounter)
         return FqPageId{pager: q, id: id}
+
+    # pgrReadOnly: the pager as a read task's discarded copy uses it.
+    proc pgrReadOnly(p: FqPager) -> FqPager:
+        return FqPager{path: p.path, pageCount: p.pageCount, capacity: p.capacity, entries: p.entries, at: p.at, touch: false, tick: p.tick, key: p.key, nonceBase: p.nonceBase, nonceCounter: p.nonceCounter}
 
     proc pgrFind(p: FqPager, id: int) -> int:
         let i = p.at[id]
@@ -128,8 +137,7 @@ app PagerSelfHost:
         let w = writeFileAt(p.path, e.id * 16384, blob)
         let mut entries = p.entries
         entries[at] = FqPgEntry{id: e.id, body: e.body, dirty: false, tick: e.tick}
-        let q = do pgrWith(p, p.pageCount, entries, p.tick, p.nonceCounter + 1)
-        return FqPagerR{ok: true, err: "", pager: q}
+        return FqPagerR{ok: true, err: "", pager: FqPager{path: p.path, pageCount: p.pageCount, capacity: p.capacity, entries: entries, at: p.at, touch: p.touch, tick: p.tick, key: p.key, nonceBase: p.nonceBase, nonceCounter: p.nonceCounter + 1}}
 
     # pgrAdmit: admit — install the page (replacing a resident copy), then
     # evict least-recently-used pages, writing dirty ones out, until the
@@ -145,7 +153,7 @@ app PagerSelfHost:
         else:
             entries = append(entries, entry)
             index[id] = len(entries)
-        let mut p = do pgrWithAt(p0, entries, index, tick)
+        let mut p = FqPager{path: p0.path, pageCount: p0.pageCount, capacity: p0.capacity, entries: entries, at: index, touch: p0.touch, tick: tick, key: p0.key, nonceBase: p0.nonceBase, nonceCounter: p0.nonceCounter}
         loop len(p.entries) > p.capacity:
             let n = len(p.entries)
             let mut victim = 0
@@ -178,15 +186,26 @@ app PagerSelfHost:
 
     # pgrRead: read — from the cache when resident (its use recorded),
     # else from disk: bounds, decrypt, decode, then admitted clean.
+    #
+    # The hit that records its use comes last and rebuilds the pager from
+    # its sibling fields: nothing after it reads the pager whole, so an
+    # owned pager's entry list is written in place rather than copied.
     proc pgrRead(p: FqPager, id: int) -> FqPageRead uses io.file:
         let at = do pgrFind(p, id)
-        if at >= 0:
-            let tick = p.tick + 1
-            let e = p.entries[at]
-            let mut entries = p.entries
-            entries[at] = FqPgEntry{id: e.id, body: e.body, dirty: e.dirty, tick: tick}
-            let q = do pgrWith(p, p.pageCount, entries, tick, p.nonceCounter)
-            return FqPageRead{ok: true, err: "", pager: q, body: e.body}
+        if at < 0:
+            let miss = do pgrReadMiss(p, id)
+            return miss
+        if !p.touch:
+            return FqPageRead{ok: true, err: "", pager: p, body: p.entries[at].body}
+        let tick = p.tick + 1
+        let e = p.entries[at]
+        let mut entries = p.entries
+        entries[at] = FqPgEntry{id: e.id, body: e.body, dirty: e.dirty, tick: tick}
+        return FqPageRead{ok: true, err: "", pager: FqPager{path: p.path, pageCount: p.pageCount, capacity: p.capacity, entries: entries, at: p.at, touch: p.touch, tick: tick, key: p.key, nonceBase: p.nonceBase, nonceCounter: p.nonceCounter}, body: e.body}
+
+    # pgrReadMiss: a page not resident — bounds, decrypt, decode, then
+    # admitted clean.
+    proc pgrReadMiss(p: FqPager, id: int) -> FqPageRead uses io.file:
         if id < 0 || id >= p.pageCount:
             let e0 = do pgrReadErr(p, "page " + id + " is past the end of " + p.path + " (" + p.pageCount + " pages)")
             return e0
@@ -211,7 +230,7 @@ app PagerSelfHost:
         let mut count = p0.pageCount
         if id >= count:
             count = id + 1
-        let p = do pgrWith(p0, count, p0.entries, p0.tick, p0.nonceCounter)
+        let p = FqPager{path: p0.path, pageCount: count, capacity: p0.capacity, entries: p0.entries, at: p0.at, touch: p0.touch, tick: p0.tick, key: p0.key, nonceBase: p0.nonceBase, nonceCounter: p0.nonceCounter}
         let r = do pgrAdmit(p, id, body, true)
         return r
 

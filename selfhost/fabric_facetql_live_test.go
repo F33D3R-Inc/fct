@@ -39,6 +39,7 @@ var (
 
 func fqlLiveServerBin(t *testing.T) string {
 	t.Helper()
+	fqRustReference(t)
 	fqlLiveOnce.Do(func() {
 		cargo, err := exec.LookPath("cargo")
 		if err != nil {
@@ -51,7 +52,7 @@ func fqlLiveServerBin(t *testing.T) string {
 		}
 		target := os.Getenv("FCT_FACETQL_SERVER_TARGET")
 		if target == "" {
-			target = filepath.Join(os.TempDir(), "fct-facetql-server")
+			target = fqTestCargoTarget("fct-facetql-server")
 		}
 		cmd := exec.Command(cargo, "build", "--release", "--quiet", "--bin", "facetql")
 		cmd.Dir = "../../facetql"
@@ -71,8 +72,30 @@ func fqlLiveServerBin(t *testing.T) string {
 	return fqlLiveBin
 }
 
-// fqlLiveStart runs a fresh FacetQL and returns its base URL; the admin
-// token is "fabtok".
+// fqlEngines: the FacetQL engines a test that needs a real one runs
+// against — the one written in fct (selfhost/fqserver.fct, what the
+// toolchain ships) always, and the Rust reference too when asked
+// (FACETQL_REFERENCE=rust). What these tests hold to account is the fabric's
+// code; the engine is the ground it stands on.
+func fqlEngines() []string {
+	if os.Getenv(fqReferenceEnv) == "rust" {
+		return []string{"fct", "rust"}
+	}
+	return []string{"fct"}
+}
+
+// fqlLiveStartOn runs a fresh FacetQL of that engine and returns its base
+// URL; the admin token is "fabtok".
+func fqlLiveStartOn(t *testing.T, engine string) string {
+	t.Helper()
+	if engine == "rust" {
+		return fqlLiveStart(t)
+	}
+	return fdtEngineStart(t, "fct")
+}
+
+// fqlLiveStart runs a fresh Rust FacetQL (the reference, opt-in) and returns
+// its base URL; the admin token is "fabtok".
 func fqlLiveStart(t *testing.T) string {
 	t.Helper()
 	bin := fqlLiveServerBin(t)
@@ -128,7 +151,12 @@ func fqlLiveFields(t *testing.T, out string) map[string]string {
 }
 
 func TestFabricFacetqlLiveAgainstRealFacetql(t *testing.T) {
-	base := fqlLiveStart(t)
+	for _, engine := range fqlEngines() {
+		t.Run(engine, func(t *testing.T) { fqlLiveAgainst(t, fqlLiveStartOn(t, engine)) })
+	}
+}
+
+func fqlLiveAgainst(t *testing.T, base string) {
 	ts := fqltApp(t, "fabric_facetql_placement.fct")
 	flow := func(name string, shard, rows int) map[string]string {
 		t.Helper()
@@ -264,8 +292,12 @@ func TestFabricFacetqlLiveAgainstRealFacetql(t *testing.T) {
 // SSE feed, a verification that compares every field, a tampered copy
 // refused, and a source with an edge refused outright.
 func TestFabricFacetqlMoverAgainstRealFacetql(t *testing.T) {
-	src := fqlLiveStart(t)
-	dst := fqlLiveStart(t)
+	for _, engine := range fqlEngines() {
+		t.Run(engine, func(t *testing.T) { fqlMoverAgainst(t, fqlLiveStartOn(t, engine), fqlLiveStartOn(t, engine)) })
+	}
+}
+
+func fqlMoverAgainst(t *testing.T, src, dst string) {
 	ts := fqltApp(t, "fabric_facetql_mover.fct")
 	m := fqlLiveFields(t, fqltCall(t, ts, "moverOut", "moverRunLive", "copy", src, dst, "fabtok", ""))
 	edge := "true NotIdentical 'src' holds 1 edge(s). FacetQL exposes edges only per node (GET /node/:address/edges/out) and refuses an edge whose far endpoint is not readable on the instance it is written to, so an edge leaving this cell cannot be reconstructed on the destination. Copying the nodes alone would produce a destination that looks complete and is not"
@@ -303,15 +335,21 @@ func TestFabricFacetqlMoverAgainstRealFacetql(t *testing.T) {
 // `fql-mover`) against its own fresh pair of FacetQL instances: every line
 // the port reports must be the line the Rust reports.
 func TestFabricFacetqlMoverMatchesRustMover(t *testing.T) {
+	for _, engine := range fqlEngines() {
+		t.Run(engine, func(t *testing.T) { fqlMoverMatchesRust(t, engine) })
+	}
+}
+
+func fqlMoverMatchesRust(t *testing.T, engine string) {
 	bin := laCheck(t)
-	rustSrc, rustDst := fqlLiveStart(t), fqlLiveStart(t)
+	rustSrc, rustDst := fqlLiveStartOn(t, engine), fqlLiveStartOn(t, engine)
 	out, err := exec.Command(bin, "fql-mover", rustSrc, rustDst, "fabtok").Output()
 	if err != nil {
 		t.Fatalf("fabric_check fql-mover: %v", err)
 	}
 	rust := fqlLiveFields(t, strings.TrimSuffix(string(out), "\n"))
 
-	src, dst := fqlLiveStart(t), fqlLiveStart(t)
+	src, dst := fqlLiveStartOn(t, engine), fqlLiveStartOn(t, engine)
 	ts := fqltApp(t, "fabric_facetql_mover.fct")
 	port := fqlLiveFields(t, fqltCall(t, ts, "moverOut", "moverRunLive", "copy", src, dst, "fabtok", ""))
 

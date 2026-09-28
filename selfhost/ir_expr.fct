@@ -113,158 +113,121 @@ app IRExprSelfHost:
         return IRExpr{kind: "agg", hasVal: false, val: "", vtype: "", name: coll, field: field, obj: [], key: [], op: op, args: [], keys: [], fields: [], l: [], r: [], x: [], itemVar: itemVar, where: where, sel: sel, order: "", desc: false, limit: [], orderBy: [], omit: [], nulls: []}
 
     # ── JSON ────────────────────────────────────────────────────────────────
-    # jsonQuote: a JSON string literal for s, spelled as encoding/json spells
-    # it: `"` and `\` escaped, \n \r \t \b \f by name, every other
-    # control character as \u00xx, and — because Go's encoder is HTML-safe
-    # by default — `<`, `>`, `&`, U+2028 and U+2029 as \u003c, \u003e,
-    # \u0026, \u2028 and \u2029 (an operator like `>=` therefore reads
-    # "\u003e=" in the real compiler's IR, and here). A string literal's
-    # escapes put any of these in source text.
-    proc jsonQuote(s: text) -> text:
-        let a = replace(s, "\\", "\\\\")
-        let b = replace(a, "\"", "\\\"")
-        let c = replace(b, "\n", "\\n")
-        let d = replace(c, "\t", "\\t")
-        let e = replace(d, "\r", "\\r")
-        let f = replace(e, "<", "\\u003c")
-        let g = replace(f, ">", "\\u003e")
-        let h = replace(g, "&", "\\u0026")
-        let bs = textToBytes(h)
-        let n = len(bs)
-        let mut rare = false
-        let mut i = 0
-        loop i < n && !rare:
-            let x = bs[i]
-            if x < 32 || (x == 226 && i + 2 < n && bs[i + 1] == 128 && (bs[i + 2] == 168 || bs[i + 2] == 169)):
-                rare = true
-            i = i + 1
-        if !rare:
-            return "\"" + h + "\""
-        let hex = "0123456789abcdef"
-        let mut out = ""
-        let mut from = 0
-        let mut j = 0
-        loop j < n:
-            let y = bs[j]
-            let mut esc = ""
-            let mut width = 1
-            if y < 32:
-                esc = "\\u00" + charAt(hex, y / 16) + charAt(hex, y % 16)
-                if y == 8:
-                    esc = "\\b"
-                if y == 12:
-                    esc = "\\f"
-            if y == 226 && j + 2 < n && bs[j + 1] == 128 && (bs[j + 2] == 168 || bs[j + 2] == 169):
-                esc = "\\u2028"
-                if bs[j + 2] == 169:
-                    esc = "\\u2029"
-                width = 3
-            if esc != "":
-                out = out + bytesToText(slice(bs, from, j)) + esc
-                from = j + width
-            j = j + width
-        out = out + bytesToText(slice(bs, from, n))
-        return "\"" + out + "\""
+    # A JSON string literal is the jsonQuote(s) builtin: encoding/json's own
+    # spelling (HTML-safe — `>=` reads "\u003e=" in the real compiler's IR,
+    # and here).
 
+    # The encoder writes one list of text parts that every node of the tree
+    # appends to (irExprParts), joined once at the top: a child's JSON is
+    # written straight into its parent's output rather than built as a
+    # string of its own and copied into the parent's, level by level —
+    # which cost a tree's size times its depth. The list is handed down and
+    # back (each call's result is its caller's own), so it grows in place.
     proc irListJSON(xs: [IRExpr]) -> text:
+        let parts = irListParts([], xs)
+        return join(parts, "")
+
+    proc irListParts(parts: [text], xs: [IRExpr]) -> [text]:
+        let mut out = append(parts, "[")
         let n = len(xs)
-        let mut out = "["
         let mut i = 0
         loop i < n:
             if i > 0:
-                out = out + ","
-            let j = do irExprJSON(xs[i])
-            out = out + j
+                out = append(out, ",")
+            out = irExprParts(out, xs[i])
             i = i + 1
-        return out + "]"
+        out = append(out, "]")
+        return out
 
     proc textListJSON(xs: [text]) -> text:
+        let parts = textListParts([], xs)
+        return join(parts, "")
+
+    proc textListParts(parts: [text], xs: [text]) -> [text]:
+        let mut out = append(parts, "[")
         let n = len(xs)
-        let mut out = "["
         let mut i = 0
         loop i < n:
             if i > 0:
-                out = out + ","
-            let q = do jsonQuote(xs[i])
-            out = out + q
+                out = append(out, ",")
+            out = append(out, jsonQuote(xs[i]))
             i = i + 1
-        return out + "]"
+        out = append(out, "]")
+        return out
 
     # irExprJSON: exactly encoding/json over ir.Expr — key order is the
     # struct's field order, and a zero value (empty text, empty list, nil
     # child) is omitted, as `omitempty` omits it.
     proc irExprJSON(e: IRExpr) -> text:
-        let kq = do jsonQuote(e.kind)
-        let mut out = "{\"kind\":" + kq
+        let parts = irExprParts([], e)
+        return join(parts, "")
+
+    # irExprParts: parts with e's JSON appended.
+    proc irExprParts(parts: [text], e: IRExpr) -> [text]:
+        let mut out = append(parts, "{\"kind\":" + jsonQuote(e.kind))
         if e.hasVal:
             if e.vtype == "text":
-                let vq = do jsonQuote(e.val)
-                out = out + ",\"val\":" + vq
+                out = append(out, ",\"val\":" + jsonQuote(e.val))
             else:
-                out = out + ",\"val\":" + e.val
+                out = append(out, ",\"val\":" + e.val)
         if e.vtype != "":
-            let tq = do jsonQuote(e.vtype)
-            out = out + ",\"vtype\":" + tq
+            out = append(out, ",\"vtype\":" + jsonQuote(e.vtype))
         if e.name != "":
-            let nq = do jsonQuote(e.name)
-            out = out + ",\"name\":" + nq
+            out = append(out, ",\"name\":" + jsonQuote(e.name))
         if e.field != "":
-            let fq = do jsonQuote(e.field)
-            out = out + ",\"field\":" + fq
+            out = append(out, ",\"field\":" + jsonQuote(e.field))
         if len(e.obj) > 0:
-            let oj = do irExprJSON(e.obj[0])
-            out = out + ",\"obj\":" + oj
+            out = append(out, ",\"obj\":")
+            out = irExprParts(out, e.obj[0])
         if len(e.key) > 0:
-            let kj = do irExprJSON(e.key[0])
-            out = out + ",\"key\":" + kj
+            out = append(out, ",\"key\":")
+            out = irExprParts(out, e.key[0])
         if e.op != "":
-            let oq = do jsonQuote(e.op)
-            out = out + ",\"op\":" + oq
+            out = append(out, ",\"op\":" + jsonQuote(e.op))
         if len(e.args) > 0:
-            let aj = do irListJSON(e.args)
-            out = out + ",\"args\":" + aj
+            out = append(out, ",\"args\":")
+            out = irListParts(out, e.args)
         if len(e.keys) > 0:
-            let ksj = do irListJSON(e.keys)
-            out = out + ",\"keys\":" + ksj
+            out = append(out, ",\"keys\":")
+            out = irListParts(out, e.keys)
         if len(e.fields) > 0:
-            let fj = do textListJSON(e.fields)
-            out = out + ",\"fields\":" + fj
+            out = append(out, ",\"fields\":")
+            out = textListParts(out, e.fields)
         if len(e.l) > 0:
-            let lj = do irExprJSON(e.l[0])
-            out = out + ",\"l\":" + lj
+            out = append(out, ",\"l\":")
+            out = irExprParts(out, e.l[0])
         if len(e.r) > 0:
-            let rj = do irExprJSON(e.r[0])
-            out = out + ",\"r\":" + rj
+            out = append(out, ",\"r\":")
+            out = irExprParts(out, e.r[0])
         if len(e.x) > 0:
-            let xj = do irExprJSON(e.x[0])
-            out = out + ",\"x\":" + xj
+            out = append(out, ",\"x\":")
+            out = irExprParts(out, e.x[0])
         if e.itemVar != "":
-            let vq2 = do jsonQuote(e.itemVar)
-            out = out + ",\"var\":" + vq2
+            out = append(out, ",\"var\":" + jsonQuote(e.itemVar))
         if len(e.where) > 0:
-            let wj = do irExprJSON(e.where[0])
-            out = out + ",\"where\":" + wj
+            out = append(out, ",\"where\":")
+            out = irExprParts(out, e.where[0])
         if len(e.sel) > 0:
-            let sj = do irExprJSON(e.sel[0])
-            out = out + ",\"sel\":" + sj
+            out = append(out, ",\"sel\":")
+            out = irExprParts(out, e.sel[0])
         if e.order != "":
-            let orq = do jsonQuote(e.order)
-            out = out + ",\"order\":" + orq
+            out = append(out, ",\"order\":" + jsonQuote(e.order))
         if e.desc:
-            out = out + ",\"desc\":true"
+            out = append(out, ",\"desc\":true")
         if len(e.limit) > 0:
-            let lj = do irExprJSON(e.limit[0])
-            out = out + ",\"limit\":" + lj
+            out = append(out, ",\"limit\":")
+            out = irExprParts(out, e.limit[0])
         if len(e.orderBy) > 0:
-            let oj = do irExprJSON(e.orderBy[0])
-            out = out + ",\"orderBy\":" + oj
+            out = append(out, ",\"orderBy\":")
+            out = irExprParts(out, e.orderBy[0])
         if len(e.omit) > 0:
-            let mj = do textListJSON(e.omit)
-            out = out + ",\"omit\":" + mj
+            out = append(out, ",\"omit\":")
+            out = textListParts(out, e.omit)
         if len(e.nulls) > 0:
-            let nj = do textListJSON(e.nulls)
-            out = out + ",\"nulls\":" + nj
-        return out + "}"
+            out = append(out, ",\"nulls\":")
+            out = textListParts(out, e.nulls)
+        out = append(out, "}")
+        return out
 
     # ── live driver ─────────────────────────────────────────────────────────
     state irDemo: text = ""

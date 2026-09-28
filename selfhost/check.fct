@@ -227,33 +227,29 @@ app CheckSelfHost:
         return false
 
     proc allNodes(n: ExprNode) -> [ExprNode]:
-        let mut out = [n]
+        let r = do allNodesInto([], n)
+        return r
+
+    # allNodesInto: acc with n's preorder appended — one list grown in
+    # place, rather than each subtree's list copied into its parent's.
+    proc allNodesInto(acc: [ExprNode], n: ExprNode) -> [ExprNode]:
+        let mut out = append(acc, n)
         let mut i = 0
         loop i < len(n.children):
-            let sub = do allNodes(n.children[i])
-            let merged = do appendAllNodes(out, sub)
-            out = merged
+            out = allNodesInto(out, n.children[i])
             i = i + 1
         let mut j = 0
         loop j < len(n.pairs):
-            let keySub = do allNodes(n.pairs[j].key)
-            let mergedKey = do appendAllNodes(out, keySub)
-            out = mergedKey
-            let valSub = do allNodes(n.pairs[j].value)
-            let mergedVal = do appendAllNodes(out, valSub)
-            out = mergedVal
+            out = allNodesInto(out, n.pairs[j].key)
+            out = allNodesInto(out, n.pairs[j].value)
             j = j + 1
         let mut k = 0
         loop k < len(n.whereClause):
-            let whereSub = do allNodes(n.whereClause[k])
-            let mergedWhere = do appendAllNodes(out, whereSub)
-            out = mergedWhere
+            out = allNodesInto(out, n.whereClause[k])
             k = k + 1
         let mut m = 0
         loop m < len(n.sel):
-            let selSub = do allNodes(n.sel[m])
-            let mergedSel = do appendAllNodes(out, selSub)
-            out = mergedSel
+            out = allNodesInto(out, n.sel[m])
             m = m + 1
         return out
 
@@ -263,13 +259,15 @@ app CheckSelfHost:
     # restated with -1 as its "not a pure builtin" second return.
     # ============================================================
     proc pureBuiltinArity(name: text) -> int:
-        if name in ["abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day", "ago", "compact", "commas", "iso", "fromIso", "first", "fromJson", "bytes", "toFloat", "toInt", "toMoney", "slug", "textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits", "exp", "ln", "sqrt", "u64Text", "u64Parse", "u64ParseError", "u64ToFloat", "sha256Bytes", "base64UrlRaw", "bcryptHash"]:
+        if name in ["abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day", "ago", "compact", "commas", "iso", "fromIso", "first", "fromJson", "bytes", "toFloat", "toInt", "toMoney", "slug", "textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits", "exp", "ln", "sqrt", "sin", "cos", "u64Text", "u64Parse", "u64ParseError", "u64ToFloat", "sha256Bytes", "base64UrlRaw", "bcryptHash", "p256PublicKey", "fromBase64UrlRaw", "uploadBytes", "validUtf8", "jsonQuote"]:
             return 1
+        if name == "p256PrivateKey":
+            return 0
         if name == "print":
             return 1
         if name == "append":
             return 2
-        if name in ["min", "max", "contains", "take", "split", "join", "charAt", "u64Cmp", "u64Min", "u64Max", "u64SatSub", "u64Div", "u64Rem", "hmacSha256", "bcryptMatches"]:
+        if name in ["min", "max", "contains", "take", "split", "join", "charAt", "u64Cmp", "u64Min", "u64Max", "u64SatSub", "u64Div", "u64Rem", "hmacSha256", "bcryptMatches", "p256Ecdh", "es256Sign"]:
             return 2
         if name in ["slice", "replace", "aesGcmSeal", "aesGcmOpen", "aesGcmAuthentic", "indexOf"]:
             return 3
@@ -286,6 +284,8 @@ app CheckSelfHost:
         fnNames: [text]
         fnArities: [int]
         procNames: [text]
+        # procAt: proc name -> its (first) index in procNames
+        procAt: {text: int}
         procArities: [int]
         procDerives: [text]
         # listNames / jsonNames: the names in scope holding a list or a
@@ -320,7 +320,7 @@ app CheckSelfHost:
         tsc: TyScope
 
     proc emptyCallEnv() -> CallEnv:
-        return CallEnv{fnNames: [], fnArities: [], procNames: [], procArities: [], procDerives: [], listNames: [], jsonNames: [], deriveKeys: [], inAction: false, inDerive: false, inProc: false, ty: tyEmptyEnv(), tsc: tyEmptyScope(), actionNames: [], stateNames: [], stateDeclPlacements: []}
+        return CallEnv{fnNames: [], fnArities: [], procNames: [], procAt: {}, procArities: [], procDerives: [], listNames: [], jsonNames: [], deriveKeys: [], inAction: false, inDerive: false, inProc: false, ty: tyEmptyEnv(), tsc: tyEmptyScope(), actionNames: [], stateNames: [], stateDeclPlacements: []}
 
     # indexIsJson / indexIsList: checkIndexable's exprType test on an
     # index's object — a list (a list-valued name, split(...), list(...)) or
@@ -381,9 +381,13 @@ app CheckSelfHost:
             if argc != 1:
                 return "rand(n) takes exactly one argument (an exclusive upper bound)"
             return ""
-        if name == "readFile" || name == "httpGet" || name == "fileExists" || name == "fileSize" || name == "fileModTime" || name == "syncFile" || name == "removeFile" || name == "lockFile" || name == "toHex" || name == "fromHex" || name == "listen" || name == "accept" || name == "closeListener" || name == "listenError" || name == "listenerPort" || name == "grantRead" || name == "closeConn" || name == "connError" || name == "connPeer" || name == "connOpen" || name == "shutdownConn" || name == "writeStdout" || name == "writeStderr" || name == "envVar" || name == "envSet" || name == "randomBytes":
+        if name == "readFile" || name == "httpGet" || name == "fileExists" || name == "fileSize" || name == "fileModTime" || name == "syncFile" || name == "removeFile" || name == "lockFile" || name == "toHex" || name == "fromHex" || name == "listen" || name == "accept" || name == "closeListener" || name == "listenError" || name == "listenerPort" || name == "grantRead" || name == "grantDir" || name == "listDir" || name == "makeDir" || name == "closeConn" || name == "connError" || name == "connPeer" || name == "connOpen" || name == "shutdownConn" || name == "closeWrite" || name == "writeStdout" || name == "writeStderr" || name == "envVar" || name == "envSet" || name == "randomBytes":
             if argc != 1:
                 return name + "(...) takes exactly one argument"
+            return ""
+        if name == "httpSend":
+            if argc != 4:
+                return "httpSend(method, url, headers, body) takes exactly four arguments"
             return ""
         if name == "writeFile" || name == "httpPost" || name == "appendFile" || name == "truncateFile" || name == "renameFile" || name == "readBytes" || name == "writeBytes" || name == "connect" || name == "setTimeoutMs" || name == "listenOn":
             if argc != 2:
@@ -397,17 +401,17 @@ app CheckSelfHost:
             if argc != 2:
                 return "bytesCmp(a, b) takes exactly two arguments"
             return ""
-        if name == "readFileAt" || name == "writeFileAt" || name == "pollBytes" || name == "crc32" || name == "uintLE":
+        if name == "readFileAt" || name == "writeFileAt" || name == "pollBytes" || name == "bytesPut" || name == "crc32" || name == "uintLE":
             if argc != 3:
                 return name + "(...) takes exactly three arguments"
             return ""
-        if name == "readStdin":
+        if name == "readStdin" || name == "readStdinLine":
             if argc != 0:
-                return "readStdin() takes no arguments"
+                return name + "() takes no arguments"
             return ""
         if name == "channel":
-            if argc != 0:
-                return "channel() takes no arguments"
+            if argc > 1:
+                return "channel() takes no arguments, or one: channel(n), a buffer of n values"
             return ""
         if name == "sleepMs":
             if argc != 1:
@@ -488,9 +492,9 @@ app CheckSelfHost:
             if argc != 1:
                 return "recv(ch) takes exactly one argument (the channel)"
             return ""
-        if name == "send":
+        if name == "send" || name == "trySend":
             if argc != 2:
-                return "send(ch, value) takes exactly two arguments"
+                return name + "(ch, value) takes exactly two arguments"
             return ""
         let fi = do indexOfName(ce.fnNames, name)
         if fi >= 0:
@@ -499,7 +503,9 @@ app CheckSelfHost:
             if (name in ce.procDerives) && !ce.inAction && !ce.inDerive:
                 return "derive \"" + name + "\" calls a proc, so it runs only on the authority — use it in an action, not a view or policy"
             return ""
-        let pi = do indexOfName(ce.procNames, name)
+        let mut pi = -1
+        if name in ce.procAt:
+            pi = ce.procAt[name]
         if pi >= 0:
             if ce.inAction || ce.inDerive || ce.inProc:
                 if ce.procArities[pi] >= 0 && argc != ce.procArities[pi]:
@@ -513,14 +519,43 @@ app CheckSelfHost:
             return name + " takes " + arity + " argument(s), got " + argc
         return ""
 
-    proc indexOfName(xs: [text], x: text) -> int:
-        let n = len(xs)
+    # callSiteDiag: checkBuiltins' site rule for a proc-only builtin
+    # (parser.SiteProc) outside a proc body — the I/O, concurrency and
+    # listen ones keep their own, more specific barriers; a proc of the
+    # same name is the proc.
+    proc callSiteDiag(name: text, ce: CallEnv) -> text:
+        if ce.inProc || (name in ce.procAt):
+            return ""
+        let procOnly = do procSiteBuiltins()
+        if !(name in procOnly):
+            return ""
+        let own = do ownBarrierBuiltins()
+        if name in own:
+            return ""
+        return name + "(...) is only available inside a proc body — only the proc engine implements it, and a proc always runs on the authority"
+
+    # procSiteBuiltins: every builtin internal/parser/builtins.go marks
+    # SiteProc.
+    proc procSiteBuiltins() -> [text]:
+        return ["accept", "aesGcmAuthentic", "aesGcmOpen", "aesGcmSeal", "append", "appendFile", "awaitAny", "base64UrlRaw", "bcryptHash", "bcryptMatches", "bytes", "bytesCmp", "bytesCmpRange", "bytesPut", "bytesToText", "channel", "closeChannel", "closeConn", "closeListener", "closeWrite", "connError", "connOpen", "connPeer", "connect", "connectTls", "crc32", "envSet", "envVar", "es256Sign", "exitProcess", "fileExists", "fileModTime", "fileSize", "fromBase64UrlRaw", "fromHex", "grantDir", "grantRead", "hmacSha256", "httpGet", "httpPost", "httpSend", "jsonQuote", "listDir", "listen", "listenError", "listenOn", "listenTls", "listenerPort", "lockFile", "makeDir", "monoMs", "nowMs", "p256Ecdh", "p256PrivateKey", "p256PublicKey", "pollBytes", "processStats", "randomBytes", "readBytes", "readFile", "readFileAt", "readStdin", "readStdinLine", "recv", "removeFile", "renameFile", "send", "trySend", "setTimeoutMs", "sha256Bytes", "shutdownConn", "signals", "sleepMs", "syncFile", "textToBytes", "toHex", "truncateFile", "uintLE", "uploadBytes", "validUtf8", "writeBytes", "writeFile", "writeFileAt", "writeStderr", "writeStdout"]
+
+    # ownBarrierBuiltins: build.go's ioBuiltins, concurrencyBuiltins and
+    # listenBuiltins — refused outside a proc by their own barriers.
+    proc ownBarrierBuiltins() -> [text]:
+        return ["httpSend", "readFile", "writeFile", "appendFile", "fileExists", "truncateFile", "fileSize", "fileModTime", "readFileAt", "writeFileAt", "syncFile", "renameFile", "removeFile", "lockFile", "httpGet", "httpPost", "connect", "connectTls", "readBytes", "writeBytes", "closeConn", "setTimeoutMs", "connError", "pollBytes", "connOpen", "closeListener", "listenError", "listenerPort", "grantRead", "grantDir", "listDir", "makeDir", "writeStdout", "writeStderr", "readStdin", "readStdinLine", "channel", "send", "trySend", "recv", "sleepMs", "monoMs", "nowMs", "signals", "awaitAny", "closeChannel", "listen", "listenOn", "listenTls", "accept"]
+
+    # callProcIndex: each name's (first) index in names — CallEnv.procAt.
+    proc callProcIndex(names: [text]) -> {text: int}:
+        let mut at = {}
         let mut i = 0
-        loop i < n:
-            if xs[i] == x:
-                return i
+        loop i < len(names):
+            if !(names[i] in at):
+                at[names[i]] = i
             i = i + 1
-        return -1
+        return at
+
+    proc indexOfName(xs: [text], x: text) -> int:
+        return indexOf(xs, x, 0)
 
     # aggDiag: checkBuiltins' ast.Agg arm — the collection must be an
     # entity; a field aggregate with no general reduced value needs a
@@ -535,13 +570,17 @@ app CheckSelfHost:
             # `for x in <list>` does (build.go's checkBuiltins Agg arm).
             let st = do tyLookup(ce.ty.stateNames, ce.ty.stateTypes, coll)
             let isListCell = slice(st, 0, 1) == "["
-            if !isListCell:
-                return op + "(...) needs a collection to range over; \"" + coll + "\" is neither an entity nor a `[T]` list state"
+            # an action's own list-typed local (a parameter, or a `let` a
+            # proc answered): its elements, exactly as a list cell's
+            let lt = do tyLookup(ce.tsc.names, ce.tsc.types, coll)
+            let localList = ce.inAction && slice(lt, 0, 1) == "["
+            if !isListCell && !localList:
+                return op + "(...) needs a collection to range over; \"" + coll + "\" is neither an entity, a `[T]` list state, nor an action's list local"
             let at = do indexOfName(ce.stateNames, coll)
             let mut place = ""
             if at >= 0 && at < len(ce.stateDeclPlacements):
                 place = ce.stateDeclPlacements[at]
-            if place != "server" && place != "private":
+            if !localList && place != "server" && place != "private":
                 return op + "(...) over \"" + coll + "\": an aggregate runs on the authority, so the cell must live there — declare it `state " + coll + ": [T] = [] @server`"
             let fieldAggL = do isFieldAgg(op)
             if fieldAggL && len(n.sel) == 0:
@@ -593,6 +632,11 @@ app CheckSelfHost:
         return ""
 
     proc builtinDiag(n: ExprNode, entityNames: [text], entityFields: [text], ce: CallEnv) -> text:
+        if n.kind == "asset":
+            # resolved by the driver: the literal's value begins with NUL
+            if slice(n.text, 1, 2) != bytesToText(bytes(1)):
+                return "asset from " + n.text + " was never resolved — asset from \"...\" is only supported when compiling from a file (run `facet <command> <file.fct>`)"
+            return ""
         if n.kind == "astate":
             let ad = do actStateCheck(n.text, n.field, ce.actionNames, ce.stateNames)
             return ad
@@ -604,7 +648,10 @@ app CheckSelfHost:
             return d
         if n.kind == "call":
             let d2 = do callArityDiag(n, ce)
-            return d2
+            if d2 != "":
+                return d2
+            let ds = do callSiteDiag(n.text, ce)
+            return ds
         if n.kind == "entityGet":
             if (n.text + "." + n.field) in ce.deriveKeys:
                 return ""
@@ -630,18 +677,18 @@ app CheckSelfHost:
     # false, the only way check() ever calls it).
     # ============================================================
     proc ioCapability(name: text) -> text:
-        if name == "readFile" || name == "writeFile" || name == "appendFile" || name == "fileExists" || name == "truncateFile" || name == "fileSize" || name == "fileModTime" || name == "readFileAt" || name == "writeFileAt" || name == "syncFile" || name == "renameFile" || name == "removeFile" || name == "lockFile" || name == "grantRead":
+        if name == "readFile" || name == "writeFile" || name == "appendFile" || name == "fileExists" || name == "truncateFile" || name == "fileSize" || name == "fileModTime" || name == "readFileAt" || name == "writeFileAt" || name == "syncFile" || name == "renameFile" || name == "removeFile" || name == "lockFile" || name == "grantRead" || name == "grantDir" || name == "listDir" || name == "makeDir":
             return "io.file"
         if name == "closeListener" || name == "listenError" || name == "listenerPort":
             return "io.net.listen"
-        if name == "httpGet" || name == "httpPost" || name == "connect" || name == "connectTls":
+        if name == "httpGet" || name == "httpPost" || name == "httpSend" || name == "connect" || name == "connectTls":
             return "io.net"
-        if name == "writeStdout" || name == "writeStderr" || name == "readStdin" || name == "signals" || name == "exitProcess" || name == "processStats":
+        if name == "writeStdout" || name == "writeStderr" || name == "readStdin" || name == "readStdinLine" || name == "signals" || name == "exitProcess" || name == "processStats":
             return "io.console"
         if name == "envVar" || name == "envSet":
             return "io.env"
         # netConnCap's builtins, named by the capability a proc declares.
-        if name == "readBytes" || name == "writeBytes" || name == "closeConn" || name == "setTimeoutMs" || name == "connError" || name == "connPeer" || name == "pollBytes" || name == "connOpen" || name == "shutdownConn":
+        if name == "readBytes" || name == "writeBytes" || name == "closeConn" || name == "setTimeoutMs" || name == "connError" || name == "connPeer" || name == "pollBytes" || name == "connOpen" || name == "shutdownConn" || name == "closeWrite":
             return "io.net"
         return ""
 
@@ -666,7 +713,7 @@ app CheckSelfHost:
                     return n.text + "(...) is only available inside a proc that declares `uses " + capName + "` — it is a real I/O effect, and only a proc is unconditionally server-executed with no client mirror to disagree with it"
             return ""
         if rule == "concurrency":
-            if n.kind == "call" && (n.text == "channel" || n.text == "send" || n.text == "recv" || n.text == "sleepMs" || n.text == "monoMs" || n.text == "nowMs" || n.text == "signals" || n.text == "awaitAny" || n.text == "closeChannel"):
+            if n.kind == "call" && (n.text == "channel" || n.text == "send" || n.text == "trySend" || n.text == "recv" || n.text == "sleepMs" || n.text == "monoMs" || n.text == "nowMs" || n.text == "signals" || n.text == "awaitAny" || n.text == "closeChannel"):
                 return n.text + "(...) is only available inside a proc body — it is real, blocking concurrency machinery, and only a proc is unconditionally server-executed with no client mirror to disagree with it"
             return ""
         if rule == "daemon":

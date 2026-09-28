@@ -30,6 +30,11 @@ app ExprTypeSelfHost:
         recordNames: [text]
         recFieldKeys: [text]
         recFieldTypes: [text]
+        # structFieldKeys / structFieldTypes: "Struct.field" and its type —
+        # a proc struct an action binds reads like a record (a field that
+        # is a map or a nested list types as unknown, "").
+        structFieldKeys: [text]
+        structFieldTypes: [text]
         wireNames: [text]
         wireFieldKeys: [text]
         wireFieldTypes: [text]
@@ -50,7 +55,7 @@ app ExprTypeSelfHost:
         recTypes: [text]
 
     proc tyEmptyEnv() -> TyEnv:
-        return TyEnv{stateNames: [], stateTypes: [], entityNames: [], fieldKeys: [], fieldTypes: [], enumNames: [], recordNames: [], recFieldKeys: [], recFieldTypes: [], wireNames: [], wireFieldKeys: [], wireFieldTypes: [], procNames: [], procRets: [], deriveNames: [], deriveRets: [], deriveParams: [], inlineNames: [], inlineTypes: []}
+        return TyEnv{stateNames: [], stateTypes: [], entityNames: [], fieldKeys: [], fieldTypes: [], enumNames: [], recordNames: [], recFieldKeys: [], recFieldTypes: [], wireNames: [], wireFieldKeys: [], wireFieldTypes: [], procNames: [], procRets: [], deriveNames: [], deriveRets: [], deriveParams: [], inlineNames: [], inlineTypes: [], structFieldKeys: [], structFieldTypes: []}
 
     proc tyEmptyScope() -> TyScope:
         return TyScope{names: [], types: [], recNames: [], recTypes: []}
@@ -95,7 +100,13 @@ app ExprTypeSelfHost:
     # tyAggItemType: what an aggregate's item variable is — a row of the
     # entity ranged, or an element of the `[T]` list cell ranged
     # (build.go's checkRowFields / bindRange over e.stateList).
-    proc tyAggItemType(te: TyEnv, coll: text) -> text:
+    proc tyAggItemType(te: TyEnv, coll: text, sc: TyScope) -> text:
+        # an action's own list local (build.go's actLocalTypes) — unless an
+        # entity has the name
+        if !(coll in te.entityNames):
+            let lt = do tyLookup(sc.names, sc.types, coll)
+            if slice(lt, 0, 1) == "[":
+                return slice(lt, 1, len(lt) - 1)
         let st = do tyLookup(te.stateNames, te.stateTypes, coll)
         if slice(st, 0, 1) == "[":
             return slice(st, 1, len(st) - 1)
@@ -164,6 +175,8 @@ app ExprTypeSelfHost:
     proc tyExpr(te: TyEnv, n: ExprNode, sc: TyScope) -> VT:
         let unknown = VT{core: "", list: false}
         let k = n.kind
+        if k == "asset":
+            return VT{core: "text", list: false}
         if k == "int" || k == "text" || k == "bool":
             return VT{core: k, list: false}
         if k == "ref":
@@ -201,7 +214,9 @@ app ExprTypeSelfHost:
                     let rb = do tyLookup(sc.recNames, sc.recTypes, obj.text)
                     let rt = do tyParse(rb)
                     if !rt.list:
-                        let ft = do tyLookup(te.recFieldKeys, te.recFieldTypes, rt.core + "." + n.text)
+                        let mut ft = do tyLookup(te.recFieldKeys, te.recFieldTypes, rt.core + "." + n.text)
+                        if ft == "":
+                            ft = do tyLookup(te.structFieldKeys, te.structFieldTypes, rt.core + "." + n.text)
                         let pf = do tyParse(ft)
                         return pf
             let ot = do tyExpr(te, obj, sc)
@@ -220,7 +235,7 @@ app ExprTypeSelfHost:
                 return VT{core: "int", list: false}
             if op == "exists":
                 return VT{core: "bool", list: false}
-            let itemT = do tyAggItemType(te, n.coll)
+            let itemT = do tyAggItemType(te, n.coll, sc)
             if op == "list":
                 if len(n.sel) > 0:
                     let inner = do tyScopeWith(sc, n.itemVar, itemT)
@@ -243,6 +258,11 @@ app ExprTypeSelfHost:
                 let dr = do tyLookup(te.deriveNames, te.deriveRets, name)
                 let pd = do tyParse(dr)
                 return pd
+            # take(xs, n): a list's prefix is that list's type; a text's, text
+            if name == "take" && len(n.children) == 2:
+                let tk = do tyExpr(te, n.children[0], sc)
+                if tk.list:
+                    return tk
             if name in ["upper", "lower", "trim", "ago", "compact", "commas", "take", "replace", "slug", "money", "totpSecret", "randomToken", "join", "sha256Hex", "canonicalJson", "formatIn", "fileDigest"]:
                 return VT{core: "text", list: false}
             if name == "toMoney":
@@ -447,7 +467,7 @@ app ExprTypeSelfHost:
         if k == "agg":
             let mut inner = sc
             if n.itemVar != "":
-                let itemT = do tyAggItemType(te, n.coll)
+                let itemT = do tyAggItemType(te, n.coll, sc)
                 inner = do tyScopeWith(sc, n.itemVar, itemT)
             let subs = [n.whereClause, n.sel]
             let mut s = 0
@@ -570,7 +590,7 @@ app ExprTypeSelfHost:
         if k == "agg":
             let mut inner = sc
             if n.itemVar != "":
-                let itemT = do tyAggItemType(te, n.coll)
+                let itemT = do tyAggItemType(te, n.coll, sc)
                 inner = do tyScopeWith(sc, n.itemVar, itemT)
             let subs = [n.whereClause, n.sel, n.limit]
             let mut s = 0
@@ -602,8 +622,17 @@ app ExprTypeSelfHost:
         if rt.list:
             return "\"" + r + "\" is a list of " + rt.core + " — access a field on one element, not the whole list"
         let has = do tyHas(te.recFieldKeys, rt.core + "." + n.text)
-        if !has:
-            return "record " + rt.core + " has no field \"" + n.text + "\""
+        let hasS = do tyHas(te.structFieldKeys, rt.core + "." + n.text)
+        if !has && !hasS:
+            let mut kind = "record"
+            let pre = rt.core + "."
+            let mut k = 0
+            loop k < len(te.structFieldKeys):
+                let key = te.structFieldKeys[k]
+                if len(key) > len(pre) && slice(key, 0, len(pre)) == pre:
+                    kind = "struct"
+                k = k + 1
+            return kind + " " + rt.core + " has no field \"" + n.text + "\""
         return ""
 
     state exprTypeOut: text = ""

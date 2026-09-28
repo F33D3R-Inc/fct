@@ -1,0 +1,94 @@
+import "runtime_page.fct"
+
+app RuntimeOps:
+    # The runtime's operational built-ins (runtime/staticassets.go,
+    # runtime/metrics.go): /assets/<name> serves a file the compiler bundled
+    # into the graph, /metrics renders the Prometheus collector.
+
+    # rtHandleAssets: handleAssets — a content-addressed bundled file, kept
+    # by the browser forever (its name changes exactly when its bytes do).
+    proc rtHandleAssets(w: RtWorld, req: HttpServerRequest) -> HttpServerResponse:
+        let name = slice(req.path, 8, len(req.path))
+        let sl = do rtIndexOfText(name, "/")
+        let bsl = do rtIndexOfText(name, "\\")
+        if name == "" || sl >= 0 || bsl >= 0:
+            let nf = do rtNotFound()
+            return nf
+        let a = do jGet(w.g.assets, name)
+        if a.kind != "obj":
+            let nf2 = do rtNotFound()
+            return nf2
+        # encoding/json carries []byte as standard, padded base64.
+        let b64 = do jStr(a, "bytes")
+        let raw = bytesToText(fromBase64UrlRaw(replace(replace(b64, "+", "-"), "/", "_")))
+        let mut headers = []
+        let ct = do jStr(a, "contentType")
+        if ct != "":
+            headers = append(headers, HttpHeader{name: "content-type", value: ct})
+        headers = append(headers, HttpHeader{name: "cache-control", value: "public, max-age=31536000, immutable"})
+        return HttpServerResponse{status: 200, reason: "", headers: headers, body: raw}
+
+    # rtPromHelp: writeHelp.
+    proc rtPromHelp(name: text, typ: text, help: text) -> text:
+        return "# HELP " + name + " " + help + "\n# TYPE " + name + " " + typ + "\n"
+
+    # rtPromQuote: a label value as %q writes it.
+    proc rtPromQuote(s: text) -> text:
+        return "\"" + replace(replace(s, "\\", "\\\\"), "\"", "\\\"") + "\""
+
+    # rtPromFloat: %g of a sample.
+    proc rtPromFloat(f: float) -> text:
+        if f == toFloat(floor(f)) && f < 1000000000000000000.0 && f > -1000000000000000000.0:
+            return "" + toInt(f)
+        return "" + f
+
+    # rtPromSplit: a series key's labels ("a|b|c").
+    proc rtPromSplit(k: text, n: int) -> [text]:
+        let parts = split(k, "|")
+        if len(parts) <= n:
+            return parts
+        let mut out = slice(parts, 0, n - 1)
+        out = append(out, join(slice(parts, n - 1, len(parts)), "|"))
+        return out
+
+    # rtHandleMetrics: handleMetrics — the Prometheus text exposition.
+    proc rtHandleMetrics(w: RtWorld) -> HttpServerResponse:
+        let m = w.met
+        let mut b = do rtPromHelp("facet_uptime_seconds", "gauge", "Seconds since the server started.")
+        b = b + "facet_uptime_seconds " + rtPromFloat(toFloat(monoMs() - m.startMs) / 1000.0) + "\n"
+        b = b + rtPromHelp("facet_http_requests_total", "counter", "Total HTTP requests by method, route, and status.")
+        let ri = do rtSortedIndex(m.reqKeys)
+        let mut i = 0
+        loop i < len(ri):
+            let p = do rtPromSplit(m.reqKeys[ri[i]], 3)
+            b = b + "facet_http_requests_total{method=" + rtPromQuote(p[0]) + ",route=" + rtPromQuote(p[1]) + ",status=" + rtPromQuote(p[2]) + "} " + m.reqCounts[ri[i]] + "\n"
+            i = i + 1
+        b = b + rtPromHelp("facet_http_request_duration_seconds", "histogram", "HTTP request latency.")
+        let les = ["0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10"]
+        let mut bi = 0
+        loop bi < len(les):
+            b = b + "facet_http_request_duration_seconds_bucket{le=\"" + les[bi] + "\"} " + m.durCounts[bi] + "\n"
+            bi = bi + 1
+        b = b + "facet_http_request_duration_seconds_bucket{le=\"+Inf\"} " + m.durCount + "\n"
+        b = b + "facet_http_request_duration_seconds_sum " + rtPromFloat(m.durSum) + "\n"
+        b = b + "facet_http_request_duration_seconds_count " + m.durCount + "\n"
+        b = b + rtPromHelp("facet_actions_total", "counter", "Server actions executed by name and outcome.")
+        let ai = do rtSortedIndex(m.actKeys)
+        let mut j = 0
+        loop j < len(ai):
+            let q = do rtPromSplit(m.actKeys[ai[j]], 2)
+            b = b + "facet_actions_total{action=" + rtPromQuote(q[0]) + ",outcome=" + rtPromQuote(q[1]) + "} " + m.actCounts[ai[j]] + "\n"
+            j = j + 1
+        b = b + rtPromHelp("facet_jobs_total", "counter", "Durable job runs by outcome.")
+        let ji = do rtSortedIndex(m.jobKeys)
+        let mut k = 0
+        loop k < len(ji):
+            b = b + "facet_jobs_total{outcome=" + rtPromQuote(m.jobKeys[ji[k]]) + "} " + m.jobCounts[ji[k]] + "\n"
+            k = k + 1
+        b = b + rtPromHelp("facet_job_queue_depth", "gauge", "Pending durable jobs waiting to run.")
+        b = b + "facet_job_queue_depth " + m.jobQueueDepth + "\n"
+        b = b + rtPromHelp("facet_sse_connections", "gauge", "Active server-sent-event connections on this instance.")
+        b = b + "facet_sse_connections " + len(w.subs) + "\n"
+        b = b + rtPromHelp("facet_sessions", "gauge", "Sessions held in this instance's memory.")
+        b = b + "facet_sessions " + m.sessions + "\n"
+        return HttpServerResponse{status: 200, reason: "", headers: [HttpHeader{name: "content-type", value: "text/plain; version=0.0.4; charset=utf-8"}], body: b}

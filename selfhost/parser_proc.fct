@@ -181,6 +181,72 @@ app ParserProcSelfHost:
         let ends = do hasSuffixText(s, "]")
         return starts && ends
 
+    # mapTypeSpec: parser.go's splitMapType — "K:V" for a `{K: V}` type
+    # expression (key and value as written), "" for any other type.
+    proc mapTypeSpec(t: text) -> text:
+        let s = trim(t)
+        let n = len(s)
+        if n < 2 || charAt(s, 0) != "{" || charAt(s, n - 1) != "}":
+            return ""
+        let inner = trim(slice(s, 1, n - 1))
+        let c = indexOf(inner, ":", 0)
+        if c < 0:
+            return ""
+        return trim(slice(inner, 0, c)) + ":" + trim(slice(inner, c + 1, len(inner)))
+
+    proc mapSpecKey(spec: text) -> text:
+        let c = indexOf(spec, ":", 0)
+        return slice(spec, 0, c)
+
+    proc mapSpecVal(spec: text) -> text:
+        let c = indexOf(spec, ":", 0)
+        return slice(spec, c + 1, len(spec))
+
+    # parseProcHeaderParamMapSpecs: each parameter's mapTypeSpec, "" for a
+    # parameter that is no map.
+    proc parseProcHeaderParamMapSpecs(lineText: text) -> [text]:
+        let head = do procHeadOf(lineText)
+        let pieces = do headerParamPieces(head)
+        let mut out = []
+        let mut i = 0
+        loop i < len(pieces):
+            let raw = do paramTypeRawOf(pieces[i])
+            let sp = do mapTypeSpec(raw)
+            out = append(out, sp)
+            i = i + 1
+        return out
+
+    # parseProcHeaderRetMapSpec: the return type's mapTypeSpec ("" when the
+    # proc returns no map, or nothing).
+    proc parseProcHeaderRetMapSpec(lineText: text) -> text:
+        let head = do procHeadOf(lineText)
+        let has = do headerRetSectionExists(head)
+        if !has:
+            return ""
+        let rt = do headerRetTypeRaw(head)
+        let sp = do mapTypeSpec(rt)
+        return sp
+
+    # nestedBase / nestedDepth: parser.go's splitNestedList over a list's
+    # element type — `[float]` (the element of `[[float]]`) is "float" one
+    # level deeper. nestedDepth answers the whole list's depth (2 for
+    # `[[T]]`) or 0 for an element that is no list.
+    proc nestedBase(core: text) -> text:
+        let mut c = trim(core)
+        loop len(c) >= 2 && slice(c, 0, 1) == "[" && slice(c, len(c) - 1, len(c)) == "]":
+            c = trim(slice(c, 1, len(c) - 1))
+        return c
+
+    proc nestedDepth(core: text) -> int:
+        let mut c = trim(core)
+        let mut d = 0
+        loop len(c) >= 2 && slice(c, 0, 1) == "[" && slice(c, len(c) - 1, len(c)) == "]":
+            c = trim(slice(c, 1, len(c) - 1))
+            d = d + 1
+        if d == 0:
+            return 0
+        return d + 1
+
     proc typeCore(t: text) -> text:
         let s = do typeStripOptional(t)
         let isL = do typeIsList(t)
@@ -946,6 +1012,8 @@ app ParserProcSelfHost:
         # driver mangles the module).
         renameFrom: [text]
         renameTo: [text]
+        # lineNo: the header's source line (0 when unknown)
+        lineNo: int
 
     # parseProcDecl: the end-to-end driver this task's brief asks for —
     # raw header LINE TEXT (e.g. "proc buildTree(lines: [text]) -> int:")
@@ -970,7 +1038,7 @@ app ParserProcSelfHost:
         let uses = do parseProcHeaderUses(lineText)
         let body = do parseProcDeclBody(bodySrc)
         let bodyValid = len(body) > 0
-        return ProcDecl{name: name, paramNames: paramNames, paramTypes: paramTypes, paramLists: paramLists, paramOptionals: paramOptionals, hasRet: hasRet, retCore: retCore, retIsList: retIsList, retIsOptional: retIsOptional, uses: uses, headerValid: headerValid, body: body, bodyValid: bodyValid, headerLine: lineText, bodySrc: bodySrc, renameFrom: [], renameTo: [], bodyLineNos: []}
+        return ProcDecl{name: name, paramNames: paramNames, paramTypes: paramTypes, paramLists: paramLists, paramOptionals: paramOptionals, hasRet: hasRet, retCore: retCore, retIsList: retIsList, retIsOptional: retIsOptional, uses: uses, headerValid: headerValid, body: body, bodyValid: bodyValid, headerLine: lineText, bodySrc: bodySrc, renameFrom: [], renameTo: [], bodyLineNos: [], lineNo: 0}
 
     # ------------------------------------------------------------
     # `action` is DELIBERATELY NOT wired the same way here, and this is a

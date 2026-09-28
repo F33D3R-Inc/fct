@@ -1,0 +1,83 @@
+# spawn/join in app procs (runtime/proccompile.go), driven through both
+# runtimes by TestRuntimeParityProcs.
+app ProcParity:
+    entity Out:
+        id: int
+        v: int
+    file Notes: text at "notes/log.txt"
+    file Blob: bytes at "blob.bin"
+    file Outside: text at "../escape.txt"
+    file Missing: text at "missing.txt"
+    proc keep(line: text) -> text uses io.file:
+        write Notes(line)
+        let back = read Notes()
+        return back
+    proc blob(n: int) -> int uses io.file:
+        let mut buf = bytes(4)
+        buf[0] = 1
+        buf[1] = 2
+        buf[2] = 255
+        buf[3] = n
+        write Blob(buf)
+        let b = read Blob()
+        return b[2] + b[3] + len(b)
+    proc escape() -> text uses io.file:
+        let x = read Outside()
+        return x
+    proc missing() -> text uses io.file:
+        let x = read Missing()
+        return x
+    proc sumTo(n: int) -> int:
+        let mut total = 0
+        let mut i = 0
+        loop i < n:
+            total = total + i
+            i = i + 1
+        return total
+    proc boom(n: int) -> int:
+        let mut xs = [0]
+        xs[n] = 1
+        return n
+    proc sumBoth(a: int, b: int) -> int:
+        let h1 = spawn sumTo(a)
+        let h2 = spawn sumTo(b)
+        let r1 = join h1
+        let r2 = join h2
+        return r1 + r2
+    proc joinsAFailure(n: int) -> int:
+        let h = spawn boom(n)
+        let r = join h
+        return r
+    proc fanIn(ns: [int]) -> [int]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(ns):
+            let h = spawn sumTo(ns[i])
+            let r = join h
+            out = append(out, r)
+            i = i + 1
+        return out
+    action run(a: int, b: int) -> int:
+        let r = do sumBoth(a, b)
+        add Out { v: r }
+        return r
+    action failing(n: int) -> int:
+        let r = do joinsAFailure(n)
+        return r
+    action many() -> [int]:
+        let r = do fanIn([3, 4, 5])
+        return r
+    action note(line: text) -> text:
+        let r = do keep(line)
+        return r
+    action blobs(n: int) -> int:
+        let r = do blob(n)
+        return r
+    action escapes() -> text:
+        let r = do escape()
+        return r
+    action missings() -> text:
+        let r = do missing()
+        return r
+    view Home at "/":
+        text "{count(Out)} runs"

@@ -287,7 +287,7 @@ func (s *Server) runStreamHook(sid, action string, pathVals map[string]string) (
 	}
 	args := make([]any, len(act.Params))
 	for i, p := range act.Params {
-		v, ok := paramArg(pathVals[p.Name], p)
+		v, ok := s.argFor(pathVals[p.Name], p)
 		if !ok {
 			return nil, http.StatusNotFound, fmt.Sprintf("parameter %q expects %s", p.Name, paramTypeName(p))
 		}

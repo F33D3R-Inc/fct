@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"strings"
@@ -46,7 +47,25 @@ func envToken() string { return os.Getenv("FACETQL_TOKEN") }
 type fqStore struct {
 	c    *fqClient
 	ents map[string]ir.Entity
+	// searched: the text fields, per entity, the app searches
+	// case-insensitively (ir.SearchedFields) — each declared a folded text
+	// index when the operator asks for them (fqFoldedIndexesWanted).
+	searched map[string][]string
+	// folded: the folded text indexes FacetQL holds, whoever declared them
+	// (seen by the last migrate) — the searches searchpush.go may push down.
+	folded map[ir.Index]bool
 }
+
+// fqFoldedIndexesWanted is the operator's choice to have the app's searched
+// fields indexed: FACET_FOLDED_INDEXES=1. Not the default, because a folded
+// index costs every write of the field one index insert per three-byte
+// window of its text — a price the operator should choose to pay per
+// deployment (and, on the fct engine today, a steep one).
+func fqFoldedIndexesWanted() bool { return os.Getenv("FACET_FOLDED_INDEXES") == "1" }
+
+// setSearched is how the server tells the store which fields its searches
+// read (see searchIndexer).
+func (s *fqStore) setSearched(fields map[string][]string) { s.searched = fields }
 
 // fqPageSize is how many nodes we pull per GET /nodes page when loading a kind.
 const fqPageSize = 500
@@ -420,6 +439,15 @@ var fqReservedIndexes = []ir.Index{
 type fqIndexWant struct {
 	ir.Index
 	Unique bool
+	// Folded: a folded text index (FacetQL's mode "folded") over the field's
+	// text lowered — what a case-insensitive search of it reads through.
+	Folded bool
+}
+
+// fqWantKey tells an ordered index from a folded one over the same field.
+type fqWantKey struct {
+	ir.Index
+	Folded bool
 }
 
 // fqRelationKeyField is the field on a parent node that a child's relation value
@@ -442,7 +470,7 @@ const fqRelationKeyField = "id"
 // a reference has to name exactly one node, and a value two nodes can hold names
 // neither. It is also the only reason fct ever indexes an `id` — ir.Indexes
 // deliberately never does, since identity is already the store's primary order.
-func fqWantedIndexes(entities []ir.Entity) []fqIndexWant {
+func fqWantedIndexes(entities []ir.Entity, searched map[string][]string) []fqIndexWant {
 	var out []fqIndexWant
 	at := map[ir.Index]int{}
 	add := func(ix ir.Index, unique bool) {
@@ -462,7 +490,24 @@ func fqWantedIndexes(entities []ir.Entity) []fqIndexWant {
 	for _, r := range ir.References(entities) {
 		add(ir.Index{Entity: r.Parent, Field: fqRelationKeyField}, true)
 	}
+	// Each field a query searches case-insensitively (ir.SearchedFields) gets a
+	// folded text index: `contains(lower(x.f), q)` reads the rows that index
+	// names instead of every row.
+	for _, e := range entities {
+		if e.Ephemeral || !fqFoldedIndexesWanted() {
+			continue
+		}
+		for _, f := range searched[e.Name] {
+			out = append(out, fqIndexWant{Index: ir.Index{Entity: e.Name, Field: f}, Folded: true})
+		}
+	}
 	return out
+}
+
+// fqFoldedIndexName is the name of the folded text index over entity.field:
+// the ordered index's name with a `_ci` suffix, made safe the same way.
+func fqFoldedIndexName(entity, field string) string {
+	return fqSafeName(indexName(entity, field)+"_ci", entity, field+"\x00ci")
 }
 
 // Migrate declares to FacetQL the two things about this app's data that the
@@ -522,19 +567,32 @@ func (s *fqStore) migrateIndexes(ctx context.Context, entities []ir.Entity, appl
 	if err != nil {
 		return nil, fqAdminError("list FacetQL indexes", err)
 	}
-	covered := map[ir.Index]fqIndexDef{}
+	covered := map[fqWantKey]fqIndexDef{}
+	s.folded = map[ir.Index]bool{}
 	for _, d := range have {
-		covered[ir.Index{Entity: d.Kind, Field: d.Field}] = d
+		if d.Mode == "folded" {
+			s.folded[ir.Index{Entity: d.Kind, Field: d.Field}] = true
+		}
+		// an unfolded text index is a different access path again, never
+		// what either kind of want is asking for
+		if d.Mode == "text" {
+			continue
+		}
+		covered[fqWantKey{Index: ir.Index{Entity: d.Kind, Field: d.Field}, Folded: d.Mode == "folded"}] = d
 	}
 	var plan []string
-	wanted := map[ir.Index]bool{}
-	for _, w := range fqWantedIndexes(entities) {
-		wanted[w.Index] = true
+	wanted := map[fqWantKey]bool{}
+	for _, w := range fqWantedIndexes(entities, s.searched) {
+		key := fqWantKey{Index: w.Index, Folded: w.Folded}
+		wanted[key] = true
 		what := fmt.Sprintf("index on %s.%s", w.Entity, w.Field)
 		if w.Unique {
 			what = "unique " + what
 		}
-		if d, ok := covered[w.Index]; ok {
+		if w.Folded {
+			what = fmt.Sprintf("folded text index on %s.%s", w.Entity, w.Field)
+		}
+		if d, ok := covered[key]; ok {
 			// An index that covers the field but does not make it unique cannot
 			// be upgraded in place, and this app never drops an index it did not
 			// declare — so say what has to happen instead of failing later, with
@@ -549,7 +607,10 @@ func (s *fqStore) migrateIndexes(ctx context.Context, entities []ir.Entity, appl
 			continue
 		}
 		def := fqIndexDef{Name: fqIndexName(w.Entity, w.Field), Kind: w.Entity, Field: w.Field, Unique: w.Unique}
-		covered[w.Index] = def // two wants for one field are still one index
+		if w.Folded {
+			def = fqIndexDef{Name: fqFoldedIndexName(w.Entity, w.Field), Kind: w.Entity, Field: w.Field, Mode: "folded"}
+		}
+		covered[key] = def // two wants for one field are still one index
 		plan = append(plan, "create "+what)
 		if !apply {
 			continue
@@ -557,9 +618,12 @@ func (s *fqStore) migrateIndexes(ctx context.Context, entities []ir.Entity, appl
 		if err := s.c.createIndex(ctx, def); err != nil {
 			return plan, fqAdminError("create "+what, err)
 		}
+		if w.Folded {
+			s.folded[w.Index] = true
+		}
 	}
 	for _, d := range have {
-		if !wanted[ir.Index{Entity: d.Kind, Field: d.Field}] {
+		if !wanted[fqWantKey{Index: ir.Index{Entity: d.Kind, Field: d.Field}, Folded: d.Mode == "folded"}] {
 			plan = append(plan, fmt.Sprintf("index %q on %s.%s is not declared by this app — left in place",
 				d.Name, d.Kind, d.Field))
 		}
@@ -1278,6 +1342,30 @@ func (s *fqStore) LoadSession(sid string) (*persistedSession, bool, error) {
 func (s *fqStore) SaveSession(sid string, ps *persistedSession) error {
 	d := fqSessionData{persistedSession: *ps, ExpiresUnix: ps.Expires.Unix()}
 	return s.reservedUpsert(context.Background(), "__session", fqSessionAddr(sid), d)
+}
+
+// UpdateSession rewrites a session's node only if it still exists: a set_if
+// whose target must be present (a missing target fails the precondition, and
+// nothing in the batch is applied), with an expectation on the expiry column
+// that every stored session meets.
+func (s *fqStore) UpdateSession(sid string, ps *persistedSession) (bool, error) {
+	d := fqSessionData{persistedSession: *ps, ExpiresUnix: ps.Expires.Unix()}
+	raw, err := json.Marshal(d)
+	if err != nil {
+		return false, fmt.Errorf("encode __session node: %w", err)
+	}
+	var set map[string]any
+	if err := json.Unmarshal(raw, &set); err != nil {
+		return false, fmt.Errorf("encode __session node: %w", err)
+	}
+	err = s.c.transaction(context.Background(), []fqTxOp{{
+		Type: "set_if", Address: fqSessionAddr(sid), Field: "_expires_unix",
+		Expect: fqExpectLE(math.MaxInt64), Set: set, // every expiry is at most this
+	}})
+	if errors.Is(err, errFQPrecondition) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (s *fqStore) DeleteSession(sid string) error {

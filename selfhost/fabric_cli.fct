@@ -1,5 +1,6 @@
 import "fabric_runtime.fct"
 import "fabric_cli_render.fct"
+import "fabric_cli_daemon.fct"
 
 app FabricCli:
     # Port of fabric/crates/fabric-cli/src/{args.rs, session.rs, main.rs}:
@@ -55,6 +56,10 @@ app FabricCli:
         value: text
 
     proc cliParseErrorDisplay(e: CliParseError) -> text:
+        if e.kind == "MissingArgument":
+            return "missing argument " + e.arg
+        if e.kind == "InvalidArgument":
+            return "argument " + e.arg + " expects a number, got '" + e.value + "'"
         if e.kind == "UnknownCommand":
             return "unknown command '" + e.arg + "'"
         if e.kind == "UnknownFlag":
@@ -73,10 +78,96 @@ app FabricCli:
         subcommand: text
         opts: RunOpts
         err: CliParseError
+        # kind "daemon": `fabric daemon ...` (fabric_cli_daemon.fct).
+        daemon: CliDaemon
+
+    proc cliNoDaemon() -> CliDaemon:
+        return CliDaemon{op: "help", hasAdmin: false, admin: "", json: false, shard: 0, x: 0, y: 0, destination: ""}
 
     private proc cliFail(kind: text, arg: text, value: text) -> CliCommand:
         let opts = do runOptsDefault()
-        return CliCommand{ok: false, kind: "", subcommand: "", opts: opts, err: CliParseError{kind: kind, arg: arg, value: value}}
+        return CliCommand{ok: false, kind: "", subcommand: "", opts: opts, err: CliParseError{kind: kind, arg: arg, value: value}, daemon: cliNoDaemon()}
+
+    # u8's FromStr: u64's, then no more than 255.
+    proc cliU8Ok(v: text) -> bool:
+        return u64ParseError(v) == "" && u64Cmp(u64Parse(v), 255) <= 0
+
+    # args.rs `parse_daemon`: `fabric daemon <status|placements|migrate ...>
+    # [--admin <url>] [--json]`, refusing in the crate's order.
+    proc cliParseDaemon(args: [text]) -> CliCommand:
+        let defaults = do runOptsDefault()
+        let none = do cliNoError()
+        let mut d = do cliNoDaemon()
+        let mut hasName = false
+        let mut name = ""
+        let mut positional = []
+        let mut help = false
+        let n = len(args)
+        let mut i = 0
+        loop i < n:
+            let arg = args[i]
+            if arg == "-h" || arg == "--help":
+                help = true
+            else:
+                if arg == "--json":
+                    d.json = true
+                else:
+                    if arg == "--admin":
+                        if i + 1 >= n:
+                            let e1 = do cliFail("MissingValue", arg, "")
+                            return e1
+                        d.hasAdmin = true
+                        d.admin = args[i + 1]
+                        i = i + 1
+                    else:
+                        if cliHasPrefix(arg, "--admin="):
+                            d.hasAdmin = true
+                            d.admin = slice(arg, 8, len(arg))
+                        else:
+                            if cliHasPrefix(arg, "-") && len(arg) > 1:
+                                let e2 = do cliFail("UnknownFlag", arg, "")
+                                return e2
+                            if !hasName:
+                                hasName = true
+                                name = arg
+                            else:
+                                positional = append(positional, arg)
+            i = i + 1
+        if help || !hasName:
+            return CliCommand{ok: true, kind: "daemon", subcommand: "", opts: defaults, err: none, daemon: d}
+        if name == "status" || name == "placements":
+            if len(positional) > 0:
+                let e3 = do cliFail("UnexpectedArgument", positional[0], "")
+                return e3
+            d.op = name
+            return CliCommand{ok: true, kind: "daemon", subcommand: "", opts: defaults, err: none, daemon: d}
+        if name == "migrate":
+            let names = ["<shard>", "<x>", "<y>", "<destination>"]
+            if len(positional) < 4:
+                let e4 = do cliFail("MissingArgument", names[len(positional)], "")
+                return e4
+            if len(positional) > 4:
+                let e5 = do cliFail("UnexpectedArgument", positional[4], "")
+                return e5
+            if u64ParseError(positional[0]) != "":
+                let e6 = do cliFail("InvalidArgument", "<shard>", positional[0])
+                return e6
+            let xOk = do cliU8Ok(positional[1])
+            if !xOk:
+                let e7 = do cliFail("InvalidArgument", "<x>", positional[1])
+                return e7
+            let yOk = do cliU8Ok(positional[2])
+            if !yOk:
+                let e8 = do cliFail("InvalidArgument", "<y>", positional[2])
+                return e8
+            d.op = "migrate"
+            d.shard = u64Parse(positional[0])
+            d.x = toInt(u64Parse(positional[1]))
+            d.y = toInt(u64Parse(positional[2]))
+            d.destination = positional[3]
+            return CliCommand{ok: true, kind: "daemon", subcommand: "", opts: defaults, err: none, daemon: d}
+        let e9 = do cliFail("UnknownCommand", "daemon " + name, "")
+        return e9
 
     private proc cliNoError() -> CliParseError:
         return CliParseError{kind: "", arg: "", value: ""}
@@ -121,12 +212,15 @@ app FabricCli:
         let none = do cliNoError()
         let n = len(args)
         if n == 0:
-            return CliCommand{ok: true, kind: "help", subcommand: "", opts: defaults, err: none}
+            return CliCommand{ok: true, kind: "help", subcommand: "", opts: defaults, err: none, daemon: cliNoDaemon()}
         let first = args[0]
+        if first == "daemon":
+            let daemon = do cliParseDaemon(slice(args, 1, n))
+            return daemon
         if first == "-h" || first == "--help" || first == "help":
-            return CliCommand{ok: true, kind: "help", subcommand: "", opts: defaults, err: none}
+            return CliCommand{ok: true, kind: "help", subcommand: "", opts: defaults, err: none, daemon: cliNoDaemon()}
         if first == "-V" || first == "--version" || first == "version":
-            return CliCommand{ok: true, kind: "version", subcommand: "", opts: defaults, err: none}
+            return CliCommand{ok: true, kind: "version", subcommand: "", opts: defaults, err: none, daemon: cliNoDaemon()}
         let subcommand = do cliSubcommandParse(first)
         if subcommand == "":
             let e0 = do cliFail("UnknownCommand", first, "")
@@ -191,7 +285,7 @@ app FabricCli:
                                 return e5
             i = i + 1
         let opts = do withOpts(help, json, hasInput, input, hasNow, now, hasDeadline, deadline)
-        return CliCommand{ok: true, kind: "run", subcommand: subcommand, opts: opts, err: none}
+        return CliCommand{ok: true, kind: "run", subcommand: subcommand, opts: opts, err: none, daemon: cliNoDaemon()}
 
     # ----------------------------------------------------------- session.rs
 
@@ -237,7 +331,7 @@ app FabricCli:
     # -------------------------------------------------------------- main.rs
 
     proc cliTopHelp() -> text:
-        return "fabric -- Facet Fabric operator CLI\n\nUSAGE:\n    fabric <command> [--input <file>] [--json]\n\nCOMMANDS:\n    status      Runtime summary (grid geometry, protocol version, counts)\n    topology    Physical placements known to the topology registry\n    workload    Workload profiles derived from ingested telemetry\n    metrics     Latest raw workload metrics per location\n    placement   Optimizer placement/optimization decisions\n    predict     ML hotspot probability and anomaly score per profile\n    validate    Check that ingested coordinates fall within the grid\n    nodes       Fleet inventory: registered nodes and their liveness\n\nOPTIONS:\n    -i, --input <file>   JSON array of FabricMessage values to replay ('-' = stdin)\n        --json           Emit JSON instead of human-readable text\n        --now <ms>       nodes: judge liveness at this epoch-millisecond instant\n                         (default: the newest timestamp the runtime ingested)\n        --deadline <ms>  nodes: silence budget before a node is unreachable\n                         (default: 30000)\n    -h, --help           Show help\n    -V, --version        Show version\n\nNOTES:\n    Fabric has no live daemon yet, so this tool runs the real analysis pipeline\n    over a captured/authored protocol-message session. With no --input the\n    runtime is empty and each command reports the empty state."
+        return "fabric -- Facet Fabric operator CLI\n\nUSAGE:\n    fabric <command> [--input <file>] [--json]\n\nCOMMANDS:\n    status      Runtime summary (grid geometry, protocol version, counts)\n    topology    Physical placements known to the topology registry\n    workload    Workload profiles derived from ingested telemetry\n    metrics     Latest raw workload metrics per location\n    placement   Optimizer placement/optimization decisions\n    predict     ML hotspot probability and anomaly score per profile\n    validate    Check that ingested coordinates fall within the grid\n    nodes       Fleet inventory: registered nodes and their liveness\n    daemon      A running fabricd, over its operator port\n                (status, placements, migrate; see 'fabric daemon --help')\n\nOPTIONS:\n    -i, --input <file>   JSON array of FabricMessage values to replay ('-' = stdin)\n        --json           Emit JSON instead of human-readable text\n        --now <ms>       nodes: judge liveness at this epoch-millisecond instant\n                         (default: the newest timestamp the runtime ingested)\n        --deadline <ms>  nodes: silence budget before a node is unreachable\n                         (default: 30000)\n    -h, --help           Show help\n    -V, --version        Show version\n\nNOTES:\n    Every command but 'daemon' runs the real analysis pipeline over a\n    captured/authored protocol-message session. With no --input the runtime\n    is empty and each command reports the empty state. 'daemon' asks a\n    running fabricd instead."
 
     proc cliSubcommandHelp(sub: text) -> text:
         let mut purpose = ""
@@ -519,12 +613,15 @@ app FabricCli:
         return CliOutput{stdout: output + "\n", stderr: "", code: ok}
 
     # cliMain: main.rs `main` as a value — used by `main` below and by tests.
-    proc cliMain(args: [text]) -> CliOutput uses io.file, io.console:
+    proc cliMain(args: [text]) -> CliOutput uses io.file, io.console, io.net, io.env:
         let command = do cliParse(args)
         if !command.ok:
             let shown = do cliParseErrorDisplay(command.err)
             let usage = do cliExitUsage()
             return CliOutput{stdout: "", stderr: "error: " + shown + "\ntry 'fabric --help'\n", code: usage}
+        if command.kind == "daemon":
+            let asked = do cldRun(command.daemon, envSet("FABRIC_ADMIN_URL"), envVar("FABRIC_ADMIN_URL"), envSet("FABRIC_ADMIN_TOKEN"), envVar("FABRIC_ADMIN_TOKEN"))
+            return CliOutput{stdout: asked.stdout, stderr: asked.stderr, code: asked.code}
         let ok = do cliExitOk()
         if command.kind == "help":
             let help = do cliTopHelp()
@@ -542,7 +639,7 @@ app FabricCli:
         let out = do cliRun(command.subcommand, command.opts, session.runtime)
         return out
 
-    proc main(args: [text]) -> int uses io.file, io.console:
+    proc main(args: [text]) -> int uses io.file, io.console, io.net, io.env:
         let out = do cliMain(args)
         if len(out.stdout) > 0:
             writeStdout(out.stdout)

@@ -116,15 +116,45 @@ app IRJSONSelfHost:
             return 15
         return 0
 
-    # jCharOf: the one-character text for a code point below 128 — the only
-    # range encoding/json's \uXXXX escapes ever cover for the characters it
-    # escapes (<, >, &, and control characters). Built through a one-byte
-    # buffer, since the language has no code-point-to-text builtin.
+    # jCharOf: the one-character text for a code point — its UTF-8 bytes,
+    # since the language has no code-point-to-text builtin. encoding/json
+    # escapes <, >, &, control characters and U+2028/U+2029 this way; a
+    # surrogate never reaches here (jReadString pairs or replaces it).
     private proc jCharOf(code: int) -> text:
-        let mut buf = bytes(1)
-        buf[0] = code
-        let t = bytesToText(buf)
-        return t
+        if code < 128:
+            let mut b1 = bytes(1)
+            b1[0] = code
+            return bytesToText(b1)
+        if code < 2048:
+            let mut b2 = bytes(2)
+            b2[0] = 192 + code / 64
+            b2[1] = 128 + code % 64
+            return bytesToText(b2)
+        if code < 65536:
+            let mut b3 = bytes(3)
+            b3[0] = 224 + code / 4096
+            b3[1] = 128 + (code / 64) % 64
+            b3[2] = 128 + code % 64
+            return bytesToText(b3)
+        let mut b4 = bytes(4)
+        b4[0] = 240 + code / 262144
+        b4[1] = 128 + (code / 4096) % 64
+        b4[2] = 128 + (code / 64) % 64
+        b4[3] = 128 + code % 64
+        return bytesToText(b4)
+
+    # jHex4: the \uXXXX escape's value at seg[i] (the backslash), -1 when
+    # there is none there.
+    private proc jHex4(seg: text, i: int) -> int:
+        if i + 5 >= len(seg):
+            return -1
+        if charAt(seg, i) != "\\" || charAt(seg, i + 1) != "u":
+            return -1
+        let h1 = do jHexVal(charAt(seg, i + 2))
+        let h2 = do jHexVal(charAt(seg, i + 3))
+        let h3 = do jHexVal(charAt(seg, i + 4))
+        let h4 = do jHexVal(charAt(seg, i + 5))
+        return h1 * 4096 + h2 * 256 + h3 * 16 + h4
 
     # jReadString: s[pos] is the opening quote; returns the decoded text and
     # the position after the closing quote. The closing quote is found by
@@ -171,19 +201,33 @@ app IRJSONSelfHost:
                             out = out + "\r"
                             i = i + 2
                         else:
-                            if e == "u" && i + 5 < m:
-                                let h1 = do jHexVal(charAt(seg, i + 2))
-                                let h2 = do jHexVal(charAt(seg, i + 3))
-                                let h3 = do jHexVal(charAt(seg, i + 4))
-                                let h4 = do jHexVal(charAt(seg, i + 5))
-                                let code = h1 * 4096 + h2 * 256 + h3 * 16 + h4
-                                let ch = do jCharOf(code)
-                                out = out + ch
-                                i = i + 6
-                            else:
-                                # \" \\ \/ and anything else: the character itself
-                                out = out + e
+                            if e == "b" || e == "f":
+                                let mut cb = 8
+                                if e == "f":
+                                    cb = 12
+                                let cc = do jCharOf(cb)
+                                out = out + cc
                                 i = i + 2
+                            else:
+                                if e == "u" && i + 5 < m:
+                                    let code = do jHex4(seg, i)
+                                    i = i + 6
+                                    let mut cp = code
+                                    # a surrogate pair is one code point; a lone
+                                    # surrogate is U+FFFD, as encoding/json reads it
+                                    if code >= 55296 && code < 57344:
+                                        cp = 65533
+                                        if code < 56320:
+                                            let low = do jHex4(seg, i)
+                                            if low >= 56320 && low < 57344:
+                                                cp = 65536 + (code - 55296) * 1024 + (low - 56320)
+                                                i = i + 6
+                                    let ch = do jCharOf(cp)
+                                    out = out + ch
+                                else:
+                                    # \" \\ \/ and anything else: the character itself
+                                    out = out + e
+                                    i = i + 2
             else:
                 let nextEsc = indexOf(seg, "\\", i)
                 if nextEsc < 0:
@@ -297,9 +341,239 @@ app IRJSONSelfHost:
         let none = do jNone()
         return JRead{val: none, pos: n}
 
+    # jsonParse reads a document over its bytes, jumping between the bytes
+    # that matter with indexOf (a string's closing quote or backslash, the
+    # end of a run of whitespace, a number's delimiter) rather than a step
+    # per character; only an escaped string is decoded character by
+    # character (jReadString).
     proc jsonParse(s: text) -> JVal:
-        let r = do jReadValue(s, 0)
+        let b = textToBytes(s)
+        let r = do jReadB(b, 0)
         return r.val
+
+    # jNonWs: every byte value but JSON's four whitespace bytes.
+    proc jNonWs() -> [int]:
+        return [0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255]
+
+    # jWsB: the first position at or after pos that is not whitespace.
+    proc jWsB(b: [int], pos: int, nonWs: [int]) -> int:
+        if pos >= len(b):
+            return len(b)
+        let c = b[pos]
+        if c != 32 && c != 10 && c != 13 && c != 9:
+            return pos
+        let j = indexOf(b, nonWs, pos)
+        if j < 0:
+            return len(b)
+        return j
+
+    # jReadB: jReadValue over bytes, positions byte offsets.
+    proc jReadB(b: [int], pos0: int) -> JRead:
+        let nonWs = do jNonWs()
+        let r = do jReadBW(b, pos0, nonWs)
+        return r
+
+    proc jReadBW(b: [int], pos0: int, nonWs: [int]) -> JRead:
+        let n = len(b)
+        let pos = do jWsB(b, pos0, nonWs)
+        if pos >= n:
+            return JRead{val: jNone(), pos: n}
+        let c = b[pos]
+        if c == 34:
+            let r = do jStrB(b, pos)
+            return r
+        if c == 123:
+            let mut keys = []
+            let mut vals = []
+            let mut i = jWsB(b, pos + 1, nonWs)
+            loop i < n && b[i] != 125:
+                if b[i] == 44:
+                    i = jWsB(b, i + 1, nonWs)
+                    continue
+                if b[i] != 34:
+                    return JRead{val: jNone(), pos: n}
+                let kr = do jStrB(b, i)
+                let colon = do jWsB(b, kr.pos, nonWs)
+                if colon >= n || b[colon] != 58:
+                    return JRead{val: jNone(), pos: n}
+                let vr = do jReadBW(b, colon + 1, nonWs)
+                keys = append(keys, kr.val.s)
+                vals = append(vals, vr.val)
+                i = jWsB(b, vr.pos, nonWs)
+            if i >= n:
+                return JRead{val: jNone(), pos: n}
+            return JRead{val: JVal{kind: "obj", s: "", keys: keys, vals: vals}, pos: i + 1}
+        if c == 91:
+            let mut items = []
+            let mut i = jWsB(b, pos + 1, nonWs)
+            loop i < n && b[i] != 93:
+                if b[i] == 44:
+                    i = jWsB(b, i + 1, nonWs)
+                    continue
+                let vr = do jReadBW(b, i, nonWs)
+                if vr.val.kind == "none":
+                    return JRead{val: jNone(), pos: n}
+                items = append(items, vr.val)
+                i = jWsB(b, vr.pos, nonWs)
+            if i >= n:
+                return JRead{val: jNone(), pos: n}
+            return JRead{val: JVal{kind: "arr", s: "", keys: [], vals: items}, pos: i + 1}
+        if c == 116 && pos + 4 <= n && b[pos + 1] == 114 && b[pos + 2] == 117 && b[pos + 3] == 101:
+            return JRead{val: JVal{kind: "bool", s: "true", keys: [], vals: []}, pos: pos + 4}
+        if c == 102 && pos + 5 <= n && b[pos + 1] == 97 && b[pos + 2] == 108 && b[pos + 3] == 115 && b[pos + 4] == 101:
+            return JRead{val: JVal{kind: "bool", s: "false", keys: [], vals: []}, pos: pos + 5}
+        if c == 110 && pos + 4 <= n && b[pos + 1] == 117 && b[pos + 2] == 108 && b[pos + 3] == 108:
+            return JRead{val: JVal{kind: "null", s: "", keys: [], vals: []}, pos: pos + 4}
+        # a number: its characters (jIsNumChar's set) up to the first other
+        if c == 45 || c == 43 || c == 46 || (c >= 48 && c <= 57):
+            let mut i = pos + 1
+            loop i < n && (b[i] == 45 || b[i] == 43 || b[i] == 46 || b[i] == 101 || b[i] == 69 || (b[i] >= 48 && b[i] <= 57)):
+                i = i + 1
+            return JRead{val: JVal{kind: "num", s: bytesToText(slice(b, pos, i)), keys: [], vals: []}, pos: i}
+        return JRead{val: jNone(), pos: n}
+
+    # jStrB: b[pos] is a string's opening quote — its text and the position
+    # after its closing quote. An escape-free string is its bytes; one with
+    # escapes is decoded by jReadString.
+    proc jStrB(b: [int], pos: int) -> JRead:
+        let q = indexOf(b, [34, 92], pos + 1)
+        if q < 0:
+            return JRead{val: jNone(), pos: len(b)}
+        if b[q] == 34:
+            return JRead{val: JVal{kind: "str", s: bytesToText(slice(b, pos + 1, q)), keys: [], vals: []}, pos: q + 1}
+        let end = do jStrEnd(b, pos)
+        let raw = bytesToText(slice(b, pos, end))
+        let r = do jReadString(raw, 0)
+        return JRead{val: r.val, pos: end}
+
+    # ── spans: where each value lies, without building it ──────────────────
+    # A document's bytes (textToBytes of it) are scanned for the byte span
+    # [start, end) of a value and of each member of an object or element of
+    # an array — so a caller holding the IR a compiler wrote can serve a
+    # page, a view or a component straight from those bytes (bytesToText of
+    # the span is that value's JSON exactly as written) instead of parsing
+    # it into JVals and encoding it again. The scan jumps between the bytes
+    # that matter (quotes, backslashes, brackets) with indexOf, so a span
+    # costs a few steps per nested value, not a step per byte.
+    struct JSpans:
+        ok: bool
+        # keys: an object's member names, in document order ([] for an
+        # array); starts/ends: each member value's (or element's) span
+        keys: [text]
+        starts: [int]
+        ends: [int]
+
+    # jWsSkip: the first position at or after pos that is not JSON
+    # whitespace (space, tab, newline, carriage return).
+    proc jWsSkip(b: [int], pos: int) -> int:
+        let mut i = pos
+        loop i < len(b) && (b[i] == 32 || b[i] == 10 || b[i] == 13 || b[i] == 9):
+            i = i + 1
+        return i
+
+    # jStrEnd: b[pos] is a string's opening quote; the position after its
+    # closing quote (len(b) when it has none).
+    proc jStrEnd(b: [int], pos: int) -> int:
+        let mut i = pos + 1
+        loop i < len(b):
+            let j = indexOf(b, [34, 92], i)
+            if j < 0:
+                return len(b)
+            if b[j] == 34:
+                return j + 1
+            i = j + 2
+        return len(b)
+
+    # jSpanEnd: the end of the value starting at pos (whitespace before it
+    # skipped) — after a string's closing quote, an object's or array's
+    # closing bracket, or a number's or literal's last byte.
+    proc jSpanEnd(b: [int], pos: int) -> int:
+        let i0 = do jWsSkip(b, pos)
+        if i0 >= len(b):
+            return len(b)
+        let c = b[i0]
+        if c == 34:
+            let e = do jStrEnd(b, i0)
+            return e
+        if c == 123 || c == 91:
+            let mut depth = 1
+            let mut i = i0 + 1
+            loop i < len(b) && depth > 0:
+                let j = indexOf(b, [34, 123, 125, 91, 93], i)
+                if j < 0:
+                    return len(b)
+                let d = b[j]
+                if d == 34:
+                    i = jStrEnd(b, j)
+                else:
+                    if d == 123 || d == 91:
+                        depth = depth + 1
+                    else:
+                        depth = depth - 1
+                    i = j + 1
+            return i
+        # a number, true, false or null: up to the next delimiter
+        let k = indexOf(b, [44, 125, 93, 32, 10, 13, 9], i0)
+        if k < 0:
+            return len(b)
+        return k
+
+    # jSpanKey: the member name whose quoted form spans [start, end).
+    proc jSpanKey(b: [int], start: int, end: int) -> text:
+        let raw = bytesToText(slice(b, start, end))
+        let r = do jReadString(raw, 0)
+        return r.val.s
+
+    # jObjectSpans: the members of the object at pos — each name, and its
+    # value's span. ok false when no object starts there.
+    proc jObjectSpans(b: [int], pos: int) -> JSpans:
+        let mut keys = []
+        let mut starts = []
+        let mut ends = []
+        let mut i = do jWsSkip(b, pos)
+        if i >= len(b) || b[i] != 123:
+            return JSpans{ok: false, keys: [], starts: [], ends: []}
+        i = jWsSkip(b, i + 1)
+        loop i < len(b) && b[i] == 34:
+            let kEnd = do jStrEnd(b, i)
+            keys = append(keys, jSpanKey(b, i, kEnd))
+            i = jWsSkip(b, kEnd)
+            if i < len(b) && b[i] == 58:
+                i = jWsSkip(b, i + 1)
+            let vEnd = do jSpanEnd(b, i)
+            starts = append(starts, i)
+            ends = append(ends, vEnd)
+            i = jWsSkip(b, vEnd)
+            if i < len(b) && b[i] == 44:
+                i = jWsSkip(b, i + 1)
+        return JSpans{ok: true, keys: keys, starts: starts, ends: ends}
+
+    # jArraySpans: the elements of the array at pos, each's span (keys
+    # empty). ok false when no array starts there.
+    proc jArraySpans(b: [int], pos: int) -> JSpans:
+        let mut starts = []
+        let mut ends = []
+        let mut i = do jWsSkip(b, pos)
+        if i >= len(b) || b[i] != 91:
+            return JSpans{ok: false, keys: [], starts: [], ends: []}
+        i = jWsSkip(b, i + 1)
+        loop i < len(b) && b[i] != 93:
+            let vEnd = do jSpanEnd(b, i)
+            starts = append(starts, i)
+            ends = append(ends, vEnd)
+            i = jWsSkip(b, vEnd)
+            if i < len(b) && b[i] == 44:
+                i = jWsSkip(b, i + 1)
+        return JSpans{ok: true, keys: [], starts: starts, ends: ends}
+
+    # jMemberSpan: the index of member `key` in an object's spans, -1 when
+    # it has none.
+    proc jMemberSpan(sp: JSpans, key: text) -> int:
+        return indexOf(sp.keys, key, 0)
+
+    # jSpanText: the value's JSON exactly as the document writes it.
+    proc jSpanText(b: [int], start: int, end: int) -> text:
+        return bytesToText(slice(b, start, end))
 
     # ── PART TWO: JVal → IR ─────────────────────────────────────────────────
     # Each object is read in ONE pass over its keys (a `continue` per key
@@ -484,6 +758,8 @@ app IRJSONSelfHost:
         let mut bind = ""
         let mut ret = ""
         let mut retList = false
+        let mut retMap = false
+        let mut retDepth = 0
         let mut role = []
         let mut msg = ""
         let mut status = 0
@@ -522,6 +798,13 @@ app IRJSONSelfHost:
                 continue
             if k == "retList":
                 retList = val.kind == "bool" && val.s == "true"
+                continue
+            if k == "retMap":
+                retMap = val.kind == "bool" && val.s == "true"
+                continue
+            if k == "retDepth":
+                if val.kind == "num":
+                    retDepth = toInt(val.s)
                 continue
             if k == "body":
                 body = do jStmtListX(val)
@@ -594,7 +877,7 @@ app IRJSONSelfHost:
             if k == "path":
                 path = val.s
                 continue
-        return IRStmt{op: op, target: target, entity: entity, field: field, key: key, value: value, fieldNames: fieldNames, fieldExprs: fieldExprs, service: service, args: args, itemVar: itemVar, where: where, order: order, desc: desc, limit: limit, bind: bind, ret: ret, retList: retList, role: role, msg: msg, status: status, body: body, elseBody: elseBody, bytesFlag: bytesFlag, file: file, path: path}
+        return IRStmt{op: op, target: target, entity: entity, field: field, key: key, value: value, fieldNames: fieldNames, fieldExprs: fieldExprs, service: service, args: args, itemVar: itemVar, where: where, order: order, orderBy: orderBy, desc: desc, limit: limit, bind: bind, ret: ret, retList: retList, role: role, msg: msg, status: status, body: body, elseBody: elseBody, bytesFlag: bytesFlag, file: file, path: path, retMap: retMap, retDepth: retDepth}
 
     proc irStmtFromJSON(s: text) -> IRStmt:
         let v = do jsonParse(s)
@@ -611,6 +894,41 @@ app IRJSONSelfHost:
         let st = do irStmtFromJSON(s)
         let j = do irStmtJSON(st)
         return j
+
+    # irSpanReport: for the IR document src, a JSON array of [name, json]
+    # pairs — each top-level member, then each element of `pages` and of
+    # `components` ("pages[i]") — each json the value's text sliced from src
+    # by its span.
+    proc irSpanReport(src: text) -> text:
+        let b = textToBytes(src)
+        let top = do jObjectSpans(b, 0)
+        if !top.ok:
+            return "!not an object"
+        let mut out = "["
+        let mut i = 0
+        loop i < len(top.keys):
+            if i > 0:
+                out = out + ","
+            out = out + "[" + jsonQuote(top.keys[i]) + "," + jsonQuote(jSpanText(b, top.starts[i], top.ends[i])) + "]"
+            i = i + 1
+        let names = ["pages", "components"]
+        let mut k = 0
+        loop k < len(names):
+            let at = do jMemberSpan(top, names[k])
+            if at >= 0:
+                let arr = do jArraySpans(b, top.starts[at])
+                let mut e = 0
+                loop e < len(arr.starts):
+                    out = out + ",[" + jsonQuote(names[k] + "[" + e + "]") + "," + jsonQuote(jSpanText(b, arr.starts[e], arr.ends[e])) + "]"
+                    e = e + 1
+            k = k + 1
+        return out + "]"
+
+    state irSpans: text = ""
+
+    action runIRSpans(src: text):
+        let r = do irSpanReport(src)
+        irSpans = r
 
     state irExprBack: text = ""
     state irStmtBack: text = ""

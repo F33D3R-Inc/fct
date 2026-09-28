@@ -50,7 +50,9 @@ app APIJSON:
         let mut a = 0
         loop a < len(g.actions):
             let act = g.actions[a]
-            if act.placement == "server":
+            # an @internal action is reached only from the authority (run, a
+            # job, a trigger): it is not part of the callable surface
+            if act.placement == "server" && !act.internal:
                 if !any:
                     aj = "["
                 else:
@@ -99,6 +101,14 @@ app APIJSON:
         return r2
 
     proc rtActionIndex(g: IRGraph, name: text) -> int:
+        let idx = rtNames
+        if idx.nActs == len(g.actions) && idx.nActs > 0:
+            if name in idx.acts:
+                let p = idx.acts[name]
+                if g.actions[p].name == name:
+                    return p
+            else:
+                return -1
         let mut i = 0
         loop i < len(g.actions):
             if g.actions[i].name == name:
@@ -145,11 +155,43 @@ app APIJSON:
         let got = do rtHeaderValue(req.headers, "x-facet-csrf")
         return got == want
 
+    # rtRunReserved: runReserved — the tenancy and billing action names are
+    # the runtime's own, claimed before an app's action of the same name is
+    # looked up (an app declaring `subscribe` reaches billing on /event and
+    # /api alike). Disabled, each answers 501 naming the switch; enabled,
+    # they are not ported yet and say so rather than run the app's action.
+    struct RtReserved:
+        claimed: bool
+        resp: HttpServerResponse
+
+    proc rtRunReserved(w: RtWorld, name: text) -> RtReserved:
+        let tenant = name == "createTenant" || name == "switchTenant" || name == "inviteMember" || name == "acceptInvite" || name == "setMemberRole" || name == "removeMember" || name == "leaveTenant"
+        let billing = name == "subscribe" || name == "cancelSubscription" || name == "recordUsage"
+        let none = do rtNotFound()
+        if tenant:
+            if !w.multiTenant:
+                let r = do rtTextError(501, "multi-tenancy is not enabled (set FACET_MULTI_TENANT=1)")
+                return RtReserved{claimed: true, resp: r}
+            let r2 = do rtTextError(501, "multi-tenancy is not available in the self-hosted runtime yet")
+            return RtReserved{claimed: true, resp: r2}
+        if billing:
+            if !w.billing:
+                let r3 = do rtTextError(501, "billing is not enabled (set FACET_BILLING=1)")
+                return RtReserved{claimed: true, resp: r3}
+            let r4 = do rtTextError(501, "billing is not available in the self-hosted runtime yet")
+            return RtReserved{claimed: true, resp: r4}
+        return RtReserved{claimed: false, resp: none}
+
     proc rtHandleEvent(w0: RtWorld, req: HttpServerRequest) -> RtHandled:
         let mut w = w0
         if req.method != "POST":
             let m = do rtTextError(405, "POST only")
             return RtHandled{resp: m, w: w}
+        let gm = do rtGuardRate(w, req)
+        w = gm.w
+        if !gm.allowed:
+            let rl = do rtTextError(429, "rate limit exceeded")
+            return RtHandled{resp: rl, w: w}
         let csrf = do rtCheckCSRF(w, req)
         if !csrf:
             let f = do rtTextError(403, "missing or invalid CSRF token")
@@ -162,8 +204,11 @@ app APIJSON:
         if w.g.auth && isAuth:
             let ar = do rtRunAuth(w, req, a.action, a.args)
             return ar
+        let reserved = do rtRunReserved(w, a.action)
+        if reserved.claimed:
+            return RtHandled{resp: reserved.resp, w: w}
         let ai = do rtActionIndex(w.g, a.action)
-        if ai < 0:
+        if ai < 0 || w.g.actions[ai].internal:
             let u = do rtTextError(404, "unknown action")
             return RtHandled{resp: u, w: w}
         let act = w.g.actions[ai]
@@ -185,7 +230,10 @@ app APIJSON:
             raws = append(raws, rtValJSON(run.value))
         let body = do rtObjectJSONRaw(keys, raws)
         let mut resp = do rtJSONResponse(200, body + "\n")
-        resp.headers = append(resp.headers, so.cookie)
+        # adoptSession: a re-keyed session's cookie replaces the one the
+        # request was stamped with; an ended one's is cleared.
+        let adopted = do rtAdoptSession(w, so.sid, run.sid, so.cookie)
+        resp.headers = resp.headers + adopted
         return RtHandled{resp: resp, w: w}
 
     proc rtHandleAPI(w0: RtWorld, req: HttpServerRequest) -> RtHandled uses io.net:
@@ -242,6 +290,11 @@ app APIJSON:
             let lr = do rtJSONResponse(200, body)
             return RtHandled{resp: lr, w: w}
         if req.method == "POST":
+            let gm = do rtGuardRate(w, req)
+            w = gm.w
+            if !gm.allowed:
+                let rl = do rtTextError(429, "rate limit exceeded")
+                return RtHandled{resp: rl, w: w}
             let a = do rtArgsOf(req.body)
             if !a.ok:
                 let b = do rtTextError(400, "bad request")
@@ -250,8 +303,11 @@ app APIJSON:
             if w.g.auth && isAuth:
                 let ar = do rtRunAuth(w, req, name, a.args)
                 return ar
+            let claim = do rtRunReserved(w, name)
+            if claim.claimed:
+                return RtHandled{resp: claim.resp, w: w}
             let ai = do rtActionIndex(w.g, name)
-            if ai < 0:
+            if ai < 0 || w.g.actions[ai].internal:
                 let u = do rtTextError(404, "unknown action")
                 return RtHandled{resp: u, w: w}
             let act = w.g.actions[ai]
@@ -278,8 +334,11 @@ app APIJSON:
                 raws = append(raws, rtValJSON(run.value))
             let body = do rtObjectJSONRaw(keys, raws)
             let mut resp = do rtJSONResponse(200, body + "\n")
+            let mut minted = HttpHeader{name: "", value: ""}
             if so.hasCookie:
-                resp.headers = append(resp.headers, so.cookie)
+                minted = so.cookie
+            let adopted = do rtAdoptSession(w, so.sid, run.sid, minted)
+            resp.headers = resp.headers + adopted
             return RtHandled{resp: resp, w: w}
         let mna = do rtTextError(405, "GET or POST only")
         return RtHandled{resp: mna, w: w}
@@ -511,6 +570,11 @@ app APIJSON:
         if req.method != "POST":
             let m = do rtTextError(405, "POST only")
             return RtHandled{resp: m, w: w}
+        let gm = do rtGuardRate(w, req)
+        w = gm.w
+        if !gm.allowed:
+            let rl = do rtTextError(429, "rate limit exceeded")
+            return RtHandled{resp: rl, w: w}
         let csrf = do rtCheckCSRF(w, req)
         if !csrf:
             let f = do rtTextError(403, "missing or invalid CSRF token")
@@ -633,7 +697,7 @@ app APIJSON:
         if pinned:
             if q.after != "":
                 return RtEnginePage{ok: true, rows: [], next: ""}
-            let got = do fqlGetNode(c, rtFqAddress(entity, pinID))
+            let got = do rtFqGetNode(c, rtFqAddress(entity, pinID))
             if !got.ok:
                 return RtEnginePage{ok: false, rows: [], next: ""}
             if !got.found:
@@ -662,7 +726,7 @@ app APIJSON:
         if q.after != "":
             parts = append(parts, "\"after\":" + jsonQuote(q.after))
         let body = "{" + rtJoinTexts(parts, ",") + "}"
-        let sent = do fqlPostJson(c, "/nodes/query", body, "POST /nodes/query")
+        let sent = do rtFqPostJson(c, "/nodes/query", body, "POST /nodes/query")
         if !sent.ok:
             return RtEnginePage{ok: false, rows: [], next: ""}
         let page = do fqlDecodeQueryPage(sent.body)

@@ -82,7 +82,8 @@ func wholeBodyParam(a *compiledAPI, g *ir.IR) (string, bool) {
 			bodyParams = append(bodyParams, p)
 		}
 	}
-	if len(bodyParams) != 1 || !isWireTypeOrMessage(bodyParams[0].Type, g) {
+	// A list of them (`events: [Event]`) is a named field of the body, not the body.
+	if len(bodyParams) != 1 || bodyParams[0].List || !isWireTypeOrMessage(bodyParams[0].Type, g) {
 		return "", false
 	}
 	return bodyParams[0].Name, true
@@ -327,7 +328,7 @@ func (s *Server) serveDeclaredAPI(w http.ResponseWriter, r *http.Request, apis [
 			args[i] = nil // absent: the action binds its zero, and given(p) is false
 			continue
 		}
-		cv, ok := paramArg(v, p)
+		cv, ok := s.argFor(v, p)
 		if !ok {
 			apiError(w, http.StatusBadRequest, fmt.Sprintf("parameter %q expects %s", p.Name, paramTypeName(p)))
 			return true
@@ -345,10 +346,9 @@ func (s *Server) serveDeclaredAPI(w http.ResponseWriter, r *http.Request, apis [
 	// caller with no session yet — a public signup/login-shaped write. Unlike a
 	// GET, which must stay read-only (sidForRequest never mints; see its own
 	// doc), a write here needs a REAL, distinct session before the action runs:
-	// runActionLocked's ensureSession(sid) treats sid as a session's storage
-	// key, and leaving it "" for every anonymous caller would collapse them
-	// all onto the one session literally keyed by "" — the same shared,
-	// racing identity for every concurrent unauthenticated write. `session`
+	// runActionLocked runs an id that names no session as a transient guest
+	// whose state is never kept, so a write left at "" would lose whatever the
+	// action set on its session (an `establish` aside). `session`
 	// mints one and signs it into the response the exact way the generic
 	// `/api/<action>` POST path already does, so this matches that existing,
 	// already-correct behavior instead of adding a second rule.
@@ -637,7 +637,7 @@ func (s *Server) serveDispatch(w http.ResponseWriter, r *http.Request, decl ir.A
 				raw = decoded
 			}
 		}
-		cv, good := paramArg(raw, p)
+		cv, good := s.argFor(raw, p)
 		if !good {
 			apiError(w, http.StatusBadRequest, fmt.Sprintf("%s: %q expects %s", tag, p.Name, paramTypeName(p)))
 			return

@@ -93,6 +93,7 @@ func (s *Server) Reload(graph *ir.IR) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	tellSearched(s.store, graph)
 	loaded, err := s.store.Init(graph.Entities)
 	if err != nil {
 		return err

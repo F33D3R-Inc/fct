@@ -127,6 +127,8 @@ type RecordField struct {
 	// (a struct field only; see ast.StructField).
 	Map bool   `json:"map,omitempty"`
 	Key string `json:"key,omitempty"`
+	// Depth: a nested list (`[[T]]`) — List with Depth 2 or more.
+	Depth int `json:"depth,omitempty"`
 }
 
 // Struct is a proc-local named-field composite type declaration (see
@@ -154,8 +156,11 @@ type WireType struct {
 	// Query marks this type as bound from a URL query string, never a JSON
 	// body — see ast.Type.Query's doc comment for what that changes (and
 	// deliberately does not change) in each codegen target.
-	Query  bool        `json:"query,omitempty"`
-	Fields []WireField `json:"fields"`
+	Query bool `json:"query,omitempty"`
+	// Internal: declared `type Name @internal:` — not published in the
+	// contract, and never an `api` route's parameter or reply.
+	Internal bool        `json:"internal,omitempty"`
+	Fields   []WireField `json:"fields"`
 }
 
 // SchemaName is the type's contract schema name: its `as "…"` alias, else Name.
@@ -423,6 +428,7 @@ type Action struct {
 	Params     []Param   `json:"params"`
 	Requires   []Require `json:"requires"`
 	Optimistic bool      `json:"optimistic,omitempty"` // client predicts the result pre-round-trip
+	Internal   bool      `json:"internal,omitempty"`   // @internal: reached only from the authority (run, job, trigger, tooling), never a client
 	Ret        string    `json:"ret,omitempty"`        // return type core ("" = no reply value); see ast.Action.Ret
 	RetList    bool      `json:"retList,omitempty"`    // the reply value is a list of Ret
 	Placement  string    `json:"placement"`
@@ -448,7 +454,9 @@ type Proc struct {
 	RetList bool    `json:"retList,omitempty"` // the return is a list of Ret
 	RetMap  bool    `json:"retMap,omitempty"`  // the return is a map of Ret values
 	RetKey  string  `json:"retKey,omitempty"`  // the map return's key type (int or text)
-	Body    []Stmt  `json:"body"`
+	// RetDepth: a nested list return (`-> [[T]]`), RetList with depth 2+.
+	RetDepth int    `json:"retDepth,omitempty"`
+	Body     []Stmt `json:"body"`
 }
 
 // API is one declared HTTP endpoint (ast.API), resolved: Params are the
@@ -588,6 +596,8 @@ type Param struct {
 	// parameter only; see ast.Param).
 	Map bool   `json:"map,omitempty"`
 	Key string `json:"key,omitempty"`
+	// Depth: a nested list (`[[T]]`) — List with Depth 2 or more.
+	Depth int `json:"depth,omitempty"`
 }
 
 // Job is a scheduled server action: the runtime invokes Action on a timer
@@ -747,20 +757,24 @@ type Stmt struct {
 	Var     string      `json:"var,omitempty"`     // remove/set (filtered), for: item variable
 	Where   *Expr       `json:"where,omitempty"`   // remove/set (filtered), for: predicate (nil = by-id / every row)
 	Order   string      `json:"order,omitempty"`   // for (action): sort field ("" = insertion order)
+	OrderBy *Expr       `json:"orderBy,omitempty"` // for (action): a computed sort key (`by <expr>`), per row
 	Desc    bool        `json:"desc,omitempty"`    // for (action): descending
 	Limit   *Expr       `json:"limit,omitempty"`   // for (action): max rows (nil = every match)
 	Bind    string      `json:"bind,omitempty"`    // call/do (request→response): local the result binds to; add: local the new row's id binds to
 	Ret     string      `json:"ret,omitempty"`     // call/do (request→response): result type core, for decode/coerce
 	RetList bool        `json:"retList,omitempty"` // call/do (request→response): result is a list of Ret
 	RetMap  bool        `json:"retMap,omitempty"`  // do: the proc's result is a {K: Ret} map
-	Role    *Expr       `json:"role,omitempty"`    // establish: optional new session role (Value holds the new actor)
-	Msg     string      `json:"msg,omitempty"`     // check: the message returned when the condition (Value) is false
-	Status  int         `json:"status,omitempty"`  // check: the HTTP status a declared api answers with on failure (0 = 422); return: the reply's own 2xx (0 = the route's)
-	Body    []Stmt      `json:"body,omitempty"`    // loop/for: the repeated body; if: the `then` branch
-	Else    []Stmt      `json:"else,omitempty"`    // if: the `else` branch (nil = none)
-	Bytes   bool        `json:"bytes,omitempty"`   // indexset: Target is a byte-buffer local (internal/ir/build.go's bytesType) — range-check Value to 0-255 rather than accepting any int; fileread/filewrite: the file resource is `bytes`-typed rather than `text`
-	File    string      `json:"file,omitempty"`    // fileread/filewrite: the declared `file` resource's name (for a clear runtime error)
-	Path    string      `json:"path,omitempty"`    // fileread/filewrite: the file's author-facing path, resolved from its `file` declaration at compile time — still passed through the sandbox (resolveDataPath) at runtime
+	// RetDepth: do/join: the proc's result is a nested list ([[Ret]]) — its
+	// elements are lists, never coerced to Ret.
+	RetDepth int    `json:"retDepth,omitempty"`
+	Role     *Expr  `json:"role,omitempty"`   // establish: optional new session role (Value holds the new actor)
+	Msg      string `json:"msg,omitempty"`    // check: the message returned when the condition (Value) is false
+	Status   int    `json:"status,omitempty"` // check: the HTTP status a declared api answers with on failure (0 = 422); return: the reply's own 2xx (0 = the route's)
+	Body     []Stmt `json:"body,omitempty"`   // loop/for: the repeated body; if: the `then` branch
+	Else     []Stmt `json:"else,omitempty"`   // if: the `else` branch (nil = none)
+	Bytes    bool   `json:"bytes,omitempty"`  // indexset: Target is a byte-buffer local (internal/ir/build.go's bytesType) — range-check Value to 0-255 rather than accepting any int; fileread/filewrite: the file resource is `bytes`-typed rather than `text`
+	File     string `json:"file,omitempty"`   // fileread/filewrite: the declared `file` resource's name (for a clear runtime error)
+	Path     string `json:"path,omitempty"`   // fileread/filewrite: the file's author-facing path, resolved from its `file` declaration at compile time — still passed through the sandbox (resolveDataPath) at runtime
 }
 
 // FieldInit is a `name: expr` in an `add`.
@@ -811,8 +825,11 @@ type Node struct {
 	Coll  string `json:"coll,omitempty"`  // list: collection name
 	Where *Expr  `json:"where,omitempty"` // list: row filter (nil = all)
 	Order string `json:"order,omitempty"` // list: sort field
-	Desc  bool   `json:"desc,omitempty"`  // list: descending
-	Limit *Expr  `json:"limit,omitempty"` // list: max rows (nil = unlimited); int literal or a dynamic page-size expr
+	// OrderBy is a list's computed sort key (`for … by <expr>`), read per row
+	// with Var bound, as an aggregate's `list(… by <expr>)` is.
+	OrderBy *Expr `json:"orderBy,omitempty"`
+	Desc    bool  `json:"desc,omitempty"`  // list: descending
+	Limit   *Expr `json:"limit,omitempty"` // list: max rows (nil = unlimited); int literal or a dynamic page-size expr
 	// More is the zero-argument action a list fires to load its next page — the
 	// infinite-scroll clause (`for … limit shown more loadMore:`). While the
 	// render cut rows off at `limit`, a "More" control follows the last row; the
@@ -848,6 +865,9 @@ type Node struct {
 
 	Bind        string `json:"bind,omitempty"`        // input/textarea/checkbox/radio/select/upload: the state cell this control reads and writes
 	Placeholder []Seg  `json:"placeholder,omitempty"` // input/textarea/typeahead
+	// Multiple: an upload bound to a `[text]` cell takes many files at once,
+	// each uploaded in turn (resumably when large) and its URL appended.
+	Multiple bool `json:"multiple,omitempty"`
 
 	// Alt is the words that stand in for a picture or a player when it cannot be
 	// seen: an `<img alt="…">` and, for a video, the `aria-label` a <video> reads

@@ -1,9 +1,16 @@
 package runtime
 
 import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 
 	"facet/internal/ir"
@@ -62,6 +69,16 @@ type testStep struct {
 	Equals any    `json:"equals"`
 	// seed rows
 	Seed map[string][]map[string]any `json:"seed"`
+	// deliver a webhook: POST Body (JSON) to the declared `webhook` at this
+	// path through the app's real handler, signed with the webhook's key —
+	// or with a wrong key (Forge) or none (Unsigned) — carrying IdemKey as
+	// the Idempotency-Key when set, and expect the HTTP Status (default 200).
+	Webhook  string         `json:"webhook"`
+	Body     map[string]any `json:"body"`
+	Forge    bool           `json:"forge"`
+	Unsigned bool           `json:"unsigned"`
+	IdemKey  string         `json:"idemKey"`
+	Status   int            `json:"status"`
 }
 
 // RunTests runs every case in the suite against a fresh app and writes a TAP-ish
@@ -73,6 +90,12 @@ func RunTests(graph *ir.IR, raw []byte, out io.Writer) (int, int, error) {
 	}
 	if len(suite.Tests) == 0 {
 		return 0, 0, fmt.Errorf("no tests found (expected a top-level \"tests\" array)")
+	}
+	// A test run's servers are the runner's own: their request log would
+	// interleave with the report, so it is kept to errors unless asked for.
+	if os.Getenv("FACET_LOG_LEVEL") == "" {
+		os.Setenv("FACET_LOG_LEVEL", "error")
+		defer os.Unsetenv("FACET_LOG_LEVEL")
 	}
 	pass, fail := 0, 0
 	for _, tc := range suite.Tests {
@@ -160,8 +183,13 @@ func runCase(graph *ir.IR, tc testCase) error {
 				return fmt.Errorf("%s: expected %q == %s, got %s", where, step.Expect, jsonOf(step.Equals), jsonOf(got))
 			}
 
+		case step.Webhook != "":
+			if err := deliverWebhook(graph, srv, step); err != nil {
+				return fmt.Errorf("%s: %w", where, err)
+			}
+
 		default:
-			return fmt.Errorf("%s: a step must be one of run / expect / seed", where)
+			return fmt.Errorf("%s: a step must be one of run / expect / seed / webhook", where)
 		}
 	}
 	return nil
@@ -196,4 +224,50 @@ func jsonOf(v any) string {
 		return fmt.Sprintf("%v", v)
 	}
 	return string(b)
+}
+
+// deliverWebhook runs a sidecar `webhook` step through the server's own HTTP
+// handler, so the signature check, the delivery dedup and the target action
+// are exercised exactly as a provider's request would exercise them.
+func deliverWebhook(graph *ir.IR, srv *Server, step testStep) error {
+	var wh *ir.Webhook
+	for i := range graph.Webhooks {
+		if graph.Webhooks[i].Path == step.Webhook {
+			wh = &graph.Webhooks[i]
+		}
+	}
+	if wh == nil {
+		return fmt.Errorf("no webhook is declared at %q", step.Webhook)
+	}
+	body, err := json.Marshal(step.Body)
+	if err != nil {
+		return fmt.Errorf("webhook body: %w", err)
+	}
+	key := webhookKey(wh.Secret)
+	if step.Forge {
+		key = []byte("not-the-webhook-key")
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write(body)
+	req := httptest.NewRequest(http.MethodPost, step.Webhook, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if !step.Unsigned {
+		req.Header.Set("X-Facet-Signature", hex.EncodeToString(mac.Sum(nil)))
+	}
+	if step.IdemKey != "" {
+		req.Header.Set("Idempotency-Key", step.IdemKey)
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	want := step.Status
+	if want == 0 {
+		want = http.StatusOK
+	}
+	if rec.Code != want {
+		return fmt.Errorf("webhook %s answered %d %q, want %d", step.Webhook, rec.Code, strings.TrimSpace(rec.Body.String()), want)
+	}
+	if step.Fails != "" && !strings.Contains(rec.Body.String(), step.Fails) {
+		return fmt.Errorf("webhook %s answered %q, want it to contain %q", step.Webhook, strings.TrimSpace(rec.Body.String()), step.Fails)
+	}
+	return nil
 }

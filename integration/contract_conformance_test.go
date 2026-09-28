@@ -77,6 +77,14 @@ var contractAllowlist = map[string]string{
 // every documented mutation (x-mutation-events) and stream event
 // (x-stream-events). Any difference not on contractAllowlist fails.
 func TestAPIContractMatchesGolden(t *testing.T) {
+	// The site (the product and its web pages at one origin) and the API
+	// alone publish the same contract.
+	for _, root := range []string{"f33d3r_com.fct", "api/main.fct"} {
+		t.Run(root, func(t *testing.T) { contractMatchesGolden(t, root) })
+	}
+}
+
+func contractMatchesGolden(t *testing.T, root string) {
 	goldenPath := os.Getenv("FACET_GOLDEN_CONTRACT")
 	if goldenPath == "" {
 		goldenPath = defaultGoldenContract
@@ -90,7 +98,7 @@ func TestAPIContractMatchesGolden(t *testing.T) {
 		t.Fatalf("golden contract %s: %v", goldenPath, err)
 	}
 
-	app, _ := filepath.Abs("../../facets/api/main.fct")
+	app, _ := filepath.Abs(filepath.Join("../../facets", root))
 	graph, err := compile.File(app)
 	if err != nil {
 		t.Fatalf("compiling %s: %v", app, err)

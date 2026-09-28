@@ -68,12 +68,20 @@ app FabricJsonSelfHost:
         return !sjU64Gt(lim, a) && (sjU64Gt(a, lim) || d > 5)
 
     proc sjRange(bs: [int], from: int, to: int) -> [int]:
-        let mut out = bytes(to - from)
-        let mut i = from
-        loop i < to:
-            out[i - from] = bs[i]
-            i = i + 1
-        return out
+        return slice(bs, from, to)
+
+    # sjStringStops: the bytes that end a run of plain string bytes — the
+    # quote, the backslash, and the control characters serde_json refuses
+    # raw — searched for natively (indexOf over a byte buffer).
+    proc sjStringStops() -> [int]:
+        return [34, 92, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+
+    # sjStopFrom: the first stop byte at or after i, or n when there is none.
+    proc sjStopFrom(bs: [int], i: int) -> int:
+        let at = indexOf(bs, sjStringStops(), i)
+        if at < 0:
+            return len(bs)
+        return at
 
     # ============================================================
     # Positions and errors — serde_json's Error Display is
@@ -390,41 +398,7 @@ app FabricJsonSelfHost:
 
     # str::from_utf8's validity (no overlongs, no surrogates, <= U+10FFFF).
     proc sjValidUtf8(bs: [int]) -> bool:
-        let n = len(bs)
-        let mut i = 0
-        loop i < n:
-            let c = bs[i]
-            if c < 128:
-                i = i + 1
-            else:
-                let mut w = 0
-                let mut lo = 128
-                let mut hi = 191
-                if c >= 194 && c <= 223:
-                    w = 2
-                if c >= 224 && c <= 239:
-                    w = 3
-                    if c == 224:
-                        lo = 160
-                    if c == 237:
-                        hi = 159
-                if c >= 240 && c <= 244:
-                    w = 4
-                    if c == 240:
-                        lo = 144
-                    if c == 244:
-                        hi = 143
-                if w == 0 || i + w > n:
-                    return false
-                if bs[i + 1] < lo || bs[i + 1] > hi:
-                    return false
-                let mut k = 2
-                loop k < w:
-                    if bs[i + k] < 128 || bs[i + k] > 191:
-                        return false
-                    k = k + 1
-                i = i + w
-        return true
+        return validUtf8(bs)
 
     # parse_str: `i` is just past the opening quote; the value is the
     # decoded text. Validated as UTF-8 once the closing quote is reached
@@ -438,8 +412,7 @@ app FabricJsonSelfHost:
         let mut badUtf8 = false
         loop true:
             let start = i
-            loop i < n && bs[i] != 34 && bs[i] != 92 && bs[i] >= 32:
-                i = i + 1
+            i = sjStopFrom(bs, i)
             if i > start:
                 let chunk = sjRange(bs, start, i)
                 if !sjValidUtf8(chunk):
@@ -510,8 +483,7 @@ app FabricJsonSelfHost:
         let n = len(bs)
         let mut i = i0
         loop true:
-            loop i < n && bs[i] != 34 && bs[i] != 92 && bs[i] >= 32:
-                i = i + 1
+            i = sjStopFrom(bs, i)
             if i >= n:
                 return sjErr(bs, n, "EOF while parsing a string")
             if bs[i] == 34:
@@ -1465,7 +1437,10 @@ app FabricJsonSelfHost:
         return r
 
     # sjDecodeBytes: the same over raw bytes (which need not be UTF-8).
-    proc sjDecodeBytes(types: [SjType], bs: [int], name: text) -> SjDecoded:
+    proc sjDecodeBytes(types: [SjType], raw: [int], name: text) -> SjDecoded:
+        # As one byte buffer (a list of byte values becomes one, verbatim), so
+        # the string scans search it natively.
+        let bs = textToBytes(bytesToText(raw))
         let d = sjDeAny(types, bs, 0, name, 128)
         if !d.ok:
             return SjDecoded{ok: false, err: d.err, v: sjNull(), category: d.cat, path: sjPathText(d.path)}

@@ -103,3 +103,17 @@ func TestFabricControllerCore(t *testing.T) {
 		}
 	}
 }
+
+// decision.rs requested_by_operator and controller.rs's three tests of it
+// (an_operator_request_is_not_held_to_the_models_threshold,
+// an_operator_request_is_held_to_every_safety_check): the operator's
+// zero-score move passes where the optimizer's identical decision is below
+// the threshold, and every other check still refuses it.
+func TestFabricControllerCoreOperatorRequest(t *testing.T) {
+	ts := loadFabricControllerCoreApp(t)
+	d := postJSON(t, ts, "runFabricControllerCoreOperator")
+	want := "score=0|admitted=true|proposed=BelowExecutionThreshold|unhealthy=DestinationUnhealthy|older=TopologySuperseded|stale=StaleDecision"
+	if got := d["demoOperatorRequestResult"]; got != want {
+		t.Errorf("operator request:\n got %v\nwant %s", got, want)
+	}
+}

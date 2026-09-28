@@ -42,6 +42,7 @@ type fctChan struct {
 	cond     *sync.Cond
 	queue    []string
 	closed   bool
+	capacity int                    // how many values may wait unread (channel(n); 1 by default)
 	watchers map[chan struct{}]bool // awaitAny calls waiting on this channel
 }
 
@@ -49,23 +50,34 @@ func newChannelRegistry() *channelRegistry {
 	return &channelRegistry{chans: map[int]*fctChan{}}
 }
 
-// channelBufferSize is the one buffer size every channel gets — a small,
-// fixed bound (LANGUAGE.md's "genuinely minimal" instruction for this
-// milestone: no arbitrary-capacity CSP feature set, just enough buffering
-// that a spawned sender doesn't have to rendezvous with its receiver on
-// every single value).
+// channelBufferSize is a channel's buffer when channel() names none — just
+// enough that a spawned sender does not rendezvous with its receiver on
+// every value. channel(n) asks for n (at most maxChannelBuffer): a queue
+// that absorbs a burst, like a server's per-client outbox, which a sender
+// fills with trySend and skips the client when it is full.
 const channelBufferSize = 1
+
+const maxChannelBuffer = 4096
 
 // create mints a fresh channel and returns its handle.
 func (r *channelRegistry) create() int {
+	id, _ := r.createSized(channelBufferSize)
+	return id
+}
+
+// createSized implements `channel(n)`: a channel buffering up to n values.
+func (r *channelRegistry) createSized(n int) (int, error) {
+	if n < 1 || n > maxChannelBuffer {
+		return 0, fmt.Errorf("channel: a buffer of %d is out of range (must be 1-%d)", n, maxChannelBuffer)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.next++
 	id := r.next
-	c := &fctChan{watchers: map[chan struct{}]bool{}}
+	c := &fctChan{capacity: n, watchers: map[chan struct{}]bool{}}
 	c.cond = sync.NewCond(&c.mu)
 	r.chans[id] = c
-	return id
+	return id, nil
 }
 
 // lookup resolves a handle. A handle that was minted and then closed
@@ -109,7 +121,7 @@ func (r *channelRegistry) send(id int, value string) (any, error) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for len(c.queue) >= channelBufferSize && !c.closed {
+	for len(c.queue) >= c.capacity && !c.closed {
 		c.cond.Wait()
 	}
 	if c.closed {
@@ -144,6 +156,30 @@ func (r *channelRegistry) recv(id int) (any, error) {
 	c.queue = c.queue[1:]
 	c.cond.Broadcast()
 	return v, nil
+}
+
+// trySend implements `trySend(ch, value) -> bool`: send without waiting —
+// true when the value was queued, false when the buffer is full or the
+// channel is closed. A sender serving many receivers (the runtime's loop
+// fanning a change out to every subscriber) skips a slow one instead of
+// stalling on it, as a Go select with a default case does.
+func (r *channelRegistry) trySend(id int, value string) (any, error) {
+	c, closed, err := r.lookup(id)
+	if err != nil {
+		return nil, fmt.Errorf("trySend: %w", err)
+	}
+	if closed {
+		return false, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || len(c.queue) >= c.capacity {
+		return false, nil
+	}
+	c.queue = append(c.queue, value)
+	c.cond.Broadcast()
+	c.notify()
+	return true, nil
 }
 
 // close implements `closeChannel(ch) -> bool`: the handle is released —
@@ -243,4 +279,18 @@ func intListArg(name string, v any) ([]int, error) {
 		out[i] = toInt(x)
 	}
 	return out, nil
+}
+
+// closeAll closes every channel (haltProgram): blocked sends answer false,
+// blocked receives fail.
+func (r *channelRegistry) closeAll() {
+	r.mu.Lock()
+	ids := make([]int, 0, len(r.chans))
+	for id := range r.chans {
+		ids = append(ids, id)
+	}
+	r.mu.Unlock()
+	for _, id := range ids {
+		r.close(id)
+	}
 }

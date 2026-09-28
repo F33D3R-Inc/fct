@@ -86,6 +86,7 @@ var (
 // skips the calling test when cargo (or the facetql checkout) is absent.
 func facetqlCheck(t *testing.T) string {
 	t.Helper()
+	fqRustReference(t)
 	facetqlCheckOnce.Do(func() {
 		cargo, err := exec.LookPath("cargo")
 		if err != nil {
@@ -98,7 +99,7 @@ func facetqlCheck(t *testing.T) string {
 		}
 		target := os.Getenv("FCT_FACETQL_CHECK_TARGET")
 		if target == "" {
-			target = filepath.Join(os.TempDir(), "fct-facetql-check")
+			target = fqTestCargoTarget("fct-facetql-check")
 		}
 		cmd := exec.Command(cargo, "build", "--release", "--quiet")
 		cmd.Dir = "testdata/facetql_check"

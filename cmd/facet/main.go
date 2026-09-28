@@ -10,6 +10,7 @@
 //	facet lang                    the language's node kinds/controls/builtins/modifiers, derived live (see lang.go)
 //	facet migrate <file.fct>      reconcile the database schema (--plan to dry-run)
 //	facet deploy <file.fct>       container + systemd config (--production, see new.go)
+//	facet facetql [command]       FacetQL, server and operator CLI (written in fct, embedded; see facetql.go)
 //	facet version                 print the toolchain version
 //
 // One binary is two programs. A copy of this executable with an application
@@ -24,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/pprof"
 	"strings"
 
 	"facet/internal/compile"
@@ -109,6 +111,8 @@ func main() {
 			fatal(err)
 		}
 		return
+	case "facetql":
+		os.Exit(cmdFacetQL(os.Args[2:]))
 	case "exec":
 		os.Exit(cmdExec(os.Args[2:]))
 	case "check":
@@ -206,6 +210,19 @@ func main() {
 		fmt.Printf("  enterprise      %s\n", runtime.EnterpriseDescription())
 		if runtime.AdminEnabled() {
 			fmt.Printf("  admin console   %s/admin\n", url)
+		}
+		// FACET_CPUPROFILE=<path>: a CPU profile of the served run, written
+		// when Serve returns — how a page's or an action's cost is measured
+		// (`go tool pprof`), as for `facet exec`.
+		if path := os.Getenv("FACET_CPUPROFILE"); path != "" {
+			f, err := os.Create(path)
+			if err != nil {
+				fatal(err)
+			}
+			if err := pprof.StartCPUProfile(f); err != nil {
+				fatal(err)
+			}
+			defer func() { pprof.StopCPUProfile(); f.Close() }()
 		}
 		// Serve blocks until SIGINT/SIGTERM, then drains in-flight requests, stops
 		// the job workers, and closes the database — a deploy-safe shutdown.
@@ -473,6 +490,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  facet serve [file] [--port N]  production server: no watcher, $PORT, preflight checks")
 	fmt.Fprintln(os.Stderr, "  facet check <file.fct> [--json] compile-only; report ok or diagnostics")
 	fmt.Fprintln(os.Stderr, "  facet exec <file.fct> [args...]  run the program's proc main(args: [text]) -> int as a command")
+	fmt.Fprintln(os.Stderr, "  facet facetql [command]         FacetQL: the server (start, the default) and its operator CLI")
 	fmt.Fprintln(os.Stderr, "  facet build <file.fct> [--json] compile and print the IR (--json for error diagnostics)")
 	fmt.Fprintln(os.Stderr, "  facet build --release <file.fct> package the app as one self-contained binary (-o, --base)")
 	fmt.Fprintln(os.Stderr, "  facet ir <file.fct> [--compact] dump the compiled IR as JSON for tooling")

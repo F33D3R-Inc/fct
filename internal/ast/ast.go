@@ -504,8 +504,12 @@ type Type struct {
 	// Schema is the contract name from `type Name as "schema":` ("" = Name).
 	Schema string
 	Query  bool
-	Fields []RecordField
-	Line   int
+	// Internal: `type Name @internal:` — a value object passed between a
+	// library's own actions and procs, never on the wire: the contract does
+	// not publish it and no `api` route may take or answer it.
+	Internal bool
+	Fields   []RecordField
+	Line     int
 }
 
 // Message is a wire tagged union: a closed set of named variants, each with
@@ -584,9 +588,12 @@ type StructField struct {
 	List bool
 	// Map / Key: a `{K: V}` field — a map from Key (int or text) to Type
 	// values, exactly as a `{K: V}` proc parameter.
-	Map  bool
-	Key  string
-	Line int
+	Map bool
+	Key string
+	// Depth: a nested list field (`[[float]]`) — List with Depth 2; 0 for
+	// a plain list or any other field.
+	Depth int
+	Line  int
 }
 
 // ThemeVar is one `name "value"` line in a `theme:` block. It becomes a CSS
@@ -818,6 +825,17 @@ type Action struct {
 	Params     []Param
 	Requires   []Require
 	Optimistic bool // @optimistic — the client predicts the result before the round-trip
+	// Internal is `@internal`: the action is reached only from the authority
+	// itself — another action's `run`, a job, an `on` trigger, tooling — and
+	// never from a client (the event endpoint and /api/<action> answer
+	// "unknown action"; an `api` route cannot be declared onto it). For a
+	// step that must not be self-served, like awarding XP or a payout.
+	Internal bool
+	// StandIn marks the synthesized action an `expect action` stands in for
+	// when no host declares it (internal/compile/expect.go). It stands for a
+	// host's server action, so it is placed on the authority even though its
+	// body is empty — a fragment may `run` it.
+	StandIn bool
 	// Ret/RetList declare a return value: `action name(params) -> Type:` whose
 	// body ends in `return expr`. The value rides back to the caller as the
 	// reply's `value` (the `/event` and `/api/<action>` JSON), which is what a
@@ -852,7 +870,10 @@ type Proc struct {
 	Ret     string // return type core ("" = no return)
 	RetList bool   // the return is a list of Ret (`-> [T]`)
 	RetMap  bool   // the return is a map of Ret values (`-> {K: Ret}`)
-	RetKey  string // the map return's key type (int or text)
+	// RetDepth: a nested list return (`-> [[float]]`) — RetList with
+	// RetDepth 2; 0 otherwise.
+	RetDepth int
+	RetKey   string // the map return's key type (int or text)
 	// Uses is the proc's declared I/O capability set — `uses io.file, io.net`,
 	// trailing the header the same way `requires <policy>` trails a mount/view
 	// header (see parseMount/parseView). Empty means the proc's body may not
@@ -1061,6 +1082,9 @@ type Param struct {
 	// type of a list.
 	Map bool
 	Key string
+	// Depth is the list nesting depth when it is more than one: `[[float]]`
+	// is List with Depth 2 (a proc parameter only). 0 otherwise.
+	Depth int
 	// Ref makes the parameter a *reference* rather than a value: it is bound at
 	// the call site to the NAME of a declaration, not to the result of an
 	// expression. RefValue ("") is an ordinary value parameter.
@@ -1752,8 +1776,11 @@ type Range struct {
 	Coll  string
 	Where Expr   // optional row filter; nil = all rows
 	Order string // sort field; "" = insertion order
-	Desc  bool   // true = descending (newest/highest first)
-	Limit Expr   // optional max rows: an int literal or an expr (e.g. a @client page size for load-more); nil = unlimited
+	// OrderExpr is `by <expr>` when the key is computed per row (a count, a
+	// sum, an arithmetic of fields) rather than read from one field.
+	OrderExpr Expr
+	Desc      bool // true = descending (newest/highest first)
+	Limit     Expr // optional max rows: an int literal or an expr (e.g. a @client page size for load-more); nil = unlimited
 	// More names the zero-argument action that loads the next page — `for … limit
 	// shown more loadMore:`. It makes the list an infinite scroll: while rows were
 	// cut off by `limit`, a "More" control follows the last row, and the client
@@ -2062,6 +2089,17 @@ type Upload struct {
 	Label []Seg
 }
 
+// Camera is a live viewfinder with a shutter: `camera bind shot [label
+// "Capture"]`. A capture is a JPEG still, uploaded like an `upload` and its
+// URL written to the bound @client text cell; where the browser has no
+// camera or it is refused, a file input that opens the device camera
+// (capture="environment") stands in.
+type Camera struct {
+	Bind  string
+	Label []Seg
+	Line  int
+}
+
 // Use renders a component with arguments bound to its parameters:
 // `use Card(post)`. It is the call site of a reusable view fragment.
 //
@@ -2112,6 +2150,7 @@ func (Link) node()      {}
 func (Select) node()    {}
 func (Form) node()      {}
 func (Upload) node()    {}
+func (Camera) node()    {}
 func (Use) node()       {}
 func (Slot) node()      {}
 func (SlotRef) node()   {}

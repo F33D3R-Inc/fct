@@ -68,7 +68,82 @@ fn path_line<T: serde::de::DeserializeOwned>(body: &[u8]) -> String {
     format!("{cat}|{path}|{e}")
 }
 
+/// `leafb-plan`: frontdoor/plan.rs over one request per stdin line, in the
+/// digest fabric_leafb/plan_check.fct prints (and plan_rust.tsv holds): the
+/// line is hex of `keyspace US preference US method US path US query US
+/// body` (query: `1<text>` present, `0` absent), over the check's six
+/// keyspaces and four read preferences.
+fn plan_line(hex: &str) -> String {
+    use axum::http::Method;
+    use fabric_core::Coordinate;
+    use fabric_facetql::frontdoor::plan::plan;
+    use fabric_facetql::frontdoor::{Agreement, Keyspace, KeyspaceRule, Plan};
+    use fabric_routing::{ReadPreference, RouteIntent, RoutingKey};
+
+    let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).expect("hex")).collect();
+    let mut parts: Vec<Vec<u8>> = vec![Vec::new()];
+    for b in bytes {
+        if b == 31 && parts.len() < 6 {
+            parts.push(Vec::new());
+        } else {
+            parts.last_mut().unwrap().push(b);
+        }
+    }
+    let text = |i: usize| String::from_utf8_lossy(&parts[i]).into_owned();
+    let key = |shard: u64, x: u8, y: u8| RoutingKey::new(shard, Coordinate::new(x, y)).expect("an on-grid key");
+    let rule = |ks: Keyspace, kind: &str, prefix: &str, k: RoutingKey| ks.with_rule(KeyspaceRule::new(kind, prefix, k).expect("a rule")).expect("a keyspace");
+    let keyspace = match text(0).as_str() {
+        "0" => rule(rule(Keyspace::new(), "Post", "Post:", key(1, 0, 0)), "User", "User:", key(2, 0, 0)),
+        "1" => rule(rule(Keyspace::new(), "Post", "Post:", key(1, 0, 0)), "User", "User:", key(2, 3, 4)).with_fallback(key(9, 11, 12)),
+        "2" => Keyspace::single(key(7, 0, 0)),
+        "3" => rule(rule(rule(Keyspace::new(), "A", "__", key(1, 0, 0)), "B", "__fabric_placement:", key(2, 0, 0)), "C", "__fabric", key(3, 0, 0)),
+        "4" => rule(Keyspace::new(), "Post", "Post:", key(1, 0, 0)).with_fallback(key(1, 0, 0)),
+        _ => Keyspace::new(),
+    };
+    let preference = match text(1).as_str() {
+        "1" => ReadPreference::PreferRegion { region: "eu".to_string() },
+        "2" => ReadPreference::AnyCopy,
+        "3" => ReadPreference::AnyFresh,
+        _ => ReadPreference::Primary,
+    };
+    let method = Method::from_bytes(&parts[2]).expect("a method");
+    let q = text(4);
+    let query = q.strip_prefix('1');
+    let body = parts[5].clone();
+    match plan(&method, &text(3), query, &body, &keyspace, &preference) {
+        Plan::Colocated { keys } => {
+            let xs: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    let intent = match &k.intent {
+                        RouteIntent::Write => "W".to_string(),
+                        RouteIntent::Read(ReadPreference::AnyFresh) => "RF".to_string(),
+                        RouteIntent::Read(ReadPreference::PreferRegion { region }) => format!("RG({region})"),
+                        RouteIntent::Read(ReadPreference::AnyCopy) => "RC".to_string(),
+                        RouteIntent::Read(ReadPreference::Primary) => "RP".to_string(),
+                    };
+                    format!("{}~{}~{}", k.key, intent, k.origin)
+                })
+                .collect();
+            format!("C|{}", xs.join(";"))
+        }
+        Plan::Broadcast { agreement, what } => format!(
+            "B|{}|{}",
+            if agreement == Agreement::Required { "Required" } else { "NotRequired" },
+            what
+        ),
+        Plan::Subscribe => "S".to_string(),
+        Plan::Refuse(refusal) => format!("R|{}|{}", refusal.status().as_u16(), refusal),
+    }
+}
+
 pub fn run(mode: &str) {
+    if mode == "leafb-plan" {
+        for line in std::io::stdin().lock().lines() {
+            println!("{}", plan_line(&line.expect("stdin")));
+        }
+        return;
+    }
     if let Some(t) = mode.strip_prefix("leafb-path-") {
         for line in std::io::stdin().lock().lines() {
             let line = line.expect("stdin");

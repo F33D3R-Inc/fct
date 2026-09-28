@@ -86,6 +86,7 @@ func BenchmarkFqServer(b *testing.B) {
 func fqStartProcB(b *testing.B, which, dir string, env ...string) (*fqProc, int) {
 	var cmd *exec.Cmd
 	if which == "rust" {
+		fqRustReference(b)
 		bin, err := filepath.Abs("../../facetql/target/release/facetql")
 		if err != nil {
 			b.Fatal(err)
@@ -116,6 +117,7 @@ func fqStartProcB(b *testing.B, which, dir string, env ...string) (*fqProc, int)
 	cmd.Env = append(os.Environ(), env...)
 	p := &fqProc{cmd: cmd, stdout: &fqLockedBuf{}, stderr: &fqLockedBuf{}, done: make(chan struct{})}
 	cmd.Stdout, cmd.Stderr = p.stdout, p.stderr
+	dieWithParent(cmd)
 	if err := cmd.Start(); err != nil {
 		b.Fatal(err)
 	}

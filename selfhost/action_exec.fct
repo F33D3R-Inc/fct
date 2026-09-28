@@ -56,6 +56,15 @@ app ActionExec:
         restateRoles: [text]
         rekey: text
         actName: text
+        # how many `run`s deep this body is (maxRunDepth backstop: 16)
+        runDepth: int
+        # the action outcomes the body reported to /metrics, "action|outcome"
+        # (observeAction): kept even when the action then rolls back
+        obs: [text]
+        # the caller as the action began (ar.actor), and the failures it
+        # audited (recordAudit), kept like obs
+        actor: text
+        audits: [RtAudit]
 
     proc rtParamTypeName(p: IRParam) -> text:
         if p.list:
@@ -131,6 +140,85 @@ app ActionExec:
             k = k + 1
         return RtCoerced{ok: true, v: listVal(out)}
 
+    # rtArgFor: argFor — a parameter typed by a wire `type` (or a list of
+    # them) is shaped to it: each element an object, each declared field
+    # coerced as a parameter of its type would be (absent: its zero; a
+    # nested wire type shaped in turn). Any other parameter is rtParamArg's.
+    proc rtArgFor(g: IRGraph, v: Val, p: IRParam) -> RtCoerced:
+        let wi = do rtWireTypeIndex(g, p.type)
+        if wi < 0:
+            let c = do rtParamArg(v, p)
+            return c
+        if !p.list:
+            if v.kind == "none":
+                return RtCoerced{ok: true, v: v}
+            let one = do rtWireValue(g, v, wi)
+            return one
+        if v.kind == "none":
+            return RtCoerced{ok: true, v: listVal([])}
+        if v.kind != "list":
+            return RtCoerced{ok: false, v: v}
+        let mut out = []
+        let mut i = 0
+        loop i < len(v.items):
+            let c = do rtWireValue(g, v.items[i], wi)
+            if !c.ok:
+                return RtCoerced{ok: false, v: v}
+            out = append(out, c.v)
+            i = i + 1
+        return RtCoerced{ok: true, v: listVal(out)}
+
+    # rtWireValue: wireValue — one object shaped to a wire type's fields.
+    proc rtWireValue(g: IRGraph, v: Val, wi: int) -> RtCoerced:
+        if v.kind != "record":
+            return RtCoerced{ok: false, v: v}
+        let wt = g.types[wi]
+        let mut keys = []
+        let mut items = []
+        let mut i = 0
+        loop i < len(wt.fields):
+            let f = wt.fields[i]
+            let fv = do valGet(v, f.name)
+            let c = do rtArgFor(g, fv, IRParam{name: f.name, type: f.type, optional: f.optional, list: f.list, map: false, key: "", depth: 0})
+            if !c.ok:
+                return RtCoerced{ok: false, v: v}
+            keys = append(keys, f.name)
+            items = append(items, c.v)
+            i = i + 1
+        let r = do recordVal(keys, items)
+        return RtCoerced{ok: true, v: r}
+
+    proc rtWireTypeIndex(g: IRGraph, name: text) -> int:
+        let mut i = 0
+        loop i < len(g.types):
+            if g.types[i].name == name:
+                return i
+            i = i + 1
+        return -1
+
+    # rtGoV: fmt's %v of a decoded JSON value — a list as [a b], an object
+    # as map[k:v] with its keys sorted, null as <nil>.
+    proc rtGoV(v: Val) -> text:
+        if v.kind == "none":
+            return "<nil>"
+        if v.kind == "list":
+            let mut parts = []
+            let mut i = 0
+            loop i < len(v.items):
+                parts = append(parts, rtGoV(v.items[i]))
+                i = i + 1
+            return "[" + join(parts, " ") + "]"
+        if v.kind == "record":
+            let idx = do rtSortedIndex(v.keys)
+            let mut kv = []
+            let mut j = 0
+            loop j < len(idx):
+                kv = append(kv, v.keys[idx[j]] + ":" + rtGoV(v.items[idx[j]]))
+                j = j + 1
+            return "map[" + join(kv, " ") + "]"
+        let s = do valToStr(v)
+        return s
+
     proc rtParamZero(p: IRParam) -> Val:
         if p.list:
             let l = do listVal([])
@@ -181,11 +269,20 @@ app ActionExec:
     # rtRunActionValue: runActionValue — the whole of one action.
     proc rtRunActionValue(w0: RtWorld, sid: text, act: IRAction, args: [Val]) -> RtRun:
         let mut w = w0
+        # The system and tool identities are minted on first use. Any other id
+        # that names no live session was ended before its action ran, or is ""
+        # (no session): it runs as a transient guest that is never stored under
+        # that id, so an ended session is not minted back as a guest the same
+        # token then resolves to (Go: runActionLocked).
         let si0 = do rtSessionIndex(w, sid)
-        if si0 < 0:
-            let fresh = do rtNewSession(w, sid, "guest", "guest")
+        let transient = si0 < 0 && sid != "__system" && sid != "tool"
+        let fresh = do rtNewSession(w, sid, "guest", "guest")
+        if si0 < 0 && !transient:
             w = do rtPutSession(w, fresh)
-        let mut sc = do rtScope(w, sid)
+        let mut scw = w
+        if transient:
+            scw = do rtPutSession(w, fresh)
+        let mut sc = do rtScope(scw, sid)
         sc = do rtSet(sc, "sessionToken", textVal(rtSessionToken(w, sid)))
         let mut given = []
         let mut i = 0
@@ -195,9 +292,9 @@ app ActionExec:
             if i < len(args) && args[i].kind != "none":
                 given = append(given, p.name)
             if i < len(args):
-                let c = do rtParamArg(args[i], p)
+                let c = do rtArgFor(w.g, args[i], p)
                 if !c.ok:
-                    let bad = do rtFailed(w0, sid, 400, act.name + ": parameter \"" + p.name + "\" expects " + rtParamTypeName(p) + ", got " + valToStr(args[i]))
+                    let bad = do rtFailed(w0, sid, 400, act.name + ": parameter \"" + p.name + "\" expects " + rtParamTypeName(p) + ", got " + rtGoV(args[i]))
                     return bad
                 v = c.v
             sc = do rtSet(sc, p.name, v)
@@ -206,15 +303,23 @@ app ActionExec:
         loop r < len(act.requires):
             let ok = do rtPolicyPasses(w.g, act.requires[r], sc)
             if !ok:
-                let denied = do rtFailed(w0, sid, 403, "forbidden: " + act.requires[r].name)
+                let wd0 = do rtObserveActions(w0, [act.name + "|denied"])
+                let actorD = do valToStr(rtGet(sc, "actor"))
+                let wd = do rtRecordAudit(wd0, actorD, act.name, false, "denied: " + act.requires[r].name)
+                let denied = do rtFailed(wd, sid, 403, "forbidden: " + act.requires[r].name)
                 return denied
             r = r + 1
         sc.given = given
-        let si = do rtSessionIndex(w, sid)
-        let ex0 = RtExec{w: w, sc: sc, ses: w.sessions[si], deltaKeys: [], deltaVals: [], changed: [], retVal: noneVal(), returned: false, status: 200, msg: "", bound: [], retStatus: 0, headerNames: [], headerVals: [], errCode: "", revokes: [], restateActors: [], restateRoles: [], rekey: "", actName: act.name}
+        let mut ses0 = fresh
+        if !transient:
+            let si = do rtSessionIndex(w, sid)
+            ses0 = w.sessions[si]
+        let ex0 = RtExec{w: w, sc: sc, ses: ses0, deltaKeys: [], deltaVals: [], changed: [], retVal: noneVal(), returned: false, status: 200, msg: "", bound: [], retStatus: 0, headerNames: [], headerVals: [], errCode: "", revokes: [], restateActors: [], restateRoles: [], rekey: "", actName: act.name, runDepth: 0, obs: [], actor: valToStr(rtGet(sc, "actor")), audits: []}
         let ex = do rtExecBlock(act.body, ex0)
         if ex.status != 200:
-            let failed = do rtFailedCode(w0, sid, ex.status, ex.msg, ex.errCode)
+            let wf0 = do rtObserveActions(w0, ex.obs)
+            let wf = do rtRecordAudits(wf0, ex.audits)
+            let failed = do rtFailedCode(wf, sid, ex.status, ex.msg, ex.errCode)
             return failed
         w = ex.w
         let mut after = sid
@@ -223,13 +328,23 @@ app ActionExec:
         # restated.
         if ex.rekey != "":
             let ri = do rtSessionIndex(w, sid)
+            let mut moved = ex.ses
+            moved.sid = ex.rekey
+            moved.persisted = false
             if ri >= 0:
-                let mut moved = ex.ses
-                moved.sid = ex.rekey
                 w.sessions[ri] = moved
+            else:
+                w = do rtPutSession(w, moved)
             after = ex.rekey
+            # dropSharedSession(sid); adoptSession persists the new id
+            w = do rtSesEnded(w, sid)
+            w = do rtSesDirty(w, after)
         else:
-            w = do rtPutSession(w, ex.ses)
+            if !transient:
+                w = do rtPutSession(w, ex.ses)
+                # the action changed per-session state: share it
+                if len(ex.deltaKeys) > 0:
+                    w = do rtSesDirty(w, sid)
         let mut rv = 0
         loop rv < len(ex.revokes):
             if ex.revokes[rv] != "":
@@ -242,6 +357,11 @@ app ActionExec:
         loop rs < len(ex.restateActors):
             w = do rtRestateActor(w, ex.restateActors[rs], ex.restateRoles[rs])
             rs = rs + 1
+        if len(ex.revokes) > 0 || ex.rekey != "":
+            w.met.sessions = len(w.sessions)
+        w = do rtObserveActions(w, ex.obs + [act.name + "|ok"])
+        w = do rtRecordAudits(w, ex.audits)
+        w = do rtRecordAudit(w, ex.actor, act.name, true, "")
         # The entity changes fan out once the writes are durable: the loop
         # commits pendingOps and then broadcasts pendingChanged.
         w.pendingChanged = w.pendingChanged + ex.changed
@@ -286,6 +406,9 @@ app ActionExec:
                 kept = append(kept, ses)
             i = i + 1
         w.sessions = kept
+        # every instance's copies too: the shared table, then the bus
+        if w.clusterOn:
+            w.revokeKeys = append(w.revokeKeys, key)
         return RtRevoked{w: w, endedOwn: endedOwn}
 
     proc rtRestateActor(w0: RtWorld, actor: text, role: text) -> RtWorld:
@@ -300,6 +423,9 @@ app ActionExec:
                 ses = do rtSesSet(ses, "role", textVal(role))
                 w.sessions[i] = ses
             i = i + 1
+        if w.clusterOn:
+            w.restateActors = append(w.restateActors, actor)
+            w.restateRoles = append(w.restateRoles, role)
         return w
 
     # ── constraints ─────────────────────────────────────────────────────
@@ -364,17 +490,51 @@ app ActionExec:
             i = i + 1
         return false
 
-    # rtStoreRow: storeRow — a @password field lands as its bcrypt hash.
-    proc rtStoreRow(g: IRGraph, entity: text, row: Val) -> Val:
+    # rtStoredValue: storedValue — a @password field's value as it is
+    # stored: its bcrypt hash ("" stays "", no credential), or a message when
+    # it cannot be one (bcrypt reads at most 72 bytes).
+    struct RtStored:
+        v: Val
+        msg: text
+
+    proc rtStoredValue(g: IRGraph, entity: text, field: text, v: Val) -> RtStored:
+        # a column holds its declared type from the first write (columnValue)
+        let mut cv = v
+        let ei = do rtEntityIndex(g, entity)
+        if ei >= 0:
+            let mut k = 0
+            loop k < len(g.entities[ei].fields):
+                if g.entities[ei].fields[k].name == field:
+                    cv = do rtColumnValue(g.entities[ei].fields[k], v)
+                k = k + 1
+        let hashed = do rtIsHashed(g, entity, field)
+        if !hashed:
+            return RtStored{v: cv, msg: ""}
+        let pv = do valToStr(cv)
+        if pv == "":
+            return RtStored{v: textVal(""), msg: ""}
+        if byteLen(pv) > 72:
+            return RtStored{v: v, msg: field + " must be at most 72 bytes"}
+        return RtStored{v: textVal(bcryptHash(pv)), msg: ""}
+
+    # rtStoreFields: storedValue over the named fields of a row about to be
+    # written (storeRow: every field of a new row; a `set`: the ones it
+    # assigns, so a stored hash it leaves alone is never hashed again).
+    struct RtStoredRow:
+        row: Val
+        msg: text
+
+    proc rtStoreFields(g: IRGraph, entity: text, row: Val, fields: [text]) -> RtStoredRow:
         let mut out = row
         let mut i = 0
-        loop i < len(row.keys):
-            let hashed = do rtIsHashed(g, entity, row.keys[i])
-            if hashed:
-                let pv = do valToStr(row.items[i])
-                out = do valSet(out, row.keys[i], textVal(bcryptHash(pv)))
+        loop i < len(fields):
+            let cur = do valGet(out, fields[i])
+            let sv = do rtStoredValue(g, entity, fields[i], cur)
+            if sv.msg != "":
+                return RtStoredRow{row: row, msg: sv.msg}
+            out = do valSet(out, fields[i], sv.v)
             i = i + 1
-        return out
+        return RtStoredRow{row: out, msg: ""}
 
     proc rtMarkChanged(ex0: RtExec, entity: text) -> RtExec:
         let mut ex = ex0
@@ -438,6 +598,21 @@ app ActionExec:
         ex.msg = msg
         return ex
 
+    # rtFailAs: rtFail at a site Go meters — observeAction(name, outcome)
+    # for the action whose body is running (a `run` callee's own name).
+    # rtFailAudit: rtFailAs at a site Go also audits (recordAudit, denied).
+    proc rtFailAudit(ex0: RtExec, status: int, msg: text, outcome: text, detail: text) -> RtExec:
+        let mut ex = ex0
+        ex.audits = append(ex.audits, RtAudit{time: 0, actor: ex.actor, action: ex.actName, allowed: false, detail: detail})
+        let f = do rtFailAs(ex, status, msg, outcome)
+        return f
+
+    proc rtFailAs(ex0: RtExec, status: int, msg: text, outcome: text) -> RtExec:
+        let mut ex = ex0
+        ex.obs = append(ex.obs, ex.actName + "|" + outcome)
+        let f = do rtFail(ex, status, msg)
+        return f
+
     # rtExecBlock: execActionBlock — a block's statements in order; names
     # the block bound are dropped on exit.
     proc rtExecBlock(body: [IRStmt], ex0: RtExec) -> RtExec:
@@ -462,6 +637,10 @@ app ActionExec:
     proc rtExecStmt(st: IRStmt, ex0: RtExec) -> RtExec:
         let mut ex = ex0
         let op = st.op
+        # a statement that can write rows, or run something that does: the
+        # scope's row indexes may no longer describe its rows
+        if op in ["add", "set", "remove", "clear", "call", "run", "do"]:
+            ex.sc.ixs = []
         if op == "check":
             let cr = do rtEvalOpt(st.value, ex.sc, -1)
             ex.sc = cr.sc
@@ -478,7 +657,7 @@ app ActionExec:
                 let mut status = 422
                 if st.status != 0:
                     status = st.status
-                let f = do rtFail(ex, status, msg)
+                let f = do rtFailAudit(ex, status, msg, "invalid", "check failed: " + msg)
                 return f
             return ex
         if op == "header":
@@ -487,7 +666,7 @@ app ActionExec:
             let hv = do valToStr(hr.v)
             let valid = do rtValidHeaderValue(hv)
             if !valid:
-                let hf = do rtFail(ex, 500, "header " + st.msg + " has a value that is not a valid HTTP header value")
+                let hf = do rtFailAs(ex, 500, "header " + st.msg + " has a value that is not a valid HTTP header value", "invalid")
                 return hf
             ex.headerNames = append(ex.headerNames, st.msg)
             ex.headerVals = append(ex.headerVals, hv)
@@ -581,9 +760,24 @@ app ActionExec:
             let none = do noneVal()
             let bad = do rtConstraintError(ex.w, st.entity, row, "", none)
             if bad != "":
-                let f2 = do rtFail(ex, 422, bad)
+                let f2 = do rtFailAudit(ex, 422, bad, "invalid", "constraint: " + bad)
                 return f2
-            row = do rtStoreRow(ex.w.g, st.entity, row)
+            # every column the add does not name holds its empty value, as a
+            # store that reloaded the row would hand it back
+            let aei = do rtEntityIndex(ex.w.g, st.entity)
+            if aei >= 0:
+                let mut k = 0
+                loop k < len(ex.w.g.entities[aei].fields):
+                    let af = ex.w.g.entities[aei].fields[k]
+                    let named = do valHas(row, af.name)
+                    if af.name != "id" && !named:
+                        row = do valSet(row, af.name, rtColumnValue(af, noneVal()))
+                    k = k + 1
+            let stored = do rtStoreFields(ex.w.g, st.entity, row, row.keys)
+            if stored.msg != "":
+                let f3 = do rtFailAudit(ex, 422, stored.msg, "invalid", "constraint: " + stored.msg)
+                return f3
+            row = stored.row
             let ei = do rtEntIndex(ex.w, st.entity)
             if ei >= 0:
                 let id = ex.w.nextIds[ei] + 1
@@ -673,22 +867,102 @@ app ActionExec:
                 return pf7
             let res = do rtRunProc(st.service, dar.v.items)
             if res.sc.err != "":
-                let df = do rtFail(ex, 500, ex.actName + ": proc " + st.service + " failed: " + res.sc.err)
+                let df = do rtFailAs(ex, 500, ex.actName + ": proc " + st.service + " failed: " + res.sc.err, "proc_error")
                 return df
             if st.bind != "":
                 let cv = do rtCoerceRet(res.v, st.ret, st.retList)
                 ex.sc = do rtSet(ex.sc, st.bind, cv)
                 ex.bound = append(ex.bound, st.bind)
             return ex
+        if op == "run":
+            let rr = do rtExecRun(st, ex)
+            return rr
         if op == "call":
             # An external service (callService / callServiceSync): the only
             # egress the Go runtime makes; a self-hosted runtime has no
             # brain to post to in this harness, so a bound call fails as an
             # unreachable service does and a fire-and-forget one is dropped.
             if st.bind != "":
-                let sf = do rtFail(ex, 502, st.service + "." + st.field + " unavailable")
+                let sf = do rtFailAs(ex, 502, st.service + "." + st.field + " unavailable", "service_error")
                 return sf
             return ex
+        return ex
+
+    # rtExecRun: runNested — `run name(args)` / `let x = run name(args)`:
+    # another action inside this one's transaction. Its parameters are bound
+    # from the caller's arguments (a bad one is a 400), its `requires` gate it
+    # (403), and its body runs against a fresh scope of the session and the
+    # current working set with the caller's identity. Its writes, emits,
+    # headers, deltas and session effects join the caller's — they live on
+    # the same world and session this run carries — so a failure anywhere
+    # rolls both back; its `return` ends only itself and binds when asked.
+    proc rtExecRun(st: IRStmt, ex0: RtExec) -> RtExec:
+        let mut ex = ex0
+        let ai = do rtActionIndex(ex.w.g, st.service)
+        if ai < 0:
+            let f0 = do rtFail(ex, 500, "run: unknown action " + st.service)
+            return f0
+        if ex.runDepth >= 16:
+            let f1 = do rtFail(ex, 500, "run: " + st.service + " nests deeper than 16 actions")
+            return f1
+        let callee = ex.w.g.actions[ai]
+        let withSes = do rtPutSession(ex.w, ex.ses)
+        let mut sc = do rtScope(withSes, ex.ses.sid)
+        sc = do rtSet(sc, "actor", rtGet(ex.sc, "actor"))
+        sc = do rtSet(sc, "role", rtGet(ex.sc, "role"))
+        sc = do rtSet(sc, "verified", rtGet(ex.sc, "verified"))
+        let mut i = 0
+        loop i < len(callee.params):
+            let p = callee.params[i]
+            let mut v = do rtParamZero(p)
+            if i < len(st.args):
+                let ar = do rtEval(st.args[i], ex.sc, -1)
+                ex.sc = ar.sc
+                if ex.sc.err != "":
+                    let pe = do rtProcError(ex)
+                    return pe
+                let c = do rtArgFor(ex.w.g, ar.v, p)
+                if !c.ok:
+                    let f2 = do rtFail(ex, 400, callee.name + ": parameter \"" + p.name + "\" expects " + rtParamTypeName(p))
+                    return f2
+                v = c.v
+            sc = do rtSet(sc, p.name, v)
+            i = i + 1
+        let mut r = 0
+        loop r < len(callee.requires):
+            let ok = do rtPolicyPasses(ex.w.g, callee.requires[r], sc)
+            if !ok:
+                let f3 = do rtFail(ex, 403, "forbidden: " + callee.requires[r].name)
+                return f3
+            r = r + 1
+        let mut child = ex
+        child.sc = sc
+        child.retVal = do noneVal()
+        child.retStatus = 0
+        child.returned = false
+        child.bound = []
+        child.actName = callee.name
+        child.runDepth = ex.runDepth + 1
+        let done = do rtExecBlock(callee.body, child)
+        ex.w = done.w
+        ex.ses = done.ses
+        ex.deltaKeys = done.deltaKeys
+        ex.deltaVals = done.deltaVals
+        ex.changed = done.changed
+        ex.headerNames = done.headerNames
+        ex.headerVals = done.headerVals
+        ex.revokes = done.revokes
+        ex.restateActors = done.restateActors
+        ex.restateRoles = done.restateRoles
+        ex.rekey = done.rekey
+        ex.obs = done.obs
+        ex.audits = done.audits
+        if done.status != 200:
+            ex.errCode = done.errCode
+            let f4 = do rtFail(ex, done.status, done.msg)
+            return f4
+        if st.bind != "":
+            ex.sc = do rtSet(ex.sc, st.bind, done.retVal)
         return ex
 
     # rtProcError: a proc that failed inside an expression fails the action
@@ -699,7 +973,7 @@ app ActionExec:
         let mut cleared = ex.sc
         cleared.err = ""
         ex.sc = cleared
-        let f = do rtFail(ex, 500, msg)
+        let f = do rtFailAs(ex, 500, msg, "proc_error")
         return f
 
     proc rtValidHeaderValue(v: text) -> bool:
@@ -743,10 +1017,15 @@ app ActionExec:
                             let bad = do rtConstraintError(ex.w, st.entity, cand, st.fieldNames[fj], mid)
                             if bad != "":
                                 ex.sc = do rtRestore(ex.sc, st.itemVar, had, prev)
-                                let f = do rtFail(ex, 422, bad)
+                                let f = do rtFailAudit(ex, 422, bad, "invalid", "constraint: " + bad)
                                 return f
                             fj = fj + 1
-                        cand = do rtStoreRow(ex.w.g, st.entity, cand)
+                        let stc = do rtStoreFields(ex.w.g, st.entity, cand, st.fieldNames)
+                        if stc.msg != "":
+                            ex.sc = do rtRestore(ex.sc, st.itemVar, had, prev)
+                            let f5 = do rtFailAudit(ex, 422, stc.msg, "invalid", "constraint: " + stc.msg)
+                            return f5
+                        cand = stc.row
                         keep = cand
                         matched = true
                         ex.w = do rtDurSave(ex.w, st.entity, cand)
@@ -774,9 +1053,13 @@ app ActionExec:
                     let mut cand2 = do valSet(m2, st.field, nv.v)
                     let bad2 = do rtConstraintError(ex.w, st.entity, cand2, st.field, id2)
                     if bad2 != "":
-                        let f2 = do rtFail(ex, 422, bad2)
+                        let f2 = do rtFailAudit(ex, 422, bad2, "invalid", "constraint: " + bad2)
                         return f2
-                    cand2 = do rtStoreRow(ex.w.g, st.entity, cand2)
+                    let stc2 = do rtStoreFields(ex.w.g, st.entity, cand2, [st.field])
+                    if stc2.msg != "":
+                        let f6 = do rtFailAudit(ex, 422, stc2.msg, "invalid", "constraint: " + stc2.msg)
+                        return f6
+                    cand2 = stc2.row
                     keep2 = cand2
                     done = true
                     ex.w = do rtDurSave(ex.w, st.entity, cand2)

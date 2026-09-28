@@ -467,6 +467,16 @@ func (s *memStore) SaveSession(sid string, ps *persistedSession) error {
 	s.sessions[sid] = ps
 	return nil
 }
+func (s *memStore) UpdateSession(sid string, ps *persistedSession) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.sessions[sid]; !ok {
+		return false, nil
+	}
+	s.sessions[sid] = ps
+	return true, nil
+}
+
 func (s *memStore) DeleteSession(sid string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

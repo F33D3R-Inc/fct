@@ -124,3 +124,58 @@ func TestAppendTextFastPathIsInvisible(t *testing.T) {
 		}
 	}
 }
+
+// `x = x + e1 + … + en` appends every ei in place, and must be exactly
+// `((x + e1) + …) + en`: each ei evaluated before any append (so an ei that
+// reads x sees x as it was), non-text operands spelled as text `+` spells
+// them, and a non-text x left to plain arithmetic.
+func TestAppendTextSpineIsInvisible(t *testing.T) {
+	src := `app A:
+    proc shout(s: text) -> text:
+        return s + "!"
+    proc build(n: int) -> text:
+        let mut out = "["
+        let mut i = 0
+        loop i < n:
+            out = out + i + ":" + len(out) + "," + out + shout(out) + 1.5 + true + ";"
+            if len(out) > 5000:
+                out = "cut"
+            i = i + 1
+        let mut k = 1
+        k = k + 2 + 3
+        return out + "|" + k
+    state got: text = ""
+    action go(n: int):
+        let r = do build(n)
+        got = r
+    view Home at "/":
+        text "{got}"
+`
+	g, err := compile.String(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewInMemory(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown()
+	want := func(n int) string {
+		out := "["
+		for i := 0; i < n; i++ {
+			out = out + itoa(i) + ":" + itoa(len([]rune(out))) + "," + out + out + "!" + "1.5" + "true" + ";"
+			if len([]rune(out)) > 5000 {
+				out = "cut"
+			}
+		}
+		return out + "|6"
+	}
+	for _, n := range []int{0, 1, 3, 9} {
+		if _, err := srv.Run("ada", "member", true, "go", []any{n}); err != nil {
+			t.Fatal(err)
+		}
+		if got := srv.StateValue("got"); got != want(n) {
+			t.Fatalf("n=%d: got %q, want %q", n, got, want(n))
+		}
+	}
+}

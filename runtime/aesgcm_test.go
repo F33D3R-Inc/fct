@@ -47,11 +47,17 @@ func TestAesGcmBuiltins(t *testing.T) {
 	if _, err := aesGcmOpen(ints(key), ints(nonce), bad); err == nil || !strings.Contains(err.Error(), "does not authenticate") {
 		t.Fatalf("opening a modified ciphertext: %v", err)
 	}
+	// AES-128 (RFC 8291's aes128gcm) is Go's output too.
+	b128, _ := aes.NewCipher(key[:16])
+	g128, _ := cipher.NewGCM(b128)
+	if s128, err := aesGcmSeal(ints(key[:16]), ints(nonce), ints(pt)); err != nil || !reflect.DeepEqual(plainValue(s128), ints(g128.Seal(nil, nonce, pt, nil))) {
+		t.Fatalf("aesGcmSeal with a 16-byte key = %v", err)
+	}
 	for _, c := range []struct {
 		key, nonce, pt []any
 		msg            string
 	}{
-		{ints(key[:16]), ints(nonce), ints(pt), "key is 16 bytes"},
+		{ints(key[:24]), ints(nonce), ints(pt), "key is 24 bytes"},
 		{ints(key), ints(nonce[:8]), ints(pt), "nonce is 8 bytes"},
 		{ints(key), ints(nonce), []any{1, 300}, "out of range"},
 	} {

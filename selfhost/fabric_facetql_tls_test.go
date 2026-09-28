@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -142,15 +143,38 @@ func fqlTlsStartFct(t *testing.T, p12, caPEM string) int {
 		cmd.Process.Kill()
 		cmd.Wait()
 	})
+	fqDumpOnHang(t, cmd, log.String, 3*time.Minute)
 	port := fdtEngineBanner(t, log.String, fdtEngineBannerRE)
-	fqlTlsWait(t, port, caPEM, log.String)
+	// A server that bound but never completes a handshake is asked what it
+	// is doing before the test gives up on it: SIGQUIT, and the goroutines
+	// it prints, with the rest of its output.
+	fqlTlsWait(t, port, caPEM, func() string {
+		_ = cmd.Process.Signal(syscall.SIGQUIT)
+		time.Sleep(2 * time.Second)
+		return log.String()
+	})
 	return port
 }
 
+// fqlTlsStartOn runs a FacetQL of that engine with the TLS identity.
+func fqlTlsStartOn(t *testing.T, engine, p12, caPEM string) int {
+	t.Helper()
+	if engine == "rust" {
+		return fqlTlsStartRust(t, p12, caPEM)
+	}
+	return fqlTlsStartFct(t, p12, caPEM)
+}
+
 func TestFabricFacetqlOverTLS(t *testing.T) {
+	for _, engine := range fqlEngines() {
+		t.Run(engine, func(t *testing.T) { fqlOverTLS(t, engine) })
+	}
+}
+
+func fqlOverTLS(t *testing.T, engine string) {
 	pki := t.TempDir()
 	caPEM, p12 := fqlTlsPKI(t, pki)
-	rustPort := fqlTlsStartRust(t, p12, caPEM)
+	rustPort := fqlTlsStartOn(t, engine, p12, caPEM)
 
 	// The port's trust file lives in its data sandbox.
 	data := t.TempDir()
@@ -192,8 +216,8 @@ func TestFabricFacetqlOverTLS(t *testing.T) {
 	})
 
 	t.Run("the_mover_between_two_https_instances", func(t *testing.T) {
-		dst := fmt.Sprintf("https://localhost:%d", fqlTlsStartRust(t, p12, caPEM))
-		src := fmt.Sprintf("https://localhost:%d", fqlTlsStartRust(t, p12, caPEM))
+		dst := fmt.Sprintf("https://localhost:%d", fqlTlsStartOn(t, engine, p12, caPEM))
+		src := fmt.Sprintf("https://localhost:%d", fqlTlsStartOn(t, engine, p12, caPEM))
 		ts := fqltApp(t, "fabric_facetql_mover.fct")
 		m := fqlLiveFields(t, fqltCall(t, ts, "moverOut", "moverRunLive", "copy", src, dst, "fabtok", "ca.pem"))
 		for k, v := range map[string]string{"subscribe": "true", "rowsCopied": "30", "verified": "verified 30", "report": "30 true 3 3"} {
@@ -216,7 +240,7 @@ func TestFabricFacetqlOverTLS(t *testing.T) {
 
 	t.Run("tls_failures_classify_as_the_rust_clients_do", func(t *testing.T) {
 		bin := laCheck(t)
-		plainPort := fqlLiveStart(t)
+		plainPort := fqlLiveStartOn(t, engine)
 		plain := strings.TrimPrefix(plainPort, "http://")
 		ts := fqltApp(t, "fabric_facetql_client.fct")
 		cases := []struct {

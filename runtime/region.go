@@ -217,6 +217,23 @@ func (s *Server) listRows(n ir.Node, scope map[string]any) []any {
 		// to both rather than to whichever path someone remembered.
 		n.Where = applyReadPolicy(ent, n.Var, n.Where)
 	}
+	// A computed ordering (`for … by <expr>`) is not a column the store can
+	// sort on: every matching row is read, keyed per row here, then capped.
+	if n.OrderBy != nil {
+		all := n
+		all.OrderBy, all.Limit, all.More = nil, nil, ""
+		rows := sortRowsBy(s.listRows(all, scope), n.Var, n.OrderBy, n.Desc, scope)
+		if n.Limit != nil {
+			lim := toInt(eval(n.Limit, scope))
+			if lim <= 0 {
+				return nil
+			}
+			if len(rows) > lim {
+				rows = rows[:lim]
+			}
+		}
+		return rows
+	}
 	// An @ephemeral entity has no row in any store — not because the store is
 	// unconfigured (that's the s.store == nil case above), but because this
 	// specific entity was deliberately kept out of it (see attachStore, commit).
@@ -579,12 +596,24 @@ func mentions(e *ir.Expr, name string) bool {
 // value; `typeLiterals` re-types it against the column it is compared with,
 // which is what keeps a text route parameter from being pushed down as text
 // against an int column.
+//
+// A list folds to a list of literals and a float to a float literal: they
+// used to fold to text ("3,1") and to a truncated int, so `p.id in ids`
+// over a list cell matched nothing and `p.score > 0.5` compared against 0.
 func litExpr(v any) *ir.Expr {
 	switch t := v.(type) {
 	case bool:
 		return &ir.Expr{Kind: "lit", Val: t, VType: "bool"}
-	case int, int64, float64:
+	case int, int64:
 		return &ir.Expr{Kind: "lit", Val: toInt(t), VType: "int"}
+	case float64:
+		return &ir.Expr{Kind: "lit", Val: t, VType: "float"}
+	case []any:
+		out := &ir.Expr{Kind: "list", Args: make([]*ir.Expr, len(t))}
+		for i, el := range t {
+			out.Args[i] = litExpr(el)
+		}
+		return out
 	}
 	return &ir.Expr{Kind: "lit", Val: toStr(v), VType: "text"}
 }

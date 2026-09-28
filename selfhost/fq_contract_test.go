@@ -21,15 +21,18 @@ package selfhost
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
+	"unicode"
 )
 
 type fqContractRow struct {
@@ -163,6 +166,7 @@ func (tr *fqTranscript) String() string { return tr.b.String() }
 // share nothing) and insists the transcripts match.
 func fqBothWays(t *testing.T, scenario func(t *testing.T, which string) string) {
 	t.Helper()
+	fqRustReference(t)
 	var mu sync.Mutex
 	out := map[string]string{}
 	t.Run("engines", func(t *testing.T) {
@@ -179,6 +183,9 @@ func fqBothWays(t *testing.T, scenario func(t *testing.T, which string) string) 
 	})
 	if t.Failed() {
 		return
+	}
+	if os.Getenv("FQ_SHOW_TRANSCRIPT") != "" {
+		t.Logf("transcript (facetql):\n%s", out["rust"])
 	}
 	if out["fct"] != out["rust"] {
 		t.Errorf("transcripts differ:\n--- facetql\n%s\n--- fqserver.fct\n%s\n--- diff\n%s", out["rust"], out["fct"], fqFirstDiff(out["rust"], out["fct"]))
@@ -611,6 +618,7 @@ func fqReadCross(tr *fqTranscript) {
 // directory — the operator's binary swap.
 func fqCrossEngine(t *testing.T, writer string) {
 	t.Helper()
+	fqRustReference(t)
 	seed := t.TempDir()
 	w := fqBoot(t, writer, seed)
 	fqSeedCross(w)
@@ -1214,6 +1222,555 @@ func fqScenarioProbeDuringTransaction(t *testing.T, which string) string {
 	return tr.String()
 }
 
+// fqScenarioSplitsAndPaging drives the B+tree through many leaf and branch
+// splits (1,200 inserts in 20-op transactions over an indexed field),
+// cell replacements of a different size (overwrites), removals (deletes)
+// and so compaction, then reads every access path the result is visible
+// through — ordered pages walked by cursor, counts, a grouped aggregate —
+// before and after a reopen.
+func fqScenarioSplitsAndPaging(t *testing.T, which string) string {
+	l := fqBoot(t, which, t.TempDir())
+	l.ok(fqSend("POST", "/admin/indexes", "tok", `{"name":"sp_score","kind":"Sp","field":"score"}`))
+	for b := 0; b < 60; b++ {
+		var ops []string
+		for i := 0; i < 20; i++ {
+			n := b*20 + i
+			ops = append(ops, fqInsertOp(fmt.Sprintf("Sp:%05d", (n*7919)%1200), "Sp", fmt.Sprintf(`{"score":%d,"pad":"%s"}`, (n*31)%97, strings.Repeat("p", n%40)), `,"public":true`))
+		}
+		l.ok(fqSend("POST", "/transaction", "tok", fqTx(ops...)))
+	}
+	var ops []string
+	for i := 0; i < 1200; i += 3 {
+		ops = append(ops, fqInsertOp(fmt.Sprintf("Sp:%05d", i), "Sp", fmt.Sprintf(`{"score":%d,"pad":"%s"}`, i%13, strings.Repeat("q", 60)), `,"public":true`))
+		if len(ops) == 20 {
+			l.ok(fqSend("POST", "/transaction", "tok", fqTx(ops...)))
+			ops = nil
+		}
+	}
+	if len(ops) > 0 {
+		l.ok(fqSend("POST", "/transaction", "tok", fqTx(ops...)))
+	}
+	ops = nil
+	for i := 1; i < 1200; i += 4 {
+		ops = append(ops, fmt.Sprintf(`{"type":"delete_node","address":"Sp:%05d"}`, i))
+		if len(ops) == 20 {
+			l.ok(fqSend("POST", "/transaction", "tok", fqTx(ops...)))
+			ops = nil
+		}
+	}
+	if len(ops) > 0 {
+		l.ok(fqSend("POST", "/transaction", "tok", fqTx(ops...)))
+	}
+	tr := &fqTranscript{l: l}
+	read := func(label string) {
+		tr.step(label+" count", fqSend("POST", "/nodes/count", "tok", `{"kind":"Sp"}`))
+		tr.step(label+" grouped", fqSend("POST", "/nodes/count_by", "tok", `{"kind":"Sp","group_by":"score","values":[0,5,12,50,96]}`))
+		for _, order := range []string{`"order":"score","desc":true`, `"order":"score"`, `"order":"pad"`} {
+			after := ""
+			for page := 0; page < 6; page++ {
+				body := `{"kind":"Sp",` + order + `,"limit":37`
+				if after != "" {
+					body += `,"after":` + after
+				}
+				resp := l.body(fqSend("POST", "/nodes/query", "tok", body+`}`))
+				var m map[string]any
+				_ = json.Unmarshal([]byte(resp), &m)
+				var addrs []string
+				nodes, _ := m["nodes"].([]any)
+				for _, n := range nodes {
+					addrs = append(addrs, fmt.Sprint(n.(map[string]any)["address"]))
+				}
+				tr.note("%s %s page %d: %s", label, order, page, strings.Join(addrs, ","))
+				nx, ok := m["next"]
+				if !ok || nx == nil {
+					break
+				}
+				b, _ := json.Marshal(nx)
+				after = string(b)
+			}
+		}
+		tr.step(label+" by address", fqGet("/nodes?kind=Sp&limit=25&offset=400", "tok"))
+	}
+	read("live")
+	l.restart()
+	read("reopened")
+	return tr.String()
+}
+
+// fqScenarioTelemetryWhileSaturated: with every in-flight slot held (a
+// write whose body never finishes arriving), ordinary work is refused with
+// the concurrency 503 while `/stats` and the `/` liveness probe still
+// answer — telemetry is not admitted work (limits.rs's is_telemetry), so a
+// supervisor can see the instance it most needs to see.
+func fqScenarioTelemetryWhileSaturated(t *testing.T, which string) string {
+	l := fqBoot(t, which, t.TempDir(), "FACETQL_MAX_CONCURRENT_REQUESTS=1", "FACETQL_REQUEST_TIMEOUT_SECS=30")
+	c, err := fqDial(l.port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Write([]byte("POST /node HTTP/1.1\r\nHost: x\r\nx-api-key: tok\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"address\":")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	tr := &fqTranscript{l: l}
+	tr.step("work while saturated", fqGet("/nodes", "tok"))
+	tr.step("liveness probe while saturated", fqGet("/", ""))
+	tr.step("HEAD probe while saturated", fqCase{method: "HEAD", path: "/"})
+	raw := l.raw(fqGet("/stats", "tok"))
+	status := 0
+	fmt.Sscanf(raw, "HTTP/1.1 %d", &status)
+	var m map[string]any
+	if i := strings.Index(raw, "\r\n\r\n"); i >= 0 {
+		_ = json.Unmarshal([]byte(raw[i+4:]), &m)
+	}
+	rt, _ := m["runtime"].(map[string]any)
+	req, _ := rt["requests"].(map[string]any)
+	tr.note("stats while saturated: status %d, in_flight %v, max_concurrent %v", status, req["in_flight"], req["max_concurrent"])
+	tr.step("a POST to / is not telemetry", fqSend("POST", "/", "tok", "{}"))
+	return tr.String()
+}
+
+// fqScenarioNonHTTPStart: bytes that cannot begin a request are answered
+// as they arrive — hyper (httparse) parses a head incrementally, so a TLS
+// ClientHello sent to a plain listener (it has no blank line to wait for)
+// gets hyper's bare 400 and a close at once, and the client fails fast
+// instead of both sides waiting on each other. A valid head arriving in
+// pieces is still waited for.
+func fqScenarioNonHTTPStart(t *testing.T, which string) string {
+	l := fqBoot(t, which, t.TempDir())
+	tr := &fqTranscript{l: l}
+	send := func(label string, pieces ...string) {
+		c, err := fqDial(l.port)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		for i, p := range pieces {
+			if i > 0 {
+				time.Sleep(300 * time.Millisecond)
+			}
+			if _, err := c.Write([]byte(p)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var out []byte
+		buf := make([]byte, 4096)
+		closed := false
+		_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		for {
+			n, err := c.Read(buf)
+			out = append(out, buf[:n]...)
+			if err != nil {
+				closed = err == io.EOF || !strings.Contains(err.Error(), "timeout")
+				break
+			}
+		}
+		tr.note("%s: closed=%v\n%s", label, closed, fqNorm(string(out)))
+	}
+	// A TLS 1.2/1.3 ClientHello's record header and handshake header.
+	send("tls ClientHello to a plain listener", "\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03")
+	send("a method byte that is no token character", "GE(T / HTTP/1.1\r\nHost: x")
+	send("a valid head arriving in pieces", "GET / HT", "TP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+	return tr.String()
+}
+
+// fqScenarioShutdownUnderLoad: SIGTERM while work is in flight — a write
+// whose body is still arriving, a keep-alive connection sitting idle after
+// an answered request, and a burst of writers before it. The write in
+// flight is finished and answered; the idle connection is not served
+// again; a new connection finds nothing listening; the process checkpoints,
+// says so and exits 0; and everything acknowledged is there on the next
+// start.
+func fqScenarioShutdownUnderLoad(t *testing.T, which string) string {
+	dir := t.TempDir()
+	l := fqBoot(t, which, dir)
+	tr := &fqTranscript{l: l}
+	body := fqNode("load:slow", "L", `{"v":1}`, "")
+	slow, err := fqDial(l.port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer slow.Close()
+	head := fmt.Sprintf("POST /node HTTP/1.1\r\nHost: x\r\nx-api-key: tok\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n", len(body))
+	if _, err := slow.Write([]byte(head + body[:10])); err != nil {
+		t.Fatal(err)
+	}
+	idle, err := fqDial(l.port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idle.Close()
+	readAnswer := func(c net.Conn) string {
+		var out []byte
+		buf := make([]byte, 65536)
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for {
+			n, err := c.Read(buf)
+			out = append(out, buf[:n]...)
+			if i := strings.Index(string(out), "\r\n\r\n"); i >= 0 {
+				m := regexp.MustCompile(`(?i)content-length: (\d+)`).FindStringSubmatch(string(out[:i]))
+				if m != nil {
+					var want int
+					fmt.Sscan(m[1], &want)
+					if len(out)-(i+4) >= want {
+						return fqNorm(string(out))
+					}
+				}
+			}
+			if err != nil {
+				if len(out) == 0 {
+					return "closed without an answer"
+				}
+				return fqNorm(string(out))
+			}
+		}
+	}
+	if _, err := idle.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	tr.note("idle connection's first answer\n%s", readAnswer(idle))
+	var wg sync.WaitGroup
+	burst := make([]string, 8)
+	for i := range burst {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			burst[i] = fqNorm(fqRaw(t, l.port, fqSend("POST", "/node", "tok", fqNode(fmt.Sprintf("load:%d", i), "L", `{"v":1}`, "")).raw(), 0))
+		}(i)
+	}
+	wg.Wait()
+	created := 0
+	for _, b := range burst {
+		if strings.HasPrefix(b, "HTTP/1.1 201") {
+			created++
+		}
+	}
+	tr.note("burst: %d of %d created", created, len(burst))
+	time.Sleep(200 * time.Millisecond)
+	if err := l.p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", l.port), time.Second); err != nil {
+		tr.note("a new connection while draining: refused")
+	} else {
+		_, _ = c.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
+		tr.note("a new connection while draining: accepted, %s", readAnswer(c))
+		c.Close()
+	}
+	if _, err := idle.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		tr.note("the idle connection while draining: write failed")
+	} else {
+		tr.note("the idle connection while draining: %s", readAnswer(idle))
+	}
+	if _, err := slow.Write([]byte(body[10:])); err != nil {
+		t.Fatal(err)
+	}
+	tr.note("the write in flight\n%s", readAnswer(slow))
+	code := l.p.fqExit(t)
+	var lines []string
+	for _, ln := range strings.Split(l.p.stdout.String()+l.p.stderr.String(), "\n") {
+		if strings.HasPrefix(ln, "FacetQL: ") {
+			lines = append(lines, ln)
+		}
+	}
+	tr.note("exit %d\n%s", code, strings.Join(lines, "\n"))
+	l.start()
+	tr.step("the write in flight, after a restart", fqGet("/node/load:slow", "tok"))
+	tr.step("the burst, after a restart", fqGet("/nodes?kind=L&limit=100", "tok"))
+	return tr.String()
+}
+
+// fqScenarioShutdownHeldBySubscriber: a live event stream never ends by
+// itself, so the drain is on a clock (main.rs's SHUTDOWN_GRACE): SIGTERM
+// with a subscriber attached waits the fifteen seconds, says the
+// connection is still open, then checkpoints and exits 0.
+func fqScenarioShutdownHeldBySubscriber(t *testing.T, which string) string {
+	l := fqBoot(t, which, t.TempDir())
+	tr := &fqTranscript{l: l}
+	sub, err := fqDial(l.port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	if _, err := sub.Write([]byte("GET /events HTTP/1.1\r\nHost: x\r\nx-api-key: tok\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	t0 := time.Now()
+	if err := l.p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	code := l.p.fqExit(t)
+	took := time.Since(t0)
+	window := "outside 14-17s"
+	if took >= 14*time.Second && took <= 17*time.Second {
+		window = "within 14-17s"
+	}
+	var lines []string
+	for _, ln := range strings.Split(l.p.stdout.String()+l.p.stderr.String(), "\n") {
+		if strings.HasPrefix(ln, "FacetQL: ") {
+			lines = append(lines, ln)
+		}
+	}
+	sort.Strings(lines)
+	tr.note("exit %d, %s of the signal\n%s", code, window, strings.Join(lines, "\n"))
+	return tr.String()
+}
+
+// fqProbeBound is what a liveness or /stats probe is held to while the
+// engine works: the budget a supervisor gives it.
+const fqProbeBound = 500 * time.Millisecond
+
+// fqScenarioProbesUnderLoad: the `/` liveness probe and `/stats` answer
+// within fqProbeBound while the engine is busy — writers committing small
+// transactions back to back, a mover's large batches (500 inserts a
+// transaction) with its subscription, change-log paging and multigets, and
+// a crowd of admin reads the loop itself runs — for every probe, not on
+// average: telemetry must not queue behind the work it reports on. (A
+// fabric daemon ages every node's heartbeat by the time one /stats poll
+// takes: a poll slower than its silence budget reads as a lost node.)
+func fqScenarioProbesUnderLoad(t *testing.T, which string) string {
+	l := fqBoot(t, which, t.TempDir(), os.Getenv("FQ_PROBE_EXTRA_ENV"))
+	tr := &fqTranscript{l: l}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	failures := map[string]int{}
+	work := func(name string, ops func(i int) []string) {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			r := fqRaw(t, l.port, fqSend("POST", "/transaction", "tok", fqTx(ops(i)...)).raw(), 0)
+			if !strings.HasPrefix(r, "HTTP/1.1 200") {
+				mu.Lock()
+				failures[name]++
+				mu.Unlock()
+			}
+		}
+	}
+	for w := 0; w < 4; w++ {
+		w := w
+		wg.Add(1)
+		go work("writer", func(i int) []string {
+			var ops []string
+			for k := 0; k < 20; k++ {
+				ops = append(ops, fqInsertOp(fmt.Sprintf("w%d:%d:%d", w, i, k), "W", `{"v":1}`, ""))
+			}
+			return ops
+		})
+	}
+	wg.Add(1)
+	go work("mover", func(i int) []string {
+		var ops []string
+		for k := 0; k < 500; k++ {
+			ops = append(ops, fqInsertOp(fmt.Sprintf("m%d:%d", i, k), "M", `{"payload":"`+strings.Repeat("x", 200)+`"}`, ""))
+		}
+		return ops
+	})
+	// the mover's other traffic: a live subscription, change-log paging
+	// and multigets of what it copies
+	sub, err := fqDial(l.port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	if _, err := sub.Write([]byte("GET /events HTTP/1.1\r\nHost: x\r\nx-api-key: tok\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		buf := make([]byte, 65536)
+		for {
+			if _, err := sub.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = fqRaw(t, l.port, fqGet(fmt.Sprintf("/changes?after=%d&limit=500", i*50), "tok").raw(), 0)
+			var addrs []string
+			for k := 0; k < 200; k++ {
+				addrs = append(addrs, fmt.Sprintf("%q", fmt.Sprintf("m%d:%d", i%10, k)))
+			}
+			_ = fqRaw(t, l.port, fqSend("POST", "/nodes/multiget", "tok", `{"addresses":[`+strings.Join(addrs, ",")+`]}`).raw(), 0)
+		}
+	}()
+	// and a crowd of reads the loop itself runs (the admin listings), so
+	// its ordinary inbox always holds a backlog
+	for r := 0; r < 16; r++ {
+		r := r
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			paths := []string{"/admin/indexes", "/admin/users", "/admin/references"}
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = fqRaw(t, l.port, fqGet(paths[(i+r)%3], "tok").raw(), 0)
+			}
+		}()
+	}
+	time.Sleep(time.Second)
+	probe := func(c fqCase) (time.Duration, bool) {
+		t0 := time.Now()
+		r := fqRaw(t, l.port, c.raw(), 0)
+		return time.Since(t0), strings.HasPrefix(r, "HTTP/1.1 200")
+	}
+	var worstHome, worstStats time.Duration
+	homeOver, statsOver, bad, n := 0, 0, 0, 0
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		d, ok := probe(fqGet("/", ""))
+		if !ok {
+			bad++
+		}
+		if d > worstHome {
+			worstHome = d
+		}
+		if d > fqProbeBound {
+			homeOver++
+		}
+		d2, ok2 := probe(fqGet("/stats", "tok"))
+		if !ok2 {
+			bad++
+		}
+		if d2 > worstStats {
+			worstStats = d2
+		}
+		if d2 > fqProbeBound {
+			statsOver++
+		}
+		n++
+		time.Sleep(50 * time.Millisecond)
+	}
+	close(stop)
+	wg.Wait()
+	t.Logf("%s: %d probe pairs; worst / %v, worst /stats %v; over %v: / %d, /stats %d; failed transactions %v",
+		which, n, worstHome, worstStats, fqProbeBound, homeOver, statsOver, failures)
+	tr.note("probes answered 200: %v; every / within %v: %v; every /stats within %v: %v; the work committed: %v",
+		bad == 0, fqProbeBound, homeOver == 0, fqProbeBound, statsOver == 0, len(failures) == 0)
+	return tr.String()
+}
+
+// fqLowered is a predicate testing op(lower(item.field), lit).
+func fqLowered(op, field, lit string) string {
+	l, _ := json.Marshal(lit)
+	return fmt.Sprintf(`{"kind":"bin","op":%q,"l":{"kind":"call","name":"lower","args":[{"kind":"get","field":%q,"obj":{"kind":"ref","name":"item"}}]},"r":{"kind":"lit","val":%s}}`, op, field, l)
+}
+
+// fqScenarioFoldedTextIndex: a folded inverted index — the one a
+// case-insensitive search uses — as the admin surface declares, lists and
+// refuses it; the lowered searches it serves, answered the same with and
+// without it, over text whose lowercase is not ASCII folding; `lower` of
+// other values and its refusals; and the index surviving a crash before any
+// checkpoint, still folded and still serving.
+func fqScenarioFoldedTextIndex(t *testing.T, which string) string {
+	l := fqBoot(t, which, t.TempDir())
+	tr := &fqTranscript{l: l}
+	bodies := []string{"Hello World", "HELLO WORLD", "ÉCOLE Normale", "école normale", "İSTANBUL nights", "istanbul NIGHTS", "\u212aELVIN scale", "ΟΔΟΣ", "abcxbcd"}
+	for i, b := range bodies {
+		d, _ := json.Marshal(map[string]any{"body": b, "n": i, "flag": i%2 == 0})
+		l.ok(fqSend("POST", "/node", "tok", fqNode(fmt.Sprintf("Fold:%02d", i), "Fold", string(d), `,"public":true`)))
+	}
+	for i := 0; i < 60; i++ {
+		l.ok(fqSend("POST", "/node", "tok", fqNode(fmt.Sprintf("Fold:hay%02d", i), "Fold", fmt.Sprintf(`{"body":"ordinary post %d"}`, i), `,"public":true`)))
+	}
+	queries := []struct{ label, where string }{
+		{"contains hello", fqLowered("contains", "body", "hello")},
+		{"contains école", fqLowered("contains", "body", "école")},
+		{"contains istanbul", fqLowered("contains", "body", "istanbul")},
+		{"contains kelvin", fqLowered("contains", "body", "kelvin")},
+		{"contains οδοσ", fqLowered("contains", "body", "οδοσ")},
+		{"contains abcd", fqLowered("contains", "body", "abcd")},
+		{"contains HELLO", fqLowered("contains", "body", "HELLO")},
+		{"contains zz", fqLowered("contains", "body", "zz")},
+		{"starts_with école", fqLowered("starts_with", "body", "école")},
+		{"ends_with scale", fqLowered("ends_with", "body", "scale")},
+		{"lower of a number", fqLowered("contains", "n", "7")},
+		{"lower of a bool", fqLowered("starts_with", "flag", "tru")},
+		{"lower of an absent field", `{"kind":"bin","op":"==","l":{"kind":"call","name":"lower","args":[{"kind":"get","field":"none","obj":{"kind":"ref","name":"item"}}]},"r":{"kind":"lit","val":""}}`},
+		{"lower with two arguments", `{"kind":"bin","op":"==","l":{"kind":"call","name":"lower","args":[{"kind":"lit","val":"a"},{"kind":"lit","val":"b"}]},"r":{"kind":"lit","val":"a"}}`},
+		{"a call to upper", `{"kind":"call","name":"upper","args":[{"kind":"lit","val":"a"}]}`},
+		{"a folded search beside a bare one", `{"kind":"bin","op":"&&","l":` + fqLowered("contains", "body", "hello") + `,"r":{"kind":"bin","op":"contains","l":{"kind":"get","field":"body","obj":{"kind":"ref","name":"item"}},"r":{"kind":"lit","val":"HELLO"}}}`},
+	}
+	ask := func(phase string) {
+		for _, q := range queries {
+			tr.step(phase+": "+q.label, fqSend("POST", "/nodes/query", "tok", `{"kind":"Fold","where":`+q.where+`,"limit":100}`))
+		}
+	}
+	ask("no index")
+	tr.step("declare folded", fqSend("POST", "/admin/indexes", "tok", `{"name":"fold_body","kind":"Fold","field":"body","mode":"folded"}`))
+	tr.step("declare folded again", fqSend("POST", "/admin/indexes", "tok", `{"name":"fold_body","kind":"Fold","field":"body","mode":"folded"}`))
+	tr.step("the same name, unfolded", fqSend("POST", "/admin/indexes", "tok", `{"name":"fold_body","kind":"Fold","field":"body","mode":"text"}`))
+	tr.step("a second folded over the field", fqSend("POST", "/admin/indexes", "tok", `{"name":"fold_body2","kind":"Fold","field":"body","mode":"FOLDED"}`))
+	tr.step("an unfolded one beside it", fqSend("POST", "/admin/indexes", "tok", `{"name":"text_body","kind":"Fold","field":"body","mode":"text"}`))
+	tr.step("a unique folded", fqSend("POST", "/admin/indexes", "tok", `{"name":"fold_u","kind":"Fold","field":"n","mode":"folded","unique":true}`))
+	tr.step("an unknown mode", fqSend("POST", "/admin/indexes", "tok", `{"name":"fold_x","kind":"Fold","field":"n","mode":"fuzzy"}`))
+	tr.step("listed", fqGet("/admin/indexes", "tok"))
+	ask("folded")
+	// written after the index: maintained, and a crash before any
+	// checkpoint must bring the index back — folded — from the logs
+	l.ok(fqSend("POST", "/node", "tok", fqNode("Fold:late", "Fold", `{"body":"Late HELLO from İzmir"}`, `,"public":true`)))
+	l.kill()
+	l.start()
+	tr.step("listed after a crash", fqGet("/admin/indexes", "tok"))
+	ask("after a crash")
+	tr.step("izmir after a crash", fqSend("POST", "/nodes/query", "tok", `{"kind":"Fold","where":`+fqLowered("contains", "body", "izmir")+`,"limit":10}`))
+	tr.step("drop folded", fqSend("DELETE", "/admin/indexes/fold_body", "tok", ""))
+	tr.step("listed after the drop", fqGet("/admin/indexes", "tok"))
+	return tr.String()
+}
+
+// fqScenarioLowerIsGosLower: `lower` in a predicate is the fct language's
+// lower — Go's strings.ToLower — for every code point it changes: nodes
+// hold runs of all of them, and each matches `lower(item.t) == "<what Go
+// makes of it>"` and not the unlowered text.
+func fqScenarioLowerIsGosLower(t *testing.T, which string) string {
+	l := fqBoot(t, which, t.TempDir())
+	var upper []rune
+	for r := rune(0); r <= unicode.MaxRune; r++ {
+		if r >= 0xD800 && r <= 0xDFFF {
+			continue
+		}
+		if strings.ToLower(string(r)) != string(r) {
+			upper = append(upper, r)
+		}
+	}
+	var clauses []string
+	for i := 0; i < len(upper); i += 64 {
+		end := min(i+64, len(upper))
+		run := string(upper[i:end]) + " Mixed ΣΑΣ tail"
+		d, _ := json.Marshal(map[string]any{"t": run})
+		l.ok(fqSend("POST", "/node", "tok", fqNode(fmt.Sprintf("Low:%03d", i/64), "Low", string(d), `,"public":true`)))
+		want, _ := json.Marshal(strings.ToLower(run))
+		clauses = append(clauses, fmt.Sprintf(`{"kind":"bin","op":"==","l":{"kind":"call","name":"lower","args":[{"kind":"get","field":"t","obj":{"kind":"ref","name":"item"}}]},"r":{"kind":"lit","val":%s}}`, want))
+	}
+	where := clauses[0]
+	for _, c := range clauses[1:] {
+		where = `{"kind":"bin","op":"||","l":` + where + `,"r":` + c + `}`
+	}
+	tr := &fqTranscript{l: l}
+	tr.note("%d code points lowered by Go, in %d nodes", len(upper), len(clauses))
+	tr.step("every node matches its Go-lowered text", fqSend("POST", "/nodes/count", "tok", `{"kind":"Low","where":`+where+`}`))
+	return tr.String()
+}
+
 // ── the table ──────────────────────────────────────────────────────────
 
 func fqContractRows() []fqContractRow {
@@ -1231,8 +1788,11 @@ func fqContractRows() []fqContractRow {
 		{area: "http", name: "per-identity token buckets answer 429 with Retry-After", source: "limits.rs:rate_limit", provedBy: "TestFqServerLimitsBothWays"},
 		{area: "http", name: "body limit answers 413 only when a handler reads the body", source: "limits.rs:body_limit_layer", provedBy: "TestFqServerLimitsBothWays"},
 		{area: "http", name: "in-flight cap answers 503; the request timeout 408", source: "limits.rs:concurrency, request_timeout_layer", provedBy: "TestFqServerInFlightAndTimeoutBothWays"},
+		{area: "http", name: "/stats and the liveness probe answer while every in-flight slot is held", source: "limits.rs:concurrency, is_telemetry", run: fqScenarioTelemetryWhileSaturated},
+		{area: "http", name: "bytes that cannot start a request (a ClientHello on a plain port) are refused as they arrive", source: "hyper h1 (httparse) incremental head parse", run: fqScenarioNonHTTPStart},
 		{area: "http", name: "live subscribers are capped (503)", source: "limits.rs:subscriber_permit", run: fqScenarioMaxSubscribers},
 		{area: "http", name: "a probe, a read and /stats are answered while a large transaction is in flight", source: "database.rs:with_engine_mut (the writer mutex), engine.rs:pin_read", run: fqScenarioProbeDuringTransaction},
+		{area: "http", name: "every liveness probe and /stats answers within 500ms while writers and a mover's batches run", source: "limits.rs:is_telemetry; the supervisor's probe budget", run: fqScenarioProbesUnderLoad},
 		{area: "http", name: "TLS from a PKCS#12 identity", source: "tls_server.rs", provedBy: "TestFqServerTLSBothWays"},
 		{area: "http", name: "an idle event stream carries the keep-alive comment", source: "routes.rs:subscribe_events", provedBy: "TestFqServerStreamKeepAliveBothWays"},
 		{area: "http", name: "/stats: the engine half identical, the runtime half in shape", source: "routes.rs:stats, metrics.rs", provedBy: both},
@@ -1259,6 +1819,8 @@ func fqContractRows() []fqContractRow {
 		{area: "admin", name: "users: create, list, revoke, roles, refusals", source: "routes.rs:create_user …", provedBy: both},
 		{area: "admin", name: "persistent users: minted tokens authenticate, survive a restart, revocation sticks", source: "engine.rs:insert_user, revoke_user, find_user_by_hash", run: fqScenarioPersistentUsers},
 		{area: "admin", name: "indexes: create (hash/text/unique), list, drop, refusals", source: "routes.rs:create_index …", provedBy: both},
+		{area: "admin", name: "folded text indexes: declared, listed, refused, survive a crash, serve op(lower(item.f), …) as the scan does", source: "text.rs (TextIndexDef::folded, PutFolded), wal.rs (CreateFoldedTextIndex), predicate.rs (lower, lowered_substring_literals)", run: fqScenarioFoldedTextIndex},
+		{area: "nodes", name: "lower in a predicate is the fct language's lower (Go's strings.ToLower), every code point", source: "predicate.rs:go_lower, go_lower_table.rs", run: fqScenarioLowerIsGosLower},
 		{area: "admin", name: "unique indexes: duplicates refused, moves in a batch, declared over duplicates refused, survive a reopen", source: "tests/unique_constraint.rs", run: fqScenarioUniqueIndex},
 		{area: "admin", name: "references: cascade/restrict/set_null, cycles, missing parents, needed indexes, by parent field, across a restart", source: "tests/referential_integrity.rs, reference_restart.rs", run: fqScenarioReferences},
 
@@ -1268,12 +1830,20 @@ func fqContractRows() []fqContractRow {
 		{area: "durability", name: "repeated crashes never lose a confirmed write", source: "tests/crash_recovery.rs", run: fqScenarioCrashRepeated},
 		{area: "durability", name: "a clean stop checkpoints and everything is there on the next start", source: "main.rs (shutdown), tests/crash_recovery.rs", run: fqScenarioCleanRestart},
 		{area: "durability", name: "SIGTERM: in-flight finishes, the last checkpoint, exit 0, the same words", source: "main.rs", provedBy: "TestFqServerShutdownBothWays"},
+		{area: "durability", name: "SIGTERM under load: the write in flight is answered, an idle keep-alive is not served again, nothing new is accepted, all of it durable", source: "main.rs (with_graceful_shutdown, SHUTDOWN_GRACE)", run: fqScenarioShutdownUnderLoad},
+		{area: "durability", name: "SIGTERM with a live subscriber: the drain waits SHUTDOWN_GRACE, says so, checkpoints, exits 0", source: "main.rs (SHUTDOWN_GRACE)", run: fqScenarioShutdownHeldBySubscriber},
+		// the operator CLI — main.rs, cli/mod.rs, cli/client.rs, cli/output.rs
+		{area: "cli", name: "the command line: help screens, --version, clap's usage errors, argument checks, the token, the confirmation prompt, ENOCHIAN_* warnings", source: "main.rs (Cli), cli/mod.rs", provedBy: "TestFqCliCommandLineBothWays"},
+		{area: "cli", name: "init, backup and restore of a data directory", source: "main.rs:run_backup, run_restore, data_files", provedBy: "TestFqCliDataDirectoryBothWays"},
+		{area: "cli", name: "user, index, reference, get, put, delete, query, stats and routes against a running server", source: "cli/mod.rs, cli/client.rs, cli/output.rs", provedBy: "TestFqCliClientBothWays"},
+		{area: "cli", name: "no command is `start`, with start's flags and environment", source: "main.rs:bare_start", provedBy: "TestFqCliCommandLineBothWays"},
 		{area: "durability", name: "a frame whose COMMIT never landed leaves every structure as it was", source: "storage/recovery.rs, tests/crash_recovery.rs", run: fqScenarioCommitDropped},
 		{area: "durability", name: "the same frame with its COMMIT replays all of it", source: "storage/recovery.rs", run: fqScenarioCommitReplayed},
 		{area: "durability", name: "a committed frame missing its BEGIN refuses to start", source: "storage/recovery.rs, main.rs:report_startup_failure", run: fqScenarioNoBegin},
 		{area: "durability", name: "the data directory admits only one process", source: "storage/lock.rs", run: fqScenarioSingleProcess},
 		{area: "durability", name: "a checkpoint on every write: indexes, sequences, history and edges reopen", source: "storage/checkpoint.rs, tests/sequences.rs", run: fqScenarioCheckpointEveryWrite},
 		{area: "durability", name: "WAL rotation keeps every record and moves the /changes horizon", source: "storage/wal.rs (rotate), storage/changes.rs", run: fqScenarioWalRotation},
+		{area: "storage", name: "many splits, resized overwrites and deletes read back identically on every path, live and reopened", source: "storage/btree.rs, page.rs, pager.rs, engine.rs:query_sorted", run: fqScenarioSplitsAndPaging},
 		{area: "durability", name: "records larger than a page survive the overflow chain and a reopen", source: "storage/heap.rs, tests/heap_records.rs", run: fqScenarioOverflowRecords},
 		{area: "durability", name: "a data directory written by facetql opens under fqserver.fct", source: "storage/*.rs formats", cross: "rust"},
 		{area: "durability", name: "a data directory written by fqserver.fct opens under facetql", source: "storage/*.rs formats", cross: "fct"},
@@ -1302,7 +1872,7 @@ func fqContractRows() []fqContractRow {
 		{area: "storage", name: "the event feed ring: positions, resume, horizon, audience", source: "database.rs", provedBy: "TestDatabaseEventFeedResumeBeforeHorizonIsRefused"},
 
 		// the whole application suite
-		{area: "suite", name: "the integration suite passes against the fct engine", source: "fct/integration", provedBy: "TestSuiteAgainstSelfhostedEngine"},
+		{area: "suite", name: "the integration suite passes against the fct engine", source: "fct/integration", provedBy: "TestSuiteRunsTheShippedEngine"},
 	}
 }
 

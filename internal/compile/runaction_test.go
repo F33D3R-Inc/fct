@@ -45,3 +45,33 @@ func TestRunActionCompiles(t *testing.T) {
 		}
 	}
 }
+
+// @internal refuses every HTTP route onto the action, and @optimistic with it.
+func TestInternalActionRefusals(t *testing.T) {
+	base := `app X:
+    type R:
+        ok: bool
+    action award(n: int) -> R @internal:
+        return R{ok: n > 0}
+    %s
+    view Home at "/":
+        text "hi"
+`
+	if _, err := String(strings.Replace(base, "%s", "", 1)); err != nil {
+		t.Fatalf("an internal action must compile: %v", err)
+	}
+	_, err := String(strings.Replace(base, "%s", `api POST "/api/award" -> award`, 1))
+	if err == nil || !strings.Contains(err.Error(), "routes to @internal action") {
+		t.Errorf("api onto @internal: %v", err)
+	}
+	_, err = String(`app X:
+    state n: int = 0 @client
+    action a @internal @optimistic:
+        n = 1
+    view Home at "/":
+        text "hi"
+`)
+	if err == nil || !strings.Contains(err.Error(), "nothing for a client to predict") {
+		t.Errorf("@internal @optimistic: %v", err)
+	}
+}

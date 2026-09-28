@@ -139,19 +139,33 @@ func bytesCmpBuiltin(a, b any) (any, error) {
 // bTo) -> int`: bytesCmp over a[aFrom..aTo) and b[bFrom..bTo), copying
 // neither — a key inside a page compared against a probe in place.
 func bytesCmpRangeBuiltin(a any, aFrom, aTo int, b any, bFrom, bTo int) (any, error) {
+	c, err := bytesCmpRangeInt(a, aFrom, aTo, b, bFrom, bTo)
+	if err != nil {
+		return nil, err
+	}
+	return cmpBoxed[c+1], nil
+}
+
+// cmpBoxed is -1, 0 and 1 boxed once: a comparison's result as a value
+// allocates nothing (Go boxes only 0-255 for free, not -1).
+var cmpBoxed = [3]any{-1, 0, 1}
+
+// bytesCmpRangeInt is bytesCmpRange's result as an int, for the proc
+// engine's native int path (proccompile.go's intExpr) and the builtin.
+func bytesCmpRangeInt(a any, aFrom, aTo int, b any, bFrom, bTo int) (int, error) {
 	x, ok := bytesOf(a)
 	if !ok {
-		return nil, fmt.Errorf("bytesCmpRange: the first argument is not a byte buffer")
+		return 0, fmt.Errorf("bytesCmpRange: the first argument is not a byte buffer")
 	}
 	y, ok := bytesOf(b)
 	if !ok {
-		return nil, fmt.Errorf("bytesCmpRange: the second argument is not a byte buffer")
+		return 0, fmt.Errorf("bytesCmpRange: the second argument is not a byte buffer")
 	}
 	if aFrom < 0 || aTo > len(x) || aFrom > aTo {
-		return nil, fmt.Errorf("bytesCmpRange: range %d..%d is outside a buffer of %d bytes", aFrom, aTo, len(x))
+		return 0, fmt.Errorf("bytesCmpRange: range %d..%d is outside a buffer of %d bytes", aFrom, aTo, len(x))
 	}
 	if bFrom < 0 || bTo > len(y) || bFrom > bTo {
-		return nil, fmt.Errorf("bytesCmpRange: range %d..%d is outside a buffer of %d bytes", bFrom, bTo, len(y))
+		return 0, fmt.Errorf("bytesCmpRange: range %d..%d is outside a buffer of %d bytes", bFrom, bTo, len(y))
 	}
 	return bytes.Compare(x[aFrom:aTo], y[bFrom:bTo]), nil
 }
@@ -159,15 +173,25 @@ func bytesCmpRangeBuiltin(a any, aFrom, aTo int, b any, bFrom, bTo int) (any, er
 // uintLEBuiltin implements `uintLE(b, at, n) -> int`: the little-endian
 // unsigned integer in b[at..at+n), n 1-8.
 func uintLEBuiltin(b any, at, n int) (any, error) {
+	v, err := uintLEInt(b, at, n)
+	if err != nil {
+		return nil, err
+	}
+	return boxInt(v), nil
+}
+
+// uintLEInt is uintLE's result as an int, for the proc engine's native int
+// path (proccompile.go's intExpr) and the builtin.
+func uintLEInt(b any, at, n int) (int, error) {
 	x, ok := bytesOf(b)
 	if !ok {
-		return nil, fmt.Errorf("uintLE: not a byte buffer")
+		return 0, fmt.Errorf("uintLE: not a byte buffer")
 	}
 	if n < 1 || n > 8 {
-		return nil, fmt.Errorf("uintLE: width %d is not 1-8 bytes", n)
+		return 0, fmt.Errorf("uintLE: width %d is not 1-8 bytes", n)
 	}
 	if at < 0 || at+n > len(x) {
-		return nil, fmt.Errorf("uintLE: bytes %d..%d are outside a buffer of %d bytes", at, at+n, len(x))
+		return 0, fmt.Errorf("uintLE: bytes %d..%d are outside a buffer of %d bytes", at, at+n, len(x))
 	}
 	var v uint64
 	for i := n - 1; i >= 0; i-- {
@@ -193,4 +217,35 @@ func fromHexBuiltin(s string) (any, error) {
 		return bytesVal{}, nil
 	}
 	return bytesVal(out), nil
+}
+
+// bytesPutBuiltin implements `bytesPut(dst, at, src) -> [int]`: a copy of
+// dst with src's bytes written over dst[at..at+len(src)] — dst's length and
+// every other byte unchanged. A range outside dst, or a value that is not a
+// byte, is an error. (The proc engine does `b = bytesPut(b, at, src)` in
+// place when b's slot owns it: bytesPutInto.)
+func bytesPutBuiltin(dst any, at int, src any) (any, error) {
+	d, ok := bytesOf(dst)
+	if !ok {
+		return nil, fmt.Errorf("bytesPut: the destination is not a byte buffer")
+	}
+	out := make(bytesVal, len(d))
+	copy(out, d)
+	if err := bytesPutInto(out, at, src); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// bytesPutInto writes src over b[at..at+len(src)] in place.
+func bytesPutInto(b bytesVal, at int, src any) error {
+	s, ok := bytesOf(src)
+	if !ok {
+		return fmt.Errorf("bytesPut: the source is not a byte buffer")
+	}
+	if at < 0 || at+len(s) > len(b) {
+		return fmt.Errorf("bytesPut: writing %d bytes at %d is outside a buffer of %d bytes", len(s), at, len(b))
+	}
+	copy(b[at:], s)
+	return nil
 }

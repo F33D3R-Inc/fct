@@ -42,7 +42,7 @@ func (s *Server) ioListenTls(port int, identity, password string) (any, error) {
 	if port < 0 || port > 65535 {
 		return nil, fmt.Errorf("listenTls: invalid port %d (must be 0-65535)", port)
 	}
-	full, err := s.resolveDataPath(identity)
+	full, err := s.resolveReadPath(identity)
 	if err != nil {
 		return nil, fmt.Errorf("listenTls: %w", err)
 	}

@@ -186,7 +186,7 @@ fn engine_ops(engine: &StorageEngine, script: &str) -> String {
                 .create_index(IndexDef { name: wf[1].to_string(), kind: wf[2].to_string(), field: wf[3].to_string(), unique: wf.get(4) == Some(&"unique") })
                 .map(|_| "ok;".to_string()),
             "text" => engine
-                .create_text_index(TextIndexDef { name: w[1].to_string(), kind: w[2].to_string(), field: w[3].to_string() })
+                .create_text_index(TextIndexDef { name: w[1].to_string(), kind: w[2].to_string(), field: w[3].to_string(), folded: false })
                 .map(|_| "ok;".to_string()),
             "drop" => engine.drop_index(w[1]).map(|_| "ok;".to_string()),
             "ref" => {

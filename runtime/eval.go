@@ -140,13 +140,28 @@ func runeOffsets(s string) []int32 {
 	return append(offs, int32(len(s)))
 }
 
-// textIndex answers (ascii, offsets): offsets is nil for ASCII text.
-func textIndex(s string) (bool, []int32) {
-	if len(s) < 128 {
+// shortText is the length under which a text is indexed on the spot rather
+// than through the cache: scanning it is cheaper than a cache probe.
+const shortText = 128
+
+// shortOffsets is room for a short text's rune offsets (at most one rune per
+// byte, plus the final sentinel), held by the caller so indexing a short
+// non-ASCII text — a line with an em dash, a message with an accent, the
+// many such a parser slices — allocates nothing.
+type shortOffsets [shortText + 1]int32
+
+// textIndex answers (ascii, offsets): offsets is nil for ASCII text. A
+// short text's offsets are written into buf.
+func textIndex(s string, buf *shortOffsets) (bool, []int32) {
+	if len(s) < shortText {
 		if scanASCII(s) {
 			return true, nil
 		}
-		return false, runeOffsets(s)
+		offs := buf[:0]
+		for i := range s {
+			offs = append(offs, int32(i))
+		}
+		return false, append(offs, int32(len(s)))
 	}
 	p := unsafe.StringData(s)
 	ring, next := textIndexCache[:], &textIndexNext
@@ -192,7 +207,8 @@ func boxStr(s string) any {
 // sub is found at from. Rune-indexed exactly as slice and charAt are, so a
 // found index slices back to the match.
 func runeIndexOf(s, sub string, from int) int {
-	ascii, offs := textIndex(s)
+	var buf shortOffsets
+	ascii, offs := textIndex(s, &buf)
 	n := len(s)
 	if !ascii {
 		n = len(offs) - 1
@@ -215,7 +231,16 @@ func runeIndexOf(s, sub string, from int) int {
 		return bstart + k
 	}
 	bpos := int32(bstart + k)
-	return sort.Search(len(offs), func(i int) bool { return offs[i] >= bpos })
+	lo, hi := 0, len(offs)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if offs[mid] >= bpos {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo
 }
 
 // sameText is a text builtin's result s as a value: the argument orig
@@ -230,9 +255,84 @@ func sameText(orig any, s string) any {
 	return s
 }
 
+// listIndexOf is indexOf(xs, v, from) over a list: the index of the first
+// element at or after from (clamped into [0, len]) that `==` holds for
+// with v (equal, the operator's own comparison), or -1.
+// bytesIndexOf is indexOf over a byte buffer, from position from: the
+// first byte equal to v (an int), or — v a list of byte values — the first
+// byte that is any of them (strings.IndexAny's question over bytes); -1
+// when there is none. It is how a scanner finds the end of a run of
+// ordinary bytes (a JSON string's next quote, backslash or control byte)
+// natively rather than one interpreted comparison per byte.
+func bytesIndexOf(b bytesVal, v any, from int) int {
+	if from < 0 {
+		from = 0
+	}
+	if from >= len(b) {
+		return -1
+	}
+	var set [256]bool
+	switch t := v.(type) {
+	case []any:
+		for _, x := range t {
+			if n := toInt(x); n >= 0 && n < 256 {
+				set[n] = true
+			}
+		}
+	case bytesVal:
+		for _, x := range t {
+			set[x] = true
+		}
+	default:
+		n := toInt(v)
+		if n < 0 || n > 255 {
+			return -1
+		}
+		if i := bytes.IndexByte(b[from:], byte(n)); i >= 0 {
+			return from + i
+		}
+		return -1
+	}
+	for i := from; i < len(b); i++ {
+		if set[b[i]] {
+			return i
+		}
+	}
+	return -1
+}
+
+func listIndexOf(xs []any, v any, from int) int {
+	if from < 0 {
+		from = 0
+	}
+	if s, ok := v.(string); ok {
+		// the common case, a name among names: compared without equal's
+		// conversions when the element is text too
+		for i := from; i < len(xs); i++ {
+			if t, ok := xs[i].(string); ok {
+				if t == s {
+					return i
+				}
+			} else if equal(xs[i], v) {
+				return i
+			}
+		}
+		return -1
+	}
+	for i := from; i < len(xs); i++ {
+		if equal(xs[i], v) {
+			return i
+		}
+	}
+	return -1
+}
+
 // runeLen is len(s) in runes.
 func runeLen(s string) int {
-	ascii, offs := textIndex(s)
+	if len(s) < shortText {
+		return utf8.RuneCountInString(s)
+	}
+	ascii, offs := textIndex(s, nil)
 	if ascii {
 		return len(s)
 	}
@@ -267,7 +367,8 @@ func listSlice(xs []any, start, end int) []any {
 }
 
 func runeSlice(s string, start, end int) string {
-	ascii, offs := textIndex(s)
+	var buf shortOffsets
+	ascii, offs := textIndex(s, &buf)
 	n := len(s)
 	if !ascii {
 		n = len(offs) - 1
@@ -530,6 +631,65 @@ func eval(e *ir.Expr, scope map[string]any) any {
 	return evalRest(e, scope)
 }
 
+// listSelect is a list aggregate's rows, shaped by Sel per row when there is
+// one, as a fresh list.
+func listSelect(e *ir.Expr, rows []any, scope map[string]any) any {
+	if e.Sel == nil {
+		return append([]any{}, rows...)
+	}
+	out := make([]any, 0, len(rows))
+	prev, had := scope[e.Var]
+	for _, r := range rows {
+		scope[e.Var] = r // a row, or a list cell's element
+		out = append(out, eval(e.Sel, scope))
+	}
+	if had {
+		scope[e.Var] = prev
+	} else {
+		delete(scope, e.Var)
+	}
+	return out
+}
+
+// sortedForEarlyStop is a capped list's rows in its answer order, before
+// filtering — when that order is by a stored field (reading it is cheap) and
+// its values compare consistently (all numbers, or all text), so the kept
+// rows in this order are exactly the filtered rows sorted: the sorts are
+// stable, and a consistent comparison orders a subset as it orders the
+// whole. Otherwise false, and the list filters first as it always has.
+func sortedForEarlyStop(e *ir.Expr, rows []any) ([]any, bool) {
+	field := e.Order
+	if e.OrderBy != nil {
+		f, ok := itemField(e.OrderBy, e.Var)
+		if !ok {
+			return nil, false
+		}
+		field = f
+	}
+	if field == "" {
+		return rows, true // unordered: the rows' own order is the answer's
+	}
+	nums, texts := 0, 0
+	for _, r := range rows {
+		m, ok := r.(record)
+		if !ok {
+			return nil, false
+		}
+		switch m[field].(type) {
+		case int, int64, float64:
+			nums++
+		case string:
+			texts++
+		default:
+			return nil, false
+		}
+	}
+	if nums > 0 && texts > 0 {
+		return nil, false
+	}
+	return sortRows(rows, field, e.Desc), true
+}
+
 // evalColl evaluates the two forms that read a whole collection: an
 // `Entity(id).field` lookup and an aggregate over (optionally filtered) rows.
 func evalColl(e *ir.Expr, scope map[string]any) any {
@@ -537,6 +697,10 @@ func evalColl(e *ir.Expr, scope map[string]any) any {
 	case "eget":
 		rows, _ := scope[e.Name].([]any)
 		key := eval(e.Key, scope)
+		// by id through the scope's index of the rows' ids (rowindex.go)
+		if cand, ok := indexedRows(scope, e.Name, "id", rows, key); ok {
+			rows = cand
+		}
 		for _, r := range rows {
 			if m, ok := r.(record); ok && equal(m["id"], key) {
 				if e.Field == "" {
@@ -566,9 +730,49 @@ func evalColl(e *ir.Expr, scope map[string]any) any {
 		// address of its own and must be computed for the row that is bound rather
 		// than read back from the one the first row wrote.
 		if e.Where != nil {
+			// A case-insensitive search the database indexes names its
+			// candidates (searchpush.go); a predicate that pins a field to a
+			// value (`q.quoted == w.id`) tests only the rows an index of that
+			// field names for the value (rowindex.go) — the same predicate,
+			// on fewer rows either way.
+			// (The pinned value is evaluated as the predicate evaluates it,
+			// per row: during a render nothing it reads is recorded.)
+			if cand, ok := searchedRows(scope, e, rows); ok {
+				rows = cand
+			} else if field, pe, isIn, ok := pinnedEquality(e.Where, e.Var); ok {
+				probe := evalPerRow(pe, scope)
+				if isIn {
+					if cand, ok := indexedRowsIn(scope, e.Name, field, rows, probe); ok {
+						rows = cand
+					}
+				} else if cand, ok := indexedRows(scope, e.Name, field, rows, probe); ok {
+					rows = cand
+				}
+			}
+			// How many kept rows the answer can use: `exists` needs one; a
+			// capped list, once its rows are in answer order, needs `limit`.
+			// Past that the predicate is not asked — of a heavy per-row derive
+			// (a feed's visibility rules) over a whole kind, the difference
+			// between 10 000 evaluations and a few dozen.
+			need := -1
+			presorted := false
+			switch {
+			case !rowIndexing:
+			case e.Op == "exists":
+				need = 1
+			case e.Op == "list" && e.Limit != nil:
+				if lim := toInt(eval(e.Limit, scope)); lim >= 0 {
+					if sorted, ok := sortedForEarlyStop(e, rows); ok {
+						rows, need, presorted = sorted, lim, true
+					}
+				}
+			}
 			prev, had := scope[e.Var]
 			kept := make([]any, 0, len(rows))
 			for _, r := range rows {
+				if need >= 0 && len(kept) >= need {
+					break
+				}
 				// An entity's rows are records; a `[T]` list cell's elements are
 				// its values. The item variable is bound to each as it is.
 				scope[e.Var] = r
@@ -582,6 +786,10 @@ func evalColl(e *ir.Expr, scope map[string]any) any {
 				delete(scope, e.Var)
 			}
 			rows = kept
+			if presorted {
+				// already in answer order and within the cap
+				return listSelect(e, rows, scope)
+			}
 		}
 		switch e.Op {
 		case "exists":
@@ -605,21 +813,7 @@ func evalColl(e *ir.Expr, scope map[string]any) any {
 					rows = rows[:lim]
 				}
 			}
-			if e.Sel == nil {
-				return append([]any{}, rows...)
-			}
-			out := make([]any, 0, len(rows))
-			prev, had := scope[e.Var]
-			for _, r := range rows {
-				scope[e.Var] = r // a row, or a list cell's element
-				out = append(out, eval(e.Sel, scope))
-			}
-			if had {
-				scope[e.Var] = prev
-			} else {
-				delete(scope, e.Var)
-			}
-			return out
+			return listSelect(e, rows, scope)
 		}
 		// sum/avg/min/max reduce a numeric value over the (filtered) rows: a
 		// bare column, or an expression evaluated once per row.
@@ -951,10 +1145,18 @@ func applyBin(op string, l, r any) any {
 	case "||":
 		return truthy(l) || truthy(r)
 	case "+":
-		if lb, ok := l.(bytesVal); ok {
-			if rb, ok := r.(bytesVal); ok {
-				out := make(bytesVal, 0, len(lb)+len(rb))
-				return append(append(out, lb...), rb...)
+		// A byte buffer joined with another list of bytes stays a byte
+		// buffer — the same [int] value, kept native: a list literal of
+		// header bytes spliced into a page must not turn the whole page
+		// into a boxed list that every later read copies.
+		_, lIsBytes := l.(bytesVal)
+		_, rIsBytes := r.(bytesVal)
+		if lIsBytes || rIsBytes {
+			if lb, ok := bytesOf(l); ok {
+				if rb, ok := bytesOf(r); ok {
+					out := make(bytesVal, 0, len(lb)+len(rb))
+					return append(append(out, lb...), rb...)
+				}
 			}
 		}
 		if la, ok := listElems(l); ok {
@@ -1315,6 +1517,8 @@ func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
 		return s.ioLockFile(toStr(arg(0)))
 	case "crc32":
 		return crc32Range(arg(0), toInt(arg(1)), toInt(arg(2)))
+	case "bytesPut":
+		return bytesPutBuiltin(arg(0), toInt(arg(1)), arg(2))
 	case "bytesCmp":
 		return bytesCmpBuiltin(arg(0), arg(1))
 	case "bytesCmpRange":
@@ -1337,7 +1541,7 @@ func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
 	case "$detach":
 		return s.detachProc(toStr(arg(0)), argVals[1:])
 	case "sleepMs":
-		return ioSleepMs(toInt(arg(0)))
+		return s.ioSleepMs(toInt(arg(0)))
 	case "nowMs":
 		return ioNowMs()
 	case "signals":
@@ -1345,9 +1549,14 @@ func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
 	case "monoMs":
 		return ioMonoMs()
 	case "channel":
+		if len(argVals) > 0 {
+			return s.channels.createSized(toInt(arg(0)))
+		}
 		return s.channels.create(), nil
 	case "send":
 		return s.channels.send(toInt(arg(0)), toStr(arg(1)))
+	case "trySend":
+		return s.channels.trySend(toInt(arg(0)), toStr(arg(1)))
 	case "recv":
 		return s.channels.recv(toInt(arg(0)))
 	case "closeChannel":
@@ -1408,6 +1617,8 @@ func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
 		return s.ioConnOpen(toInt(arg(0)))
 	case "shutdownConn":
 		return s.ioShutdownConn(toInt(arg(0)))
+	case "closeWrite":
+		return s.ioCloseWrite(toInt(arg(0)))
 	case "writeStdout":
 		return s.ioWriteStdout(toStr(arg(0)))
 	case "writeStderr":
@@ -1416,6 +1627,14 @@ func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
 		return s.ioReadStdin()
 	case "envVar":
 		return os.Getenv(toStr(arg(0))), nil
+	case "grantDir":
+		return s.ioGrantDir(toStr(arg(0)))
+	case "listDir":
+		return s.ioListDir(toStr(arg(0)))
+	case "makeDir":
+		return s.ioMakeDir(toStr(arg(0)))
+	case "readStdinLine":
+		return s.ioReadStdinLine()
 	case "grantRead":
 		return s.ioGrantRead(toStr(arg(0)))
 	case "listenerPort":
@@ -1429,6 +1648,20 @@ func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
 		return set, nil
 	case "randomBytes":
 		return randomBytes(toInt(arg(0)))
+	case "p256PrivateKey":
+		return p256PrivateKey()
+	case "p256PublicKey":
+		return p256PublicKey(arg(0))
+	case "p256Ecdh":
+		return p256Ecdh(arg(0), arg(1))
+	case "es256Sign":
+		return es256Sign(arg(0), arg(1))
+	case "fromBase64UrlRaw":
+		return fromBase64UrlRaw(arg(0))
+	case "httpSend":
+		return s.ioHTTPSend(toStr(arg(0)), toStr(arg(1)), arg(2), arg(3))
+	case "uploadBytes":
+		return s.uploadBytes(toStr(arg(0))), nil
 	}
 	return callBuiltin(name, argVals), nil
 }
@@ -1573,6 +1806,10 @@ func callBuiltin(name string, argVals []any) any {
 		return math.Log(toFloat(arg(0)))
 	case "sqrt":
 		return math.Sqrt(toFloat(arg(0)))
+	case "sin":
+		return math.Sin(toFloat(arg(0)))
+	case "cos":
+		return math.Cos(toFloat(arg(0)))
 	case "floatBits":
 		// The raw IEEE-754 bit pattern of a float, reinterpreted as a signed
 		// 64-bit int — a bit-cast, not a numeric conversion (contrast
@@ -1634,6 +1871,17 @@ func callBuiltin(name string, argVals []any) any {
 		// internal/ir/build.go), so it is len()-able, index-readable, and
 		// accepted wherever a byte buffer already is (e.g. writeBytes).
 		return bytesVal([]byte(toStr(arg(0))))
+	case "jsonQuote":
+		return jsonQuote(toStr(arg(0)))
+	case "validUtf8":
+		// validUtf8(b) -> bool: whether b's bytes are well-formed UTF-8 —
+		// Go's utf8.Valid, which refuses an overlong form, a surrogate and
+		// anything past U+10FFFF exactly as Rust's str::from_utf8 does. A
+		// value that is not a byte buffer is not valid UTF-8.
+		if bs, ok := bytesOf(arg(0)); ok {
+			return utf8.Valid(bs)
+		}
+		return false
 	case "bytesToText":
 		// bytesToText(b) -> text: textToBytes' inverse, decoding a [int]
 		// byte buffer as UTF-8. Invalid input (a byte value out of range, or
@@ -1742,6 +1990,11 @@ func callBuiltin(name string, argVals []any) any {
 		if n < 0 {
 			n = 0
 		}
+		// take(xs, n) of a list is its first n elements, as slice(xs, 0, n)
+		// is — the list was once stringified here, silently.
+		if xs, ok := arg(0).([]any); ok {
+			return listSlice(xs, 0, n)
+		}
 		return runeSlice(toStr(arg(0)), 0, n)
 	case "join":
 		// join(list, sep): the elements as text, sep between them — split's
@@ -1792,6 +2045,12 @@ func callBuiltin(name string, argVals []any) any {
 		}
 		return boxStr(runeSlice(toStr(arg(0)), toInt(arg(1)), toInt(arg(2))))
 	case "indexOf":
+		if xs, ok := arg(0).([]any); ok {
+			return boxInt(listIndexOf(xs, arg(1), toInt(arg(2))))
+		}
+		if b, ok := arg(0).(bytesVal); ok {
+			return boxInt(bytesIndexOf(b, arg(1), toInt(arg(2))))
+		}
 		return runeIndexOf(toStr(arg(0)), toStr(arg(1)), toInt(arg(2)))
 	case "charAt":
 		// charAt(s, i) -> text, a length-1 string (this language has no
@@ -2236,6 +2495,39 @@ func equal(a, b any) bool {
 	}
 	if bb, ok := b.([]byte); ok {
 		b = string(bb)
+	}
+	// Two lists are equal element by element, two records field by field;
+	// a list or record is never equal to a scalar. (They used to fall
+	// through to the numeric comparison below, where toInt made every list
+	// 0 — so ["a"] == ["b"] was true.)
+	if al, ok := a.([]any); ok {
+		bl, ok := b.([]any)
+		if !ok || len(al) != len(bl) {
+			return false
+		}
+		for i := range al {
+			if !equal(al[i], bl[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	if am, ok := a.(map[string]any); ok {
+		bm, ok := b.(map[string]any)
+		if !ok || len(am) != len(bm) {
+			return false
+		}
+		for k, v := range am {
+			w, ok := bm[k]
+			if !ok || !equal(v, w) {
+				return false
+			}
+		}
+		return true
+	}
+	switch b.(type) {
+	case []any, map[string]any:
+		return false
 	}
 	if as, ok := a.(string); ok {
 		return as == toStr(b)

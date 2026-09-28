@@ -1,0 +1,344 @@
+import "runtime_page.fct"
+
+app RuntimeCompliance:
+    # The compliance services (runtime/compliance.go): message catalogs
+    # negotiated per request, served at /api/_i18n and stamped on a page as
+    # Content-Language.
+
+    # rtLoadI18n: newI18n — every <locale>.json in FACET_I18N_DIR whose
+    # document is an object of strings; the default locale from
+    # FACET_DEFAULT_LOCALE ("en").
+    proc rtLoadI18n(w0: RtWorld) -> RtWorld uses io.env, io.file:
+        let mut w = w0
+        let dl = envVar("FACET_DEFAULT_LOCALE")
+        if dl != "":
+            w.i18nDefault = dl
+        let dir = envVar("FACET_I18N_DIR")
+        if dir == "":
+            return w
+        let names = listDir(dir)
+        let mut i = 0
+        loop i < len(names):
+            let n = names[i]
+            if len(n) > 5 && slice(n, len(n) - 5, len(n)) == ".json":
+                let raw = readFile(dir + "/" + n)
+                let doc = do jsonParse(raw)
+                let cat = do rtCatalogOf(slice(n, 0, len(n) - 5), doc)
+                if cat.locale != "":
+                    w.i18n = do rtPutCatalog(w.i18n, cat)
+            i = i + 1
+        return w
+
+    # rtCatalogOf: a catalog, or one with no locale when the document is not
+    # an object of strings (json.Unmarshal into map[string]string fails).
+    proc rtCatalogOf(locale: text, doc: JVal) -> RtCatalog:
+        let bad = RtCatalog{locale: "", keys: [], vals: []}
+        if doc.kind != "obj":
+            return bad
+        let mut keys = []
+        let mut vals = []
+        let mut i = 0
+        loop i < len(doc.keys):
+            if doc.vals[i].kind != "str":
+                return bad
+            let mut at = -1
+            let mut k = 0
+            loop k < len(keys):
+                if keys[k] == doc.keys[i]:
+                    at = k
+                k = k + 1
+            if at >= 0:
+                vals[at] = doc.vals[i].s
+            else:
+                keys = append(keys, doc.keys[i])
+                vals = append(vals, doc.vals[i].s)
+            i = i + 1
+        return RtCatalog{locale: locale, keys: keys, vals: vals}
+
+    proc rtPutCatalog(cats: [RtCatalog], c: RtCatalog) -> [RtCatalog]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(cats):
+            if cats[i].locale != c.locale:
+                out = append(out, cats[i])
+            i = i + 1
+        out = append(out, c)
+        return out
+
+    # rtHandleI18n: handleI18n — the negotiated locale's catalog.
+    proc rtHandleI18n(w: RtWorld, req: HttpServerRequest) -> HttpServerResponse:
+        let locale = do rtLocaleFor(w, req)
+        let mut avail = [jsonQuote(w.i18nDefault)]
+        let mut i = 0
+        loop i < len(w.i18n):
+            if w.i18n[i].locale != w.i18nDefault:
+                avail = append(avail, jsonQuote(w.i18n[i].locale))
+            i = i + 1
+        let mut msgs = "{}"
+        let mut k = 0
+        loop k < len(w.i18n):
+            if w.i18n[k].locale == locale:
+                let idx = do rtSortedIndex(w.i18n[k].keys)
+                let mut parts = []
+                let mut j = 0
+                loop j < len(idx):
+                    parts = append(parts, jsonQuote(w.i18n[k].keys[idx[j]]) + ":" + jsonQuote(w.i18n[k].vals[idx[j]]))
+                    j = j + 1
+                msgs = "{" + join(parts, ",") + "}"
+            k = k + 1
+        let body = "{\"available\":[" + join(avail, ",") + "],\"default\":" + jsonQuote(w.i18nDefault) + ",\"locale\":" + jsonQuote(locale) + ",\"messages\":" + msgs + "}\n"
+        return HttpServerResponse{status: 200, reason: "", headers: [HttpHeader{name: "content-language", value: locale}, HttpHeader{name: "content-type", value: "application/json"}], body: body}
+
+    # rtHandleContractAPI: handleContract — the app's contract document,
+    # built once (a declared `contract` built it at boot).
+    proc rtHandleContractAPI(w0: RtWorld, req: HttpServerRequest) -> RtHandled:
+        let mut w = w0
+        if req.method != "GET":
+            let na = do rtTextError(405, "GET only")
+            return RtHandled{resp: na, w: w}
+        if w.contractRaw == "":
+            let built = do cBuildContract(w, w.schemaVersion)
+            w.contractRaw = built.raw
+        return RtHandled{resp: HttpServerResponse{status: 200, reason: "", headers: [HttpHeader{name: "content-type", value: "application/json"}], body: w.contractRaw}, w: w}
+
+    # rtHandleBillingAPI: handleBilling — off unless FACET_BILLING; the
+    # enabled path (plans, subscriptions, usage) is not ported yet.
+    proc rtHandleBillingAPI(w0: RtWorld, req: HttpServerRequest) -> RtHandled:
+        let mut w = w0
+        if !w.billing:
+            let off = do rtTextError(501, "billing is not enabled")
+            return RtHandled{resp: off, w: w}
+        let so = do rtSession(w, req)
+        w = so.w
+        let mut np = do rtTextError(501, "billing is not available in the self-hosted runtime yet")
+        np.headers = append(np.headers, so.cookie)
+        return RtHandled{resp: np, w: w}
+
+    # rtHandleAudit: handleAudit — the newest entries first, for an admin;
+    # ?limit= a positive count (100 by default).
+    proc rtHandleAudit(w0: RtWorld, req: HttpServerRequest) -> RtHandled:
+        let mut w = w0
+        if req.method != "GET":
+            let na = do rtTextError(405, "GET only")
+            return RtHandled{resp: na, w: w}
+        let so = do rtSession(w, req)
+        w = so.w
+        let si = do rtSessionIndex(w, so.sid)
+        if si < 0 || w.sessions[si].role != "admin":
+            let mut fb = do rtTextError(403, "forbidden: admin only")
+            fb.headers = append(fb.headers, so.cookie)
+            return RtHandled{resp: fb, w: w}
+        let mut limit = 100
+        if req.hasQuery:
+            let lv = do rtQueryValue(req.query, "limit")
+            let n = do rtPositiveInt(lv)
+            if n > 0:
+                limit = n
+        let n2 = len(w.audit)
+        if limit > n2:
+            limit = n2
+        let mut parts = []
+        let mut i = n2 - 1
+        loop i >= n2 - limit:
+            parts = append(parts, rtAuditJSON(w.audit[i]))
+            i = i - 1
+        let mut r = do rtJSONResponse(200, "{\"entries\":[" + join(parts, ",") + "]}\n")
+        r.headers = append(r.headers, so.cookie)
+        return RtHandled{resp: r, w: w}
+
+    # rtPositiveInt: atoiPositive — a strictly positive decimal, else 0.
+    proc rtPositiveInt(s: text) -> int:
+        if s == "" || len(s) > 18:
+            return 0
+        let mut n = 0
+        let mut i = 0
+        if slice(s, 0, 1) == "+":
+            i = 1
+        if slice(s, 0, 1) == "-":
+            return 0
+        if i >= len(s):
+            return 0
+        loop i < len(s):
+            let c = slice(s, i, i + 1)
+            let d = do rtIndexOfText("0123456789", c)
+            if d < 0:
+                return 0
+            n = n * 10 + d
+            i = i + 1
+        return n
+
+    # ── GDPR export / erasure ───────────────────────────────────────────
+    # rtGDPRSubject: gdprSubject — the signed-in caller acts on themselves;
+    # an admin may name any `user`; "" refuses.
+    proc rtGDPRSubject(w: RtWorld, sid: text, requested: text) -> text:
+        let si = do rtSessionIndex(w, sid)
+        if si < 0:
+            return ""
+        let ses = w.sessions[si]
+        if ses.actor == "" || ses.actor == "guest":
+            return ""
+        if requested == "" || requested == ses.actor:
+            return ses.actor
+        if ses.role == "admin":
+            return requested
+        return ""
+
+    # rtRowNames: rowNames — a user row by its username; any other row by a
+    # text field (not a relation) equal to the subject.
+    proc rtRowNames(e: IREntity, m: Val, subject: text) -> bool:
+        if e.name == "FacetUser":
+            let un = do valToStr(valGet(m, "username"))
+            return un == subject
+        let mut i = 0
+        loop i < len(e.fields):
+            let f = e.fields[i]
+            if f.type == "text" && f.ref == "":
+                let v = do valToStr(valGet(m, f.name))
+                if v == subject:
+                    return true
+            i = i + 1
+        return false
+
+    # rtRedactRow: redactRow — no secret or credential-shaped field leaves.
+    proc rtRedactRow(e: IREntity, m: Val) -> Val:
+        let mut keys = []
+        let mut items = []
+        let mut i = 0
+        loop i < len(m.keys):
+            let k = m.keys[i]
+            let mut drop = e.name == "FacetUser" && (k == "verifyToken" || k == "resetToken")
+            let mut j = 0
+            loop j < len(e.fields):
+                if e.fields[j].name == k && (e.fields[j].secret || e.fields[j].password):
+                    drop = true
+                j = j + 1
+            if !drop:
+                keys = append(keys, k)
+                items = append(items, m.items[i])
+            i = i + 1
+        let r = do recordVal(keys, items)
+        return r
+
+    # rtHandleGDPRExport: handleGDPRExport — every row naming the subject.
+    proc rtHandleGDPRExport(w0: RtWorld, req: HttpServerRequest) -> RtHandled:
+        let mut w = w0
+        if req.method != "GET":
+            let na = do rtTextError(405, "GET only")
+            return RtHandled{resp: na, w: w}
+        let so = do rtSession(w, req)
+        w = so.w
+        let mut requested = ""
+        if req.hasQuery:
+            requested = do rtQueryValue(req.query, "user")
+        let subject = do rtGDPRSubject(w, so.sid, requested)
+        if subject == "":
+            let mut fb = do rtTextError(403, "forbidden")
+            fb.headers = append(fb.headers, so.cookie)
+            return RtHandled{resp: fb, w: w}
+        let mut names = []
+        let mut lists = []
+        let mut e = 0
+        loop e < len(w.g.entities):
+            let ent = w.g.entities[e]
+            let rows = do rtEntRows(w, ent.name)
+            let mut matched = []
+            let mut i = 0
+            loop i < len(rows):
+                if rows[i].kind == "record":
+                    let hit = do rtRowNames(ent, rows[i], subject)
+                    if hit:
+                        matched = append(matched, rtRedactRow(ent, rows[i]))
+                i = i + 1
+            if len(matched) > 0:
+                names = append(names, ent.name)
+                lists = append(lists, rtValJSON(listVal(matched)))
+            e = e + 1
+        let idx = do rtSortedIndex(names)
+        let mut parts = []
+        let mut k = 0
+        loop k < len(idx):
+            parts = append(parts, jsonQuote(names[idx[k]]) + ":" + lists[idx[k]])
+            k = k + 1
+        w = do rtRecordAudit(w, subject, "gdprExport", true, "")
+        let body = "{\"data\":{" + join(parts, ",") + "},\"exportedAt\":" + jsonQuote(iso(nowMs() / 1000)) + ",\"subject\":" + jsonQuote(subject) + "}\n"
+        let mut r = do rtJSONResponse(200, body)
+        r.headers = append(r.headers, so.cookie)
+        return RtHandled{resp: r, w: w}
+
+    # rtHandleGDPRErase: handleGDPRErase — the subject's identifying values
+    # replaced by a tombstone (rows kept), their sessions signed out.
+    proc rtHandleGDPRErase(w0: RtWorld, req: HttpServerRequest) -> RtHandled:
+        let mut w = w0
+        if req.method != "POST":
+            let na = do rtTextError(405, "POST only")
+            return RtHandled{resp: na, w: w}
+        let gm = do rtGuardRate(w, req)
+        w = gm.w
+        if !gm.allowed:
+            let rl = do rtTextError(429, "rate limit exceeded")
+            return RtHandled{resp: rl, w: w}
+        let so = do rtSession(w, req)
+        w = so.w
+        let mut requested = ""
+        if req.hasQuery:
+            requested = do rtQueryValue(req.query, "user")
+        if requested == "":
+            requested = do rtAdminFormValue(req, "user")
+        let subject = do rtGDPRSubject(w, so.sid, requested)
+        if subject == "":
+            let mut fb = do rtTextError(403, "forbidden")
+            fb.headers = append(fb.headers, so.cookie)
+            return RtHandled{resp: fb, w: w}
+        let tombstone = "erased-" + slice(rtRandomName(), 0, 12)
+        let mut erased = 0
+        let mut e = 0
+        loop e < len(w.g.entities):
+            let ent = w.g.entities[e]
+            let rows = do rtEntRows(w, ent.name)
+            let mut out = []
+            let mut i = 0
+            loop i < len(rows):
+                let mut m = rows[i]
+                let mut changed = false
+                if m.kind == "record":
+                    let un = do valToStr(valGet(m, "username"))
+                    if ent.name == "FacetUser" && un == subject:
+                        m = do valSet(m, "username", textVal(tombstone))
+                        m = do valSet(m, "password", textVal(""))
+                        m = do valSet(m, "email", textVal(""))
+                        m = do valSet(m, "verifyToken", textVal(""))
+                        m = do valSet(m, "resetToken", textVal(""))
+                        m = do valSet(m, "mfaSecret", textVal(""))
+                        m = do valSet(m, "mfaEnabled", boolVal(false))
+                        changed = true
+                    else:
+                        let mut f = 0
+                        loop f < len(ent.fields):
+                            let fl = ent.fields[f]
+                            if fl.type == "text" && fl.ref == "":
+                                let v = do valToStr(valGet(m, fl.name))
+                                if v == subject:
+                                    m = do valSet(m, fl.name, textVal(tombstone))
+                                    changed = true
+                            f = f + 1
+                if changed:
+                    w = do rtDurSave(w, ent.name, m)
+                    erased = erased + 1
+                out = append(out, m)
+                i = i + 1
+            w = do rtSetEntRows(w, ent.name, out)
+            e = e + 1
+        let mut s = 0
+        loop s < len(w.sessions):
+            if w.sessions[s].actor == subject:
+                let mut ses = w.sessions[s]
+                ses.actor = "guest"
+                ses.role = "guest"
+                ses.verified = false
+                w.sessions[s] = ses
+            s = s + 1
+        w = do rtRecordAudit(w, subject, "gdprErase", true, "" + erased + " rows")
+        let body = "{\"ok\":true,\"rowsAffected\":" + erased + ",\"subject\":" + jsonQuote(subject) + "}\n"
+        let mut r = do rtJSONResponse(200, body)
+        r.headers = append(r.headers, so.cookie)
+        return RtHandled{resp: r, w: w}

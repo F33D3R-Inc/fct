@@ -88,6 +88,13 @@ app FqEngineSelfHost:
         err: text
         eng: FqEngine
 
+    # enReadOnly: the engine as a read task uses its snapshot copy — every
+    # pager a read-only view (pgrReadOnly), so cache hits record nothing
+    # into a copy that is discarded when the request ends.
+    proc enReadOnly(e: FqEngine) -> FqEngine:
+        let r = do enWith(e, stWith(e.st, hpReadOnly(e.st.heap), ixReadOnly(e.st.ix)))
+        return r
+
     proc enWith(e: FqEngine, st: FqStore) -> FqEngine:
         return FqEngine{st: st, wal: e.wal, ctr: e.ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd, limits: e.limits}
 
@@ -1271,7 +1278,7 @@ app FqEngineSelfHost:
         let tat = do stTextIxAt(e.st.ix, def.name)
         if tat >= 0:
             let ex = e.st.ix.text[tat].def
-            if ex.kind == def.kind && ex.field == def.field:
+            if ex.kind == def.kind && ex.field == def.field && ex.folded == def.folded:
                 let ok0 = do enOk(e)
                 return ok0
             let x1 = do enErr(e, "index '" + ex.name + "' already exists, over " + ex.kind + "." + ex.field + " — drop it before redefining it")
@@ -1284,7 +1291,7 @@ app FqEngineSelfHost:
         let nt = len(e.st.ix.text)
         let mut j = 0
         loop j < nt:
-            if e.st.ix.text[j].def.kind == def.kind && e.st.ix.text[j].def.field == def.field:
+            if e.st.ix.text[j].def.kind == def.kind && e.st.ix.text[j].def.field == def.field && e.st.ix.text[j].def.folded == def.folded:
                 let x3 = do enErr(e, "index '" + e.st.ix.text[j].def.name + "' already covers the text of " + def.kind + "." + def.field)
                 return x3
             j = j + 1
@@ -1458,7 +1465,9 @@ app FqEngineSelfHost:
         # flock on facetql.lock, held for the life of the process, so a
         # data directory has exactly one writer. Refused, nothing is
         # opened (the load below only reads, and its outcome is not
-        # reported: the refusal is).
+        # reported: the refusal is). lock::acquire makes the directory
+        # first (config::ensure_data_dir), so a fresh one needs no init.
+        let made = makeDir(dir + ".")
         let held = lockFile(dir + "facetql.lock")
         let ld = do stLoad(dir, key, nonceBase)
         let h = FqwHandle{path: dir + "facetql.wal", needsSeparator: false, size: -1}
@@ -1645,8 +1654,7 @@ app FqEngineSelfHost:
     # ── the read path ──────────────────────────────────────────────────
     # enCountRead: reads_total, which every top-level read bumps first.
     proc enCountRead(e: FqEngine) -> FqEngine:
-        let r = do enWith(e, stWithMeta(e.st, metaCount(e.st.meta, 1, 0, 0, 0)))
-        return r
+        return FqEngine{st: stCount(e.st, 1, 0, 0, 0), wal: e.wal, ctr: e.ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users, rd: e.rd, limits: e.limits}
 
     # enGet: get — a counted read of one node.
     proc enGet(e: FqEngine, address: text) -> FqEngNode uses io.file:
@@ -1709,8 +1717,8 @@ app FqEngineSelfHost:
         if !r.ok:
             return FqEngNode{ok: false, err: r.err, eng: r.eng, found: false, node: r.record.node}
         let n = r.record.node
-        let m = do metaRecord(r.eng.st.meta, n.coordinate, byteLen(n.data), false)
-        let e2 = do enWith(r.eng, stWithMeta(r.eng.st, m))
+        let eng1 = r.eng
+        let e2 = FqEngine{st: stRecord(eng1.st, n.coordinate, byteLen(n.data), false), wal: eng1.wal, ctr: eng1.ctr, ck: eng1.ck, applied: eng1.applied, pending: eng1.pending, interval: eng1.interval, rotateBytes: eng1.rotateBytes, walNonce: eng1.walNonce, walSeq: eng1.walSeq, users: eng1.users, rd: eng1.rd, limits: eng1.limits}
         return FqEngNode{ok: true, err: "", eng: e2, found: true, node: n}
 
     # enMultiGet: multi_get — the live nodes among the addresses, those the
@@ -2116,7 +2124,10 @@ app FqEngineSelfHost:
         loop j < nt:
             let t = e.st.ix.text[j].def
             names = append(names, t.name)
-            let r2 = do jIndexInfo(t.name, t.kind, t.field, false, "text")
+            let mut tmode = "text"
+            if t.folded:
+                tmode = "folded"
+            let r2 = do jIndexInfo(t.name, t.kind, t.field, false, tmode)
             rows = append(rows, r2)
             j = j + 1
         let sorted = do enSortRowsByName(names, rows)

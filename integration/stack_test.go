@@ -55,6 +55,10 @@ import (
 func facetqlBinary(t *testing.T) string {
 	t.Helper()
 
+	if !rustReference() {
+		t.Skip("the Rust FacetQL is the parity reference, opt-in: set " + referenceEnv + "=rust")
+	}
+
 	if p := os.Getenv("FACETQL_BIN"); p != "" {
 		checkNotStale(t, p)
 		return p
@@ -129,8 +133,8 @@ func checkNotStale(t *testing.T, bin string) {
 }
 
 // freePort asks the kernel for a port and immediately releases it — racy,
-// and kept only for the fabric front door, which takes a port number and
-// cannot yet say which one it bound. The engine is started on port 0 and
+// and kept only for the processes that cannot yet say which port they
+// bound (selfhost/runtime_server.fct's RT_PORT). The engine is started on port 0 and
 // says which port it got (bannerPort); the app is handed a listener this
 // process bound (runtime.ServeOn). Neither has a window in which another
 // process can take the port first.
@@ -243,6 +247,7 @@ func startEngineIn(t *testing.T, dir string) *engine {
 		e.cmd.Stdout = log
 		e.cmd.Stderr = log
 
+		dieWithParent(e.cmd)
 		if err := e.cmd.Start(); err != nil {
 			t.Fatalf("starting facetql: %v", err)
 		}
@@ -269,11 +274,15 @@ func startEngineIn(t *testing.T, dir string) *engine {
 	}
 }
 
-// selfhostEnv names the harness mode that swaps the Rust engine for the
-// FacetQL server written in fct (selfhost/fqserver.fct), run by this tree's
-// own `facet exec`: the same suite, the same environment, the same wire —
-// only the process on the other end differs.
-const selfhostEnv = "FACETQL_SELFHOST"
+// referenceEnv selects the engine the suite runs against. Unset, it is the
+// FacetQL the toolchain ships — `facet facetql`, the engine written in fct and
+// embedded in the facet binary. FACETQL_REFERENCE=rust runs the same suite,
+// same environment, same wire, against the Rust engine instead: the parity
+// reference, and the only place anything here launches it.
+const referenceEnv = "FACETQL_REFERENCE"
+
+// rustReference reports whether this run is the Rust-reference one.
+func rustReference() bool { return os.Getenv(referenceEnv) == "rust" }
 
 var (
 	facetBuild    sync.Once
@@ -305,52 +314,53 @@ func facetBinary(t *testing.T) string {
 	return facetBinPath
 }
 
-// engineCommand is how the engine process is started: `facetql start`, or —
-// in the selfhost mode — `facet exec selfhost/fqserver.fct`, whose file
-// sandbox is the engine's own data directory.
+// engineCommand is how the engine process is started: `facet facetql`, the
+// engine the toolchain ships (its sources embedded in the facet binary, its
+// file sandbox the data directory), or — in the Rust-reference mode —
+// `facetql start`.
 func engineCommand(t *testing.T, dir string) *exec.Cmd {
 	t.Helper()
 
-	if os.Getenv(selfhostEnv) == "" {
+	if rustReference() {
 		cmd := exec.Command(facetqlBinary(t), "start")
 		cmd.Env = os.Environ()
 		return cmd
 	}
 
-	server, err := filepath.Abs("../selfhost/fqserver.fct")
-	if err != nil {
-		t.Fatalf("locating fqserver.fct: %v", err)
-	}
-	cmd := exec.Command(facetBinary(t), "exec", server)
+	cmd := exec.Command(facetBinary(t), "facetql")
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "FACET_DATA_DIR="+dir)
+	cmd.Env = os.Environ()
 
 	return cmd
 }
 
-// TestSuiteAgainstSelfhostedEngine runs this whole suite a second time with
-// the engine swapped for the self-hosted one, so a plain `go test ./...`
-// proves both: every property here holds whichever FacetQL the runtime is
-// talking to.
-func TestSuiteAgainstSelfhostedEngine(t *testing.T) {
-	if os.Getenv(selfhostEnv) != "" || os.Getenv(frontdoorEnv) != "" {
-		t.Skip("this run is the self-hosted or front-door one")
+// TestSuiteRunsTheShippedEngine pins what every stack test here boots by
+// default: the FacetQL the toolchain ships, `facet facetql` from this tree's
+// facet binary (the fct engine embedded in it) — never a Rust binary unless
+// the run is the Rust-reference one. It then proves the engine it booted is
+// that one by what it answers.
+func TestSuiteRunsTheShippedEngine(t *testing.T) {
+	if rustReference() {
+		t.Skip("this run is the Rust-reference one (" + referenceEnv + "=rust)")
 	}
-	if testing.Short() {
-		t.Skip("the self-hosted pass runs the whole suite again")
+	e := startEngine(t)
+	if e.cmd.Path != facetBinary(t) || len(e.cmd.Args) != 2 || e.cmd.Args[1] != "facetql" {
+		t.Fatalf("the suite booted %q %q, want %q facetql", e.cmd.Path, e.cmd.Args, facetBinary(t))
 	}
-
-	cmd := exec.Command("go", "test", "-count=1", ".")
-	cmd.Env = append(os.Environ(), selfhostEnv+"=1")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("the suite against selfhost/fqserver.fct: %v\n%s", err, out)
+	body, err := e.get("/")
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	if !strings.Contains(string(body), "FacetQL") {
+		t.Fatalf("GET / answered %q, not FacetQL's banner", body)
 	}
 }
 
 // TestSuiteThroughFrontDoor runs this whole suite through the fabric front
-// door written in fct, once in front of the Rust FacetQL and once in front of
-// selfhost/fqserver.fct — the all-fct stack: an fct app, the fct front door,
-// the fct FacetQL server.
+// door written in fct, in front of the FacetQL the toolchain ships — the
+// all-fct stack: an fct app, the fct front door, the fct FacetQL server. (The
+// Rust-reference run, FACETQL_REFERENCE=rust, is the suite's own mode, not a
+// front-door one.)
 //
 // One known gap, the Rust spec's rather than the port's: fabric-facetql's
 // frontdoor/plan.rs classifies no route for POST /nodes/aggregate, POST
@@ -360,8 +370,8 @@ func TestSuiteAgainstSelfhostedEngine(t *testing.T) {
 // set (logged as "aggregate failed"), which is why the suite still passes.
 // Classifying those routes belongs in plan.rs first.
 func TestSuiteThroughFrontDoor(t *testing.T) {
-	if os.Getenv(frontdoorEnv) != "" || os.Getenv(selfhostEnv) != "" {
-		t.Skip("this run is already a front-door or self-hosted one")
+	if os.Getenv(frontdoorEnv) != "" || rustReference() {
+		t.Skip("this run is already a front-door or Rust-reference one")
 	}
 	if testing.Short() {
 		t.Skip("the front-door passes run the whole suite again")
@@ -371,8 +381,7 @@ func TestSuiteThroughFrontDoor(t *testing.T) {
 		name string
 		env  []string
 	}{
-		{"rust-facetql", []string{frontdoorEnv + "=1"}},
-		{"fct-facetql", []string{frontdoorEnv + "=1", selfhostEnv + "=1"}},
+		{"fct-facetql", []string{frontdoorEnv + "=1"}},
 	} {
 		t.Run(mode.name, func(t *testing.T) {
 			cmd := exec.Command("go", "test", "-count=1", ".")
@@ -439,7 +448,7 @@ func (e *engine) get(path string) ([]byte, error) {
 // frontdoorEnv names the harness mode that puts the fabric front door —
 // written in fct, selfhost/fabric_frontdoor_main.fct, run by `facet exec` —
 // between the runtime and the engine: FACET_DATABASE_URL names the door, the
-// door forwards to the engine. With selfhostEnv as well, every process on the
+// door forwards to the engine. With the default engine, every process on the
 // data path is fct.
 const frontdoorEnv = "FACET_FRONTDOOR"
 
@@ -454,42 +463,57 @@ func (e *engine) startDoor(dir string) {
 		e.t.Fatalf("locating fabric_frontdoor_main.fct: %v", err)
 	}
 	backend := e.port
-	for attempt := 1; ; attempt++ {
-		port := freePort(e.t)
-		log, err := os.Create(filepath.Join(dir, "frontdoor.log"))
-		if err != nil {
-			e.t.Fatalf("front door log: %v", err)
-		}
-		e.door = exec.Command(facetBinary(e.t), "exec", main)
-		e.door.Env = append(os.Environ(),
-			fmt.Sprintf("FRONTDOOR_PORT=%d", port),
-			fmt.Sprintf("FRONTDOOR_BACKENDS=db-a=http://127.0.0.1:%d", backend),
-		)
-		e.door.Stdout = log
-		e.door.Stderr = log
-		if err := e.door.Start(); err != nil {
-			e.t.Fatalf("starting the front door: %v", err)
-		}
-		e.doorDone = make(chan struct{})
-		go func(cmd *exec.Cmd, done chan struct{}) {
-			_ = cmd.Wait()
-			close(done)
-			log.Close()
-		}(e.door, e.doorDone)
+	// Port 0: the door binds whatever the kernel gives it and names it in
+	// its banner ("fabric front door serving on port N"), as the engine
+	// does — no port is chosen here that another process could take first.
+	logPath := filepath.Join(dir, "frontdoor.log")
+	log, err := os.Create(logPath)
+	if err != nil {
+		e.t.Fatalf("front door log: %v", err)
+	}
+	e.door = exec.Command(facetBinary(e.t), "exec", main)
+	e.door.Env = append(os.Environ(),
+		"FRONTDOOR_PORT=0",
+		fmt.Sprintf("FRONTDOOR_BACKENDS=db-a=http://127.0.0.1:%d", backend),
+	)
+	e.door.Stdout = log
+	e.door.Stderr = log
+	dieWithParent(e.door)
+	if err := e.door.Start(); err != nil {
+		e.t.Fatalf("starting the front door: %v", err)
+	}
+	e.doorDone = make(chan struct{})
+	go func(cmd *exec.Cmd, done chan struct{}) {
+		_ = cmd.Wait()
+		close(done)
+		log.Close()
+	}(e.door, e.doorDone)
 
-		e.port = port
-		if e.waitDoor() {
-			return
+	e.port = 0
+	for deadline := time.Now().Add(60 * time.Second); e.port == 0; time.Sleep(20 * time.Millisecond) {
+		body, _ := os.ReadFile(logPath)
+		if m := doorBannerRE.FindSubmatch(body); m != nil {
+			fmt.Sscanf(string(m[1]), "%d", &e.port)
+			break
 		}
+		select {
+		case <-e.doorDone:
+			e.t.Fatalf("the front door exited before it served; log:\n%s", body)
+		default:
+		}
+		if time.Now().After(deadline) {
+			e.stopDoor()
+			e.t.Fatalf("the front door never said which port it bound; log:\n%s", body)
+		}
+	}
+	if !e.waitDoor() {
 		e.stopDoor()
-		body, _ := os.ReadFile(filepath.Join(dir, "frontdoor.log"))
-		if attempt < 5 && strings.Contains(string(body), "address already in use") {
-			e.port = backend
-			continue
-		}
+		body, _ := os.ReadFile(logPath)
 		e.t.Fatalf("the front door never became ready (%v); log:\n%s", e.lastDoorErr, body)
 	}
 }
+
+var doorBannerRE = regexp.MustCompile(`fabric front door serving on port (\d+)`)
 
 // waitDoor is waitReady for the door: false as soon as its process exits.
 func (e *engine) waitDoor() bool {

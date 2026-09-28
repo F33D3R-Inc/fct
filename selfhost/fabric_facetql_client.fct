@@ -35,33 +35,82 @@ app FabricFacetqlClientSelfHost:
         body: text
         context: text
         message: text
+        # Status only: the engine's Retry-After in seconds, when it gave one
+        # (error.rs `retry_after_secs`) — how long a 429 or 503 asks the
+        # caller to wait. See fqlRetryAfterSecs.
+        hasRetryAfter: bool
+        retryAfterSecs: int
 
     proc fqlErrNone() -> FqlError:
-        return FqlError{kind: "", status: 0, body: "", context: "", message: ""}
+        return FqlError{kind: "", status: 0, body: "", context: "", message: "", hasRetryAfter: false, retryAfterSecs: 0}
 
     proc fqlErrConfiguration(message: text) -> FqlError:
-        return FqlError{kind: "Configuration", status: 0, body: "", context: "", message: message}
+        return FqlError{kind: "Configuration", status: 0, body: "", context: "", message: message, hasRetryAfter: false, retryAfterSecs: 0}
 
     proc fqlErrTransport(message: text) -> FqlError:
-        return FqlError{kind: "Transport", status: 0, body: "", context: "", message: message}
+        return FqlError{kind: "Transport", status: 0, body: "", context: "", message: message, hasRetryAfter: false, retryAfterSecs: 0}
 
     proc fqlErrUnauthorized(status: int, body: text) -> FqlError:
-        return FqlError{kind: "Unauthorized", status: status, body: body, context: "", message: ""}
+        return FqlError{kind: "Unauthorized", status: status, body: body, context: "", message: "", hasRetryAfter: false, retryAfterSecs: 0}
 
     proc fqlErrPreconditionFailed(body: text) -> FqlError:
-        return FqlError{kind: "PreconditionFailed", status: 0, body: body, context: "", message: ""}
+        return FqlError{kind: "PreconditionFailed", status: 0, body: body, context: "", message: "", hasRetryAfter: false, retryAfterSecs: 0}
 
     proc fqlErrConflict(body: text) -> FqlError:
-        return FqlError{kind: "Conflict", status: 0, body: body, context: "", message: ""}
+        return FqlError{kind: "Conflict", status: 0, body: body, context: "", message: "", hasRetryAfter: false, retryAfterSecs: 0}
 
     proc fqlErrNotFound(body: text) -> FqlError:
-        return FqlError{kind: "NotFound", status: 0, body: body, context: "", message: ""}
+        return FqlError{kind: "NotFound", status: 0, body: body, context: "", message: "", hasRetryAfter: false, retryAfterSecs: 0}
 
     proc fqlErrStatus(status: int, body: text) -> FqlError:
-        return FqlError{kind: "Status", status: status, body: body, context: "", message: ""}
+        return FqlError{kind: "Status", status: status, body: body, context: "", message: "", hasRetryAfter: false, retryAfterSecs: 0}
+
+    proc fqlErrStatusRetry(status: int, body: text, retry: FqlRetryAfter) -> FqlError:
+        return FqlError{kind: "Status", status: status, body: body, context: "", message: "", hasRetryAfter: retry.has, retryAfterSecs: retry.secs}
+
+    struct FqlRetryAfter:
+        has: bool
+        secs: int
+
+    # client.rs `retry_after_secs`: a Retry-After header's delay-seconds (RFC
+    # 9110: 1*DIGIT), whitespace around it ignored; the HTTP-date form, a
+    # signed or fractional number, or one past u64 is no delay, and reads
+    # as none.
+    proc fqlRetryAfterSecs(present: bool, value: text) -> FqlRetryAfter:
+        let none = FqlRetryAfter{has: false, secs: 0}
+        if !present:
+            return none
+        let v = trim(value)
+        let bs = textToBytes(v)
+        if len(bs) == 0:
+            return none
+        let mut k = 0
+        loop k < len(bs):
+            if bs[k] < 48 || bs[k] > 57:
+                return none
+            k = k + 1
+        if u64ParseError(v) != "":
+            return none
+        return FqlRetryAfter{has: true, secs: u64Parse(v)}
+
+    # client.rs `retry_after_header`: the header's value as
+    # HeaderValue::to_str reads it (visible ASCII, tab allowed; anything
+    # else is no value), then its delay-seconds.
+    proc fqlRetryAfterOf(headers: [HttpHeader]) -> FqlRetryAfter:
+        let present = do httpHasHeader(headers, "retry-after")
+        let value = do httpHeaderValue(headers, "retry-after")
+        let raw = textToBytes(value)
+        let mut visible = true
+        let mut i = 0
+        loop i < len(raw):
+            if raw[i] > 126 || (raw[i] < 32 && raw[i] != 9):
+                visible = false
+            i = i + 1
+        let r = do fqlRetryAfterSecs(present && visible, value)
+        return r
 
     proc fqlErrDecode(context: text, message: text) -> FqlError:
-        return FqlError{kind: "Decode", status: 0, body: "", context: context, message: message}
+        return FqlError{kind: "Decode", status: 0, body: "", context: context, message: message, hasRetryAfter: false, retryAfterSecs: 0}
 
     # fqlErrorImpliesUnhealthy: FacetqlError::implies_unhealthy.
     proc fqlErrorImpliesUnhealthy(e: FqlError) -> bool:
@@ -244,7 +293,7 @@ app FabricFacetqlClientSelfHost:
             return FqlSendR{ok: false, err: fqlErrConflict(r.body), body: ""}
         if r.status == 412:
             return FqlSendR{ok: false, err: fqlErrPreconditionFailed(r.body), body: ""}
-        return FqlSendR{ok: false, err: fqlErrStatus(r.status, r.body), body: ""}
+        return FqlSendR{ok: false, err: fqlErrStatusRetry(r.status, r.body, fqlRetryAfterOf(r.headers)), body: ""}
 
     proc fqlPostJson(c: FqlClient, path: text, payload: text, context: text) -> FqlSendR uses io.net:
         let r = do fqlSend(c, "POST", fqlEndpointUrl(c.endpoint, path), true, payload, context)
@@ -428,7 +477,7 @@ app FabricFacetqlClientSelfHost:
             let closed = do httpStreamClose(s)
             if s.status == 401 || s.status == 403:
                 return FqlEventsResult{ok: false, err: fqlErrUnauthorized(s.status, body), stream: s}
-            return FqlEventsResult{ok: false, err: fqlErrStatus(s.status, body), stream: s}
+            return FqlEventsResult{ok: false, err: fqlErrStatusRetry(s.status, body, fqlRetryAfterOf(s.headers)), stream: s}
         let none = do fqlErrNone()
         return FqlEventsResult{ok: true, err: none, stream: s}
 
@@ -444,7 +493,10 @@ app FabricFacetqlClientSelfHost:
     # ── renderings shared by the tests ────────────────────────────────
     # fqlErrLine: `ERR <variant> <implies_unhealthy> <Display>`.
     proc fqlErrLine(e: FqlError) -> text:
-        return "ERR " + e.kind + " " + fqlBoolText(fqlErrorImpliesUnhealthy(e)) + " " + fqlErrorDisplay(e)
+        let mut retry = ""
+        if e.kind == "Status" && e.hasRetryAfter:
+            retry = " retry-after=" + sjU64Text(e.retryAfterSecs)
+        return "ERR " + e.kind + " " + fqlBoolText(fqlErrorImpliesUnhealthy(e)) + " " + fqlErrorDisplay(e) + retry
 
     proc fqlNodesJson(nodes: [FqlNode]) -> text:
         let mut parts = []
@@ -520,11 +572,22 @@ app FabricFacetqlClientSelfHost:
         if kind == "NotFound":
             e = fqlErrNotFound(a)
         if kind == "Status":
-            e = fqlErrStatus(status, a)
+            e = fqlErrStatusRetry(status, a, fqlRetryAfterSecs(b != "", b))
         if kind == "Decode":
             e = fqlErrDecode(a, b)
         let l = do fqlErrLine(e)
         return l
+
+    # One Retry-After value (`-` for no header): its seconds, or `-`.
+    proc fqlRetryAfterShown(value: text) -> text:
+        let parsed = do fqlRetryAfterSecs(value != "-", value)
+        if parsed.has:
+            return sjU64Text(parsed.secs)
+        return "-"
+
+    action fqlRetryAfterRun(value: text):
+        let shown = do fqlRetryAfterShown(value)
+        fqlClientOut = shown
 
     action fqlErrorRun(kind: text, status: int, a: text, b: text):
         let r = do fqlErrorLineFor(kind, status, a, b)

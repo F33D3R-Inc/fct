@@ -37,6 +37,22 @@ type readGrants struct {
 	mu    sync.Mutex
 	argv  []string
 	files map[string]bool
+	// dirs: directories granted by grantDir — every file under one is
+	// readable and writable, as the data directory's are (see ioGrantDir).
+	dirs map[string]bool
+}
+
+// coversDir reports whether full (absolute and clean) is a granted
+// directory or lies under one.
+func (g *readGrants) coversDir(full string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for d := range g.dirs {
+		if full == d || strings.HasPrefix(full, d+string(os.PathSeparator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *readGrants) setArgv(args []string) {
@@ -45,14 +61,21 @@ func (g *readGrants) setArgv(args []string) {
 	g.mu.Unlock()
 }
 
-// operatorNamed reports whether path is one of the process's arguments or
-// the value of one of its environment variables.
+// operatorNamed reports whether path is one of the process's arguments (or
+// the value of a `--name=value` one) or the value of one of its environment
+// variables.
 func (g *readGrants) operatorNamed(path string) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for _, a := range g.argv {
 		if a == path {
 			return true
+		}
+		// `--name=value` names value as surely as `--name value` does.
+		if strings.HasPrefix(a, "-") {
+			if _, v, ok := strings.Cut(a, "="); ok && v == path {
+				return true
+			}
 		}
 	}
 	for _, kv := range os.Environ() {
@@ -107,10 +130,69 @@ func (s *Server) resolveReadPath(path string) (string, error) {
 			s.grants.mu.Lock()
 			granted := s.grants.files[full]
 			s.grants.mu.Unlock()
-			if granted {
+			if granted || s.grants.coversDir(full) {
 				return full, nil
 			}
 		}
 	}
 	return s.resolveDataPath(path)
+}
+
+// ioGrantDir implements `grantDir(path: text) -> bool` (io.file, main
+// only): a directory the operator named — an argument or an environment
+// variable's value, exactly as grantRead's file — becomes a second place
+// the io.file builtins may read and write, for the life of the process.
+// It is what a command that takes a directory from its operator needs (a
+// backup's destination, a restore's source): the data directory stays the
+// sandbox for everything else, and a path the program computed can never
+// widen it. false when the operator did not name path.
+func (s *Server) ioGrantDir(path string) (any, error) {
+	if path == "" || !s.grants.operatorNamed(path) {
+		return false, nil
+	}
+	full, err := s.grantedPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("grantDir: %w", err)
+	}
+	s.grants.mu.Lock()
+	if s.grants.dirs == nil {
+		s.grants.dirs = map[string]bool{}
+	}
+	s.grants.dirs[full] = true
+	s.grants.mu.Unlock()
+	return true, nil
+}
+
+// GrantDir is grantDir for the embedder: the toolchain launching a program
+// it ships (`facet facetql` running the FacetQL engine) grants the
+// directory it resolved for it — the database's data directory, which the
+// engine names by the path its operator configured.
+func (s *Server) GrantDir(path string) error {
+	full, err := s.grantedPath(path)
+	if err != nil {
+		return err
+	}
+	s.grants.mu.Lock()
+	defer s.grants.mu.Unlock()
+	if s.grants.dirs == nil {
+		s.grants.dirs = map[string]bool{}
+	}
+	s.grants.dirs[full] = true
+	return nil
+}
+
+// GrantFile is grantRead for the embedder: one file made readable (a TLS
+// identity the operator configured, wherever it lives).
+func (s *Server) GrantFile(path string) error {
+	full, err := s.grantedPath(path)
+	if err != nil {
+		return err
+	}
+	s.grants.mu.Lock()
+	defer s.grants.mu.Unlock()
+	if s.grants.files == nil {
+		s.grants.files = map[string]bool{}
+	}
+	s.grants.files[full] = true
+	return nil
 }

@@ -393,8 +393,8 @@ func (s *Server) applyRemoteChange(entities []string) {
 		if err != nil {
 			continue
 		}
-		s.entities[ent] = rows
-		// keep the id counter ahead of anything a peer inserted.
+		// keep the id counter ahead of anything a peer inserted — archived
+		// rows included, since their ids are taken too.
 		for _, r := range rows {
 			if m, ok := r.(record); ok {
 				if id := toInt(m["id"]); id > s.nextID[ent] {
@@ -402,7 +402,15 @@ func (s *Server) applyRemoteChange(entities []string) {
 				}
 			}
 		}
-		deltas[ent] = rows
+		// The working set holds what boot holds (liveRows): a @softdelete
+		// row a peer archived leaves every instance, not just the one that
+		// archived it.
+		live := rows
+		if e, ok := s.entityByName(ent); ok {
+			live = liveRows(rows, e.SoftDelete)
+		}
+		s.entities[ent] = live
+		deltas[ent] = live
 	}
 	s.mu.Unlock()
 	s.fanout(deltas)

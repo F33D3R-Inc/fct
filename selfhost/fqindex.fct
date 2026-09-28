@@ -60,6 +60,20 @@ app FqIndexSelfHost:
     proc ixTreeNonce(ix: FqIndexes) -> int:
         return (ix.nonceBase * 4096 + ix.opens) % 4294967296
 
+    # ixReadOnly: every tree's pager as a read-only view (pgrReadOnly).
+    proc ixReadOnly(ix: FqIndexes) -> FqIndexes:
+        let mut data = []
+        let mut i = 0
+        loop i < len(ix.data):
+            data = append(data, FqDataIx{def: ix.data[i].def, tree: btReadOnly(ix.data[i].tree)})
+            i = i + 1
+        let mut text = []
+        let mut j = 0
+        loop j < len(ix.text):
+            text = append(text, FqTextIx{def: ix.text[j].def, tree: btReadOnly(ix.text[j].tree)})
+            j = j + 1
+        return FqIndexes{dir: ix.dir, key: ix.key, nonceBase: ix.nonceBase, opens: ix.opens, primary: btReadOnly(ix.primary), kind: btReadOnly(ix.kind), owner: btReadOnly(ix.owner), edgeOut: btReadOnly(ix.edgeOut), edgeIn: btReadOnly(ix.edgeIn), history: btReadOnly(ix.history), data: data, text: text}
+
     proc ixOpenTree(ix: FqIndexes, name: text) -> FqBtR uses io.file:
         let nb = do ixTreeNonce(ix)
         let r = do btOpen(ixPath(ix.dir, name), ix.key, nb, 64)
@@ -170,7 +184,7 @@ app FqIndexSelfHost:
         loop i < n:
             if ix.text[i].def.name == def.name:
                 let d = ix.text[i].def
-                if d.kind == def.kind && d.field == def.field:
+                if d.kind == def.kind && d.field == def.field && d.folded == def.folded:
                     kept = true
                     keptIx = ix.text[i]
             else:
@@ -273,6 +287,20 @@ app FqIndexSelfHost:
         return FqCounts{reads: 0, writes: 0, userLog: 0, horizon: 0, horizonMax: false, cellKeys: zeros, cellReads: zeros, cellWrites: zeros, cellBytesRead: zeros, cellBytesWritten: zeros, overflowReads: 0, overflowWrites: 0, unattributed: 0, claims: []}
 
     proc stWithMeta(st: FqStore, m: FqCounts) -> FqStore:
+        return FqStore{heap: st.heap, ix: st.ix, references: st.references, nonceBase: st.nonceBase, seq: st.seq, meta: m}
+
+    # stRecord / stCount: metaRecord / metaCount on the store's own
+    # counters. The store is rebuilt from its sibling fields, so nothing
+    # reads it whole after its counters are taken: an owned store hands
+    # its cell tables to the update, which writes them in place (reading
+    # st.meta and then passing st whole, as stWithMeta(st, metaX(st.meta))
+    # does, copies all five 256-slot tables on every counted read/write).
+    proc stRecord(st: FqStore, c: Coordinate, nbytes: int, write: bool) -> FqStore:
+        let m = do metaRecord(st.meta, c, nbytes, write)
+        return FqStore{heap: st.heap, ix: st.ix, references: st.references, nonceBase: st.nonceBase, seq: st.seq, meta: m}
+
+    proc stCount(st: FqStore, reads: int, writes: int, userLog: int, unattributed: int) -> FqStore:
+        let m = do metaCount(st.meta, reads, writes, userLog, unattributed)
         return FqStore{heap: st.heap, ix: st.ix, references: st.references, nonceBase: st.nonceBase, seq: st.seq, meta: m}
 
     # metaSlot: CellTable::slot — the slot a packed key lives in (claimed
@@ -492,10 +520,14 @@ app FqIndexSelfHost:
         loop k < nt:
             let c2 = FqwCur{buf: tl.records[k].record, pos: 0, err: ""}
             let tag2 = do fqwGetUint(c2, 4)
-            if tag2.v == 0:
+            # Put (0), PutFolded (2): a definition; Drop (1): a name
+            if tag2.v == 0 || tag2.v == 2:
                 let gt = do fqwGetTextIndexDef(tag2.cur)
-                let rest3 = do ixTextDefsWithout(tdefs, gt.def.name)
-                tdefs = append(rest3, gt.def)
+                let mut tdef = gt.def
+                if tag2.v == 2:
+                    tdef = textIndexDefFolded(tdef)
+                let rest3 = do ixTextDefsWithout(tdefs, tdef.name)
+                tdefs = append(rest3, tdef)
             else:
                 let s2 = do fqwGetString(tag2.cur)
                 let rest4 = do ixTextDefsWithout(tdefs, s2.v)
@@ -649,10 +681,9 @@ app FqIndexSelfHost:
     # its read recorded against its cell (node_at's record_read).
     proc stNodeAt(st: FqStore, address: text) -> FqStNode uses io.file:
         let r = do stPeekNode(st, address)
-        if r.found:
-            let m = do metaRecord(r.store.meta, r.node.coordinate, byteLen(r.node.data), false)
-            return FqStNode{ok: true, err: "", store: stWithMeta(r.store, m), found: true, loc: r.loc, node: r.node}
-        return r
+        if !r.found:
+            return r
+        return FqStNode{ok: true, err: "", store: stRecord(r.store, r.node.coordinate, byteLen(r.node.data), false), found: true, loc: r.loc, node: r.node}
 
     # stPeekNode: the same lookup, counted nowhere (a test harness looking).
     proc stPeekNode(st: FqStore, address: text) -> FqStNode uses io.file:
@@ -684,11 +715,39 @@ app FqIndexSelfHost:
         let k = do concatBytes(enc, textToBytes(address))
         return k
 
-    # stDataKeys: assert_data_keys (put) or retract_data_keys (remove) —
-    # one key per ordered index over the node's kind.
-    proc stDataKeys(st0: FqStore, node: Node, put: bool) -> FqStoreR uses io.file:
-        let mut st = st0
+    # stIndexKeys: assert_data_keys then assert_text_keys (put), or the
+    # retracts — the node's data parsed once for both, and not at all when
+    # no ordered or text index covers its kind.
+    proc stIndexKeys(st: FqStore, node: Node, put: bool) -> FqStoreR uses io.file:
+        let covered = do stKindIndexed(st.ix, node.kind)
+        if !covered:
+            return FqStoreR{ok: true, err: "", store: st}
         let parsed = do fjParse(node.data)
+        let d = do stDataKeys(st, node, parsed, put)
+        if !d.ok:
+            return d
+        let t = do stTextKeys(d.store, node, parsed, put)
+        return t
+
+    proc stKindIndexed(ix: FqIndexes, kind: text) -> bool:
+        let nd = len(ix.data)
+        let mut i = 0
+        loop i < nd:
+            if ix.data[i].def.kind == kind:
+                return true
+            i = i + 1
+        let nt = len(ix.text)
+        let mut j = 0
+        loop j < nt:
+            if ix.text[j].def.kind == kind:
+                return true
+            j = j + 1
+        return false
+
+    # stDataKeys: assert_data_keys (put) or retract_data_keys (remove) —
+    # one key per ordered index over the node's kind, from its parsed data.
+    proc stDataKeys(st0: FqStore, node: Node, parsed: FqJR, put: bool) -> FqStoreR uses io.file:
+        let mut st = st0
         let mut data = st.ix.data
         let n = len(data)
         let mut i = 0
@@ -717,9 +776,8 @@ app FqIndexSelfHost:
     # stTextKeys: assert_text_keys / retract_text_keys — one posting per
     # distinct gram of the field's string value (absent, or not a string,
     # posts nothing).
-    proc stTextKeys(st0: FqStore, node: Node, put: bool) -> FqStoreR uses io.file:
+    proc stTextKeys(st0: FqStore, node: Node, parsed: FqJR, put: bool) -> FqStoreR uses io.file:
         let mut st = st0
-        let parsed = do fjParse(node.data)
         let mut text = st.ix.text
         let n = len(text)
         let mut i = 0
@@ -727,7 +785,11 @@ app FqIndexSelfHost:
             if text[i].def.kind == node.kind && parsed.ok:
                 let g = do fjGet(parsed.v, text[i].def.field)
                 if g.ok && g.v.kind == "str":
-                    let gs = do grams(g.v.s)
+                    # a folded index posts the windows of the text lowered
+                    let mut indexed = g.v.s
+                    if text[i].def.folded:
+                        indexed = lower(g.v.s)
+                    let gs = do grams(indexed)
                     let ng = len(gs)
                     let mut t = text[i].tree
                     let mut j = 0
@@ -830,7 +892,7 @@ app FqIndexSelfHost:
             if isText:
                 let at3 = do stTextIxAt(st.ix, name)
                 let only = do ixSets(st.ix, st.ix.opens, st.ix.data, [st.ix.text[at3]])
-                let r = do stTextKeys(stWith(st, st.heap, only), nd, true)
+                let r = do stTextKeys(stWith(st, st.heap, only), nd, fjParse(nd.data), true)
                 let mut text = st.ix.text
                 text[at3] = r.store.ix.text[0]
                 st = do stWith(r.store, r.store.heap, ixSets(st.ix, st.ix.opens, st.ix.data, text))
@@ -914,25 +976,18 @@ app FqIndexSelfHost:
                 return p3
             st = p3.store
             if prev.found:
-                let rd = do stDataKeys(st, prev.node, false)
-                if !rd.ok:
-                    return rd
-                let rt = do stTextKeys(rd.store, prev.node, false)
+                let rt = do stIndexKeys(st, prev.node, false)
                 if !rt.ok:
                     return rt
                 st = rt.store
-            let ad = do stDataKeys(st, node, true)
-            if !ad.ok:
-                return ad
-            let at = do stTextKeys(ad.store, node, true)
+            let at = do stIndexKeys(st, node, true)
             if !at.ok:
                 return at
             st = at.store
             if prev.found:
                 let h = do hpMarkObsolete(st.heap, prev.loc)
                 st = do stWith(st, h, st.ix)
-            let mw = do metaRecord(metaCount(st.meta, 0, 1, 0, 0), node.coordinate, byteLen(node.data), true)
-            st = do stWithMeta(st, mw)
+            st = do stRecord(stCount(st, 0, 1, 0, 0), node.coordinate, byteLen(node.data), true)
             return FqStoreR{ok: true, err: "", store: st}
         if op.tag == "delete":
             let cur = do stNodeAt(st, op.name)
@@ -951,19 +1006,15 @@ app FqIndexSelfHost:
                 let d3 = do stRemove(d2.store, "owner", indexOwnerKey(node2.owner, op.name))
                 if !d3.ok:
                     return d3
-                let d4 = do stDataKeys(d3.store, node2, false)
-                if !d4.ok:
-                    return d4
-                let d5 = do stTextKeys(d4.store, node2, false)
+                let d5 = do stIndexKeys(d3.store, node2, false)
                 if !d5.ok:
                     return d5
                 st = d5.store
                 let h2 = do hpMarkObsolete(st.heap, cur.loc)
                 st = do stWith(st, h2, st.ix)
-                let md = do metaRecord(metaCount(st.meta, 0, 1, 0, 0), node2.coordinate, byteLen(node2.data), true)
-                st = do stWithMeta(st, md)
+                st = do stRecord(stCount(st, 0, 1, 0, 0), node2.coordinate, byteLen(node2.data), true)
             else:
-                st = do stWithMeta(st, metaCount(st.meta, 0, 1, 0, 1))
+                st = do stCount(st, 0, 1, 0, 1)
             return FqStoreR{ok: true, err: "", store: st}
         if op.tag == "insert_edge" || op.tag == "delete_edge":
             let mut from = op.edge.from
@@ -985,7 +1036,7 @@ app FqIndexSelfHost:
                 if !m2.ok:
                     return m2
                 st = m2.store
-            st = do stWithMeta(st, metaCount(st.meta, 0, 1, 0, 1))
+            st = do stCount(st, 0, 1, 0, 1)
             if op.tag == "delete_edge":
                 let x1 = do stRemove(st, "edge_out", outKey)
                 if !x1.ok:
@@ -1012,7 +1063,7 @@ app FqIndexSelfHost:
             let ul = do stLog(st, "facetql.users", ub)
             if !ul.ok:
                 return ul
-            return FqStoreR{ok: true, err: "", store: stWithMeta(ul.store, metaCount(ul.store.meta, 0, 0, 1, 0))}
+            return FqStoreR{ok: true, err: "", store: stCount(ul.store, 0, 0, 1, 0)}
         if op.tag == "create_index":
             let t0 = do fqwPutUint([], 0, 4)
             let rec2 = do fqwPutIndexDef(t0, op.indexDef)
@@ -1055,7 +1106,11 @@ app FqIndexSelfHost:
             let refs2 = do ixRefsWithout(st.references, op.name)
             return FqStoreR{ok: true, err: "", store: FqStore{heap: st.heap, ix: st.ix, references: refs2, nonceBase: st.nonceBase, seq: st.seq, meta: st.meta}}
         if op.tag == "create_text_index":
-            let t2 = do fqwPutUint([], 0, 4)
+            # TextIndexOpRecord::put: Put (0), or PutFolded (2) for a folded index
+            let mut putTag = 0
+            if op.textIndexDef.folded:
+                putTag = 2
+            let t2 = do fqwPutUint([], putTag, 4)
             let rec6 = do fqwPutTextIndexDef(t2, op.textIndexDef)
             let l5 = do stLog(st, "facetql.text_indexes", rec6)
             if !l5.ok:

@@ -88,6 +88,7 @@ func (s *Server) ServeOn(ln net.Listener) error {
 // Shutdown releases the server's background resources: job workers, the cluster
 // listener, and the database. Safe to call once after Serve returns.
 func (s *Server) Shutdown() {
+	s.haltProgram()
 	s.jobs.stopAll()
 	if s.cluster != nil && s.cluster.cancel != nil {
 		s.cluster.cancel()

@@ -230,7 +230,64 @@ app RenderHTML:
             i = i + 1
         return false
 
+    # The graph's name tables, built once at boot (rtIndexNames): a lookup
+    # by name costs the same in an app of 150 entities as in one of 3.
+    # RtNameIndex: name → position, and how many of each the indexed graph
+    # has — a miss is final for that graph (a name that is not there is
+    # answered without a scan, which is most lookups: every identifier an
+    # expression reads is asked whether it names an entity).
+    struct RtNameIndex:
+        ents: {text: int}
+        acts: {text: int}
+        procs: {text: int}
+        entNames: {text: int}
+        nEnts: int
+        nActs: int
+        nProcs: int
+        nEntNames: int
+
+    shared rtNames: RtNameIndex
+
+    proc rtIndexNames(g: IRGraph, entNames: [text]) -> int:
+        let mut ea = {}
+        let mut i = 0
+        loop i < len(g.entities):
+            if !(g.entities[i].name in ea):
+                ea[g.entities[i].name] = i
+            i = i + 1
+        let mut aa = {}
+        let mut j = 0
+        loop j < len(g.actions):
+            if !(g.actions[j].name in aa):
+                aa[g.actions[j].name] = j
+            j = j + 1
+        let mut pa = {}
+        let mut k = 0
+        loop k < len(g.procs):
+            if !(g.procs[k].name in pa):
+                pa[g.procs[k].name] = k
+            k = k + 1
+        let mut na = {}
+        let mut m = 0
+        loop m < len(entNames):
+            if !(entNames[m] in na):
+                na[entNames[m]] = m
+            m = m + 1
+        rtNames = RtNameIndex{ents: ea, acts: aa, procs: pa, entNames: na, nEnts: len(g.entities), nActs: len(g.actions), nProcs: len(g.procs), nEntNames: len(entNames)}
+        return 0
+
+    # rtEntityIndex: the entity's position — from the boot-time table when
+    # it describes this graph (it always does in a running runtime), else
+    # by scanning.
     proc rtEntityIndex(g: IRGraph, name: text) -> int:
+        let idx = rtNames
+        if idx.nEnts == len(g.entities) && idx.nEnts > 0:
+            if name in idx.ents:
+                let p = idx.ents[name]
+                if g.entities[p].name == name:
+                    return p
+            else:
+                return -1
         let mut i = 0
         loop i < len(g.entities):
             if g.entities[i].name == name:
@@ -670,6 +727,8 @@ app RenderHTML:
             out = do rtStoreSortRows(filtered, n.order, n.desc)
         else:
             out = do rtSortRows(filtered, n.order, n.desc)
+        if len(n.orderBy) > 0:
+            out = do rtSortRowsBy(out, n.itemVar, n.orderBy[0], n.desc, sc)
         if len(n.limit) > 0:
             let lr = do rtEval(n.limit[0], sc, bases[10])
             sc = lr.sc
@@ -730,6 +789,25 @@ app RenderHTML:
 
     proc rtListRowsMore(pg: RtPage, sc0: RtScope, n: IRNode, bases: [int]) -> RtRows uses io.net:
         let mut sc = sc0
+        # A computed ordering (`for … by <expr>`) is not a column a store
+        # sorts on: every matching row is read, keyed per row, then capped.
+        if len(n.orderBy) > 0:
+            let mut all = n
+            all.orderBy = []
+            all.limit = []
+            all.more = ""
+            let got = do rtListRowsMore(pg, sc, all, bases)
+            sc = got.sc
+            let mut sorted = do rtSortRowsBy(got.rows, n.itemVar, n.orderBy[0], n.desc, sc)
+            if len(n.limit) > 0:
+                let lr = do rtEval(n.limit[0], sc, bases[10])
+                sc = lr.sc
+                let lim = do valToInt(lr.v)
+                if lim <= 0:
+                    return RtRows{rows: [], more: false, sc: sc}
+                if len(sorted) > lim:
+                    sorted = slice(sorted, 0, lim)
+            return RtRows{rows: sorted, more: false, sc: sc}
         let coll = do rtGet(sc, n.coll)
         let ei = do rtEntityIndex(pg.g, n.coll)
         # A table's rows come back from the store (memStore.Query: ordered by
@@ -760,6 +838,16 @@ app RenderHTML:
                 let bound2 = do rtRenameRowVar(rp2[0], n.itemVar)
                 let folded2 = do rtFoldOuter(bound2, n.itemVar, sc, -1)
                 sc = folded2
+        # hoistResidual: a residual's correlated aggregates are asked for the
+        # page's candidate rows up front — and asking them evaluates each
+        # one's outer parts at the list's path, which records what they reach
+        # (not for `limit 0`, which asks the store nothing)
+        let mut hoistable = store && len(probe0.where) > 0
+        if hoistable && len(n.limit) > 0:
+            let hl = do rtEval(n.limit[0], sc, -1)
+            hoistable = valToInt(hl.v) > 0
+        if hoistable:
+            sc = do rtHoistResidual(coll.items, probe0, sc, bases, len(n.where) > 0 && len(rtReadPolicyOf(n.coll)) > 0)
         if n.more == "" || len(n.limit) == 0:
             if ei >= 0 && len(n.limit) > 0:
                 # listRows' store path: `limit 0` asks for nothing.
@@ -789,6 +877,152 @@ app RenderHTML:
             return RtRows{rows: slice(r2.v.items, 0, limit), more: true, sc: r2.sc}
         return RtRows{rows: r2.v.items, more: false, sc: r2.sc}
 
+    # ── hoistResidual (region.go) ────────────────────────────────────────
+    # RtConj: one top-level conjunct of a list's predicate, with the page
+    # address of its first aggregate (-1: no address — a read policy's).
+    struct RtConj:
+        e: IRExpr
+        base: int
+
+    proc rtConjuncts(e: IRExpr, base: int) -> [RtConj]:
+        if e.kind == "bin" && e.op == "&&" && len(e.l) > 0 && len(e.r) > 0:
+            let a = do rtConjuncts(e.l[0], base)
+            let b = do rtConjuncts(e.r[0], rtBaseAfter(base, e.l))
+            return a + b
+        return [RtConj{e: e, base: base}]
+
+    # rtPushableFolded: pushable after foldOuter — every maximal part that
+    # does not read the item becomes a literal; what is left must be the
+    # item's own fields under operators a store evaluates (exprSQL).
+    proc rtPushableFolded(e: IRExpr, itemVar: text) -> bool:
+        let m = do rtMentions(e, itemVar)
+        if !m:
+            return true
+        if e.kind == "get":
+            return len(e.obj) > 0 && e.obj[0].kind == "ref" && e.obj[0].name == itemVar
+        if e.kind == "un":
+            if (e.op == "!" || e.op == "-") && len(e.x) > 0:
+                let ux = do rtPushableFolded(e.x[0], itemVar)
+                return ux
+            return false
+        if e.kind == "bin":
+            let ok = e.op in ["==", "!=", "&&", "||", "<", "<=", ">", ">=", "+", "-", "*", "/", "%"]
+            if !ok || len(e.l) == 0 || len(e.r) == 0:
+                return false
+            let pl = do rtPushableFolded(e.l[0], itemVar)
+            let pr = do rtPushableFolded(e.r[0], itemVar)
+            return pl && pr
+        return false
+
+    # rtCorrelatedAggs: exprAggregates — every aggregate (at any depth)
+    # whose own predicate reads the row variable, with its page address,
+    # walked in the order the page numbers them.
+    proc rtCorrelatedAggs(e: IRExpr, base: int, rowVar: text) -> [RtConj]:
+        let mut out = []
+        let mut b = base
+        if e.kind == "agg" || e.kind == "eget":
+            if e.kind == "agg" && e.op in ["count", "exists", "sum", "avg", "min", "max"] && len(e.where) > 0:
+                let m = do rtMentions(e.where[0], rowVar)
+                if m:
+                    out = append(out, RtConj{e: e, base: base})
+            if b >= 0:
+                b = b + 1
+        let groups = [e.l, e.r, e.x, e.obj, e.key, e.where, e.sel, e.limit, e.keys, e.args]
+        let mut gi = 0
+        loop gi < len(groups):
+            let grp = groups[gi]
+            let mut k = 0
+            loop k < len(grp):
+                let sub = do rtCorrelatedAggs(grp[k], b, rowVar)
+                out = out + sub
+                b = do rtBaseAfter(b, [grp[k]])
+                k = k + 1
+            gi = gi + 1
+        return out
+
+    # rtHoistResidual: listRows' hoistResidual over the first page of
+    # candidate rows (those the pushable conjuncts admit, in the list's
+    # order): with a residual and two or more candidates, each correlated
+    # aggregate's query is built for each row (aggQuery: its predicate's
+    # outer parts evaluated — addressed at the list's path — then checked
+    # pushable, the batch abandoned at the first row it is not).
+    proc rtHoistResidual(rows0: [Val], n: IRNode, sc0: RtScope, bases: [int], policyFirst: bool) -> RtScope:
+        let mut sc = sc0
+        let mut conjs = []
+        if policyFirst && n.where[0].kind == "bin" && len(n.where[0].l) > 0 && len(n.where[0].r) > 0:
+            conjs = do rtConjuncts(n.where[0].l[0], -1)
+            conjs = conjs + rtConjuncts(n.where[0].r[0], bases[9])
+        else:
+            let mut wb = bases[9]
+            let pol = do rtReadPolicyOf(n.coll)
+            if len(pol) > 0:
+                wb = -1
+            conjs = do rtConjuncts(n.where[0], wb)
+        let mut push = []
+        let mut residual = []
+        let mut i = 0
+        loop i < len(conjs):
+            let p = do rtPushableFolded(conjs[i].e, n.itemVar)
+            if p:
+                push = append(push, conjs[i].e)
+            else:
+                residual = append(residual, conjs[i])
+            i = i + 1
+        if len(residual) == 0:
+            return sc
+        let prev = do rtGet(sc, n.itemVar)
+        let had = do rtHas(sc, n.itemVar)
+        let mut cands = []
+        let mut r = 0
+        loop r < len(rows0) && len(cands) < 2000:
+            if rows0[r].kind == "record":
+                sc = do rtSet(sc, n.itemVar, rows0[r])
+                sc.unaddressed = sc.unaddressed + 1
+                let mut ok = true
+                let mut k = 0
+                loop k < len(push) && ok:
+                    let pv = do rtEval(push[k], sc, -1)
+                    sc = pv.sc
+                    ok = do valTruthy(pv.v)
+                    k = k + 1
+                sc.unaddressed = sc.unaddressed - 1
+                if ok:
+                    cands = append(cands, rows0[r])
+            r = r + 1
+        if len(cands) >= 2:
+            cands = do rtStoreSortRows(cands, n.order, n.desc)
+            let mut ri = 0
+            loop ri < len(residual):
+                let aggs = do rtCorrelatedAggs(residual[ri].e, residual[ri].base, n.itemVar)
+                let mut ai = 0
+                loop ai < len(aggs):
+                    let agg = aggs[ai].e
+                    let answers = do rtStoreAnswers(agg)
+                    if answers:
+                        let mut av = agg.itemVar
+                        if av == "":
+                            av = "item"
+                        let mut wbase = -1
+                        if aggs[ai].base >= 0:
+                            wbase = aggs[ai].base + 1
+                        let mut going = true
+                        let mut ci = 0
+                        loop ci < len(cands) && going:
+                            sc = do rtSet(sc, n.itemVar, cands[ci])
+                            sc = do rtFoldOuter(agg.where[0], av, sc, wbase)
+                            let parts = do rtSplitConj(agg.where[0])
+                            let mut pi = 0
+                            loop pi < len(parts) && going:
+                                let pp = do rtPushableFolded(parts[pi], av)
+                                if !pp:
+                                    going = false
+                                pi = pi + 1
+                            ci = ci + 1
+                    ai = ai + 1
+                ri = ri + 1
+        sc = do rtRestore(sc, n.itemVar, had, prev)
+        return sc
+
     # rtEngineListRows: listRows' store path — the table's rows come from
     # the engine, in its own (field, then id) order, paged by listPageSize
     # (2000) with the predicate applied to each page as it arrives (the
@@ -812,7 +1046,7 @@ app RenderHTML:
             if after != "":
                 parts = append(parts, "\"after\":" + jsonQuote(after))
             let body = "{" + rtJoinTexts(parts, ",") + "}"
-            let sent = do fqlPostJson(c, "/nodes/query", body, "POST /nodes/query")
+            let sent = do rtFqPostJson(c, "/nodes/query", body, "POST /nodes/query")
             if !sent.ok:
                 # listFallback: the working set answers when the store cannot
                 let fb = do rtSelectRows(mirror, n, sc, bases, true)

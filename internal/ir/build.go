@@ -97,11 +97,12 @@ type env struct {
 // procSig is a proc's signature: enough to check a `do` call site (arity) and to
 // bind/coerce its result (Ret/RetList), mirroring opRet for a service operation.
 type procSig struct {
-	params  []ast.Param
-	ret     string
-	retList bool
-	retMap  bool
-	retKey  string
+	params   []ast.Param
+	ret      string
+	retList  bool
+	retMap   bool
+	retKey   string
+	retDepth int // a nested list return (`-> [[T]]`)
 }
 
 // deriveFn is a parameterized derive: what a call site is checked against (its
@@ -158,6 +159,8 @@ type structField struct {
 	// mapped / key: the field is a `{key: typ}` map.
 	mapped bool
 	key    string
+	// depth: a nested list field (`[[typ]]`): its elements are lists.
+	depth int
 }
 
 // recBind is what a record-typed local (`let v = call …`) is bound to: a record
@@ -319,8 +322,8 @@ func Build(app *ast.App) (*IR, error) {
 				return nil, &BuildError{f.Line, fmt.Sprintf(
 					"struct %q field %q has type %q — a struct field must be int/text/bool/float, another declared struct, or a list of those", sc.Name, f.Name, f.Type)}
 			}
-			fields[f.Name] = structField{typ: f.Type, list: f.List, mapped: f.Map, key: f.Key}
-			irFields = append(irFields, RecordField{Name: f.Name, Type: f.Type, List: f.List, Map: f.Map, Key: f.Key})
+			fields[f.Name] = structField{typ: f.Type, list: f.List, mapped: f.Map, key: f.Key, depth: f.Depth}
+			irFields = append(irFields, RecordField{Name: f.Name, Type: f.Type, List: f.List, Map: f.Map, Key: f.Key, Depth: f.Depth})
 		}
 		out.Structs = append(out.Structs, Struct{Name: sc.Name, Fields: irFields})
 	}
@@ -465,7 +468,7 @@ func Build(app *ast.App) (*IR, error) {
 			fields = append(fields, wf)
 			e.wireFields[ty.Name][f.Name] = true
 		}
-		out.Types = append(out.Types, WireType{Name: ty.Name, Schema: ty.Schema, Query: ty.Query, Fields: fields})
+		out.Types = append(out.Types, WireType{Name: ty.Name, Schema: ty.Schema, Query: ty.Query, Internal: ty.Internal, Fields: fields})
 	}
 	for _, ms := range app.Messages {
 		var variants []WireMessageVariant
@@ -1077,7 +1080,7 @@ func Build(app *ast.App) (*IR, error) {
 			}
 			seenUse[u] = true
 		}
-		e.procSigs[p.Name] = procSig{params: p.Params, ret: p.Ret, retList: p.RetList, retMap: p.RetMap, retKey: p.RetKey}
+		e.procSigs[p.Name] = procSig{params: p.Params, ret: p.Ret, retList: p.RetList, retMap: p.RetMap, retKey: p.RetKey, retDepth: p.RetDepth}
 	}
 	// Shared cells (see ast.Shared) are known before any proc or daemon body
 	// is lowered: those are the only bodies that may name one.
@@ -1319,6 +1322,18 @@ func Build(app *ast.App) (*IR, error) {
 			act.Placement = Server
 			act.Reason = fmt.Sprintf("serves api %s %s — an endpoint runs on the authority", ap.Method, ap.Path)
 		}
+		for _, t := range out.Types {
+			if !t.Internal {
+				continue
+			}
+			uses := act.Ret == t.Name
+			for _, p := range act.Params {
+				uses = uses || p.Type == t.Name
+			}
+			if uses {
+				return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q -> %s takes or answers %s, a `type %s @internal` — an internal type is never on the wire; declare it without @internal to publish it", ap.Method, ap.Path, ap.Action, t.Name, t.Name)}
+			}
+		}
 		key := ap.Method + " " + ap.Path
 		if prev, ok := apiSeen[key]; ok {
 			return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q redeclared (first at line %d)", ap.Method, ap.Path, prev)}
@@ -1396,6 +1411,9 @@ func Build(app *ast.App) (*IR, error) {
 				return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: auth scheme %q is reserved; name the credential (e.g. dev_token)", ap.Method, ap.Path, ap.AuthScheme)}
 			}
 			auth = ap.AuthScheme
+		}
+		if act.Internal {
+			return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q routes to @internal action %q — an internal action is reached only from the authority (run, job, trigger), never over HTTP", ap.Method, ap.Path, ap.Action)}
 		}
 		if ap.BasicID != "" {
 			// The Basic credential is the app's own client id and secret,
@@ -1797,7 +1815,7 @@ func Build(app *ast.App) (*IR, error) {
 		if !ok {
 			return nil, &BuildError{0, fmt.Sprintf("%s references unknown action %q", ref.source(), ref.name)}
 		}
-		if len(act.Params) != ref.argc {
+		if ref.argc < requiredArity(act.Params) || ref.argc > len(act.Params) {
 			// `more` (infinite scroll) always calls its action with zero arguments —
 			// there is no argument list an author could write for it — so a mismatch
 			// there means the action itself takes arguments, explained accordingly.
@@ -1829,6 +1847,13 @@ func Build(app *ast.App) (*IR, error) {
 				matched = true
 			}
 		}
+		// A link may also open something the app serves that is not a page: a
+		// declared `api GET` route (an export, a feed, a file), a `stream`, the
+		// `contract` route, or a file the runtime serves (uploads, bundled
+		// assets). Refused only when nothing serves the path.
+		if !matched {
+			matched = servedGETRoute(out, ref.path)
+		}
 		if !matched {
 			// The shape carries a NUL sentinel where an interpolation was, which
 			// is unreadable and unquotable; show the `{…}` the author wrote.
@@ -1843,7 +1868,7 @@ func Build(app *ast.App) (*IR, error) {
 			if app.Composed {
 				hint = " — declare it as a `view` on the `ui`/`data` facet that owns the route, or `mount` a wireframe at it"
 			}
-			return nil, &BuildError{0, fmt.Sprintf("link to %q%s, but no view serves that route%s",
+			return nil, &BuildError{0, fmt.Sprintf("link to %q%s, but no view serves that route, nor an api GET route, stream or served file%s",
 				strings.ReplaceAll(ref.path, dynamicSegment, "{…}"), where, hint)}
 		}
 	}
@@ -2301,7 +2326,7 @@ func lowerASCII(s string) string {
 }
 
 func (e *env) action(a *ast.Action) (Action, error) {
-	act := Action{Name: a.Name}
+	act := Action{Name: a.Name, Internal: a.Internal}
 	if a.Ret != "" {
 		// A reply value's type: a primitive, an entity (the reply is a row),
 		// or a wire type (a DTO). A struct is proc-local and has no wire form.
@@ -2331,8 +2356,14 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	paramSet := map[string]bool{}   // this action's parameter names
 	loc := map[string]bool{"actor": true, "role": true, "verified": true, "tenant": true, "tenantRole": true, "session": true, sessionTokenRef: true}
 	for _, p := range a.Params {
-		if p.List && !isPrimitive(p.Type) && e.enums[p.Type] == nil {
-			return Action{}, &BuildError{a.Line, fmt.Sprintf("action %q parameter %q is a list of %s — a list parameter holds scalars (int, text, bool, money, date, float, datetime or an enum), the values a client sends as a JSON array or a comma-separated query", a.Name, p.Name, p.Type)}
+		if p.Depth > 1 {
+			return Action{}, &BuildError{a.Line, fmt.Sprintf("action %q parameter %q is a nested list — a list of lists is a proc-only type; an action takes scalars or a list of them (bind a nested list inside a proc)", a.Name, p.Name)}
+		}
+		// A list of wire `type` values is a JSON array of objects, each shaped
+		// to the type's fields (runtime/wirearg.go); a list of rows is not a
+		// thing a client can send.
+		if p.List && !isPrimitive(p.Type) && e.enums[p.Type] == nil && !e.wireTypes[p.Type] {
+			return Action{}, &BuildError{a.Line, fmt.Sprintf("action %q parameter %q is a list of %s — a list parameter holds scalars (int, text, bool, money, date, float, datetime or an enum) or wire `type` values, what a client sends as a JSON array or a comma-separated query", a.Name, p.Name, p.Type)}
 		}
 		act.Params = append(act.Params, Param{Name: p.Name, Type: p.Type, Optional: p.Optional, List: p.List})
 		e.actLocalTypes[p.Name] = vtype{core: p.Type, list: p.List}
@@ -2710,9 +2741,6 @@ func (e *env) action(a *ast.Action) (Action, error) {
 					if sig.ret == "" {
 						return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns nothing — declare a return type (`proc %s(...) -> Type`) to bind it", st.Proc, st.Proc)}
 					}
-					if e.structs[sig.ret] != nil {
-						return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns %s, a struct type usable only inside another proc — an action cannot bind it (structs are proc-local values, with no schema/wire representation yet; see LANGUAGE.md's `proc` section). Read its fields inside the proc and give %q a scalar/list return type instead", st.Proc, sig.ret, st.Proc)}
-					}
 					if err := bindLocal(st.Bind, loc, "the bound result", st.Line); err != nil {
 						return nil, err
 					}
@@ -2720,7 +2748,15 @@ func (e *env) action(a *ast.Action) (Action, error) {
 					ds.Ret = sig.ret
 					ds.RetList = sig.retList
 					ds.RetMap = sig.retMap
-					if _, isRec := e.records[sig.ret]; isRec {
+					ds.RetDepth = sig.retDepth
+					// The bound result's type, so a later aggregate may range a
+					// list a proc answered (`list(… in xs)`, `count(x in xs …)`).
+					e.actLocalTypes[st.Bind] = vtype{core: sig.ret, list: sig.retList}
+					// A record — or a proc struct, which crosses into the action
+					// as the record its fields spell (runtime's plainValue) — is
+					// read field by field (`v.score`), each field checked.
+					_, isRec := e.records[sig.ret]
+					if isRec || (e.structs[sig.ret] != nil && !sig.retMap && sig.retDepth <= 1) {
 						e.locRecords[st.Bind] = recBind{rec: sig.ret, list: sig.retList}
 					}
 				}
@@ -2735,7 +2771,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				if st.Action == a.Name {
 					return nil, &BuildError{st.Line, fmt.Sprintf("action %q runs itself — an action cannot run itself", a.Name)}
 				}
-				if len(st.Args) != len(callee.Params) {
+				if len(st.Args) < requiredAstArity(callee.Params) || len(st.Args) > len(callee.Params) {
 					return nil, &BuildError{st.Line, fmt.Sprintf("action %q expects %d argument(s), got %d", st.Action, len(callee.Params), len(st.Args))}
 				}
 				callsProc = true
@@ -2925,7 +2961,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				if !e.entities[st.Coll] && loc[st.Coll] {
 					// `for x in names:` over a list-valued local or parameter —
 					// each element in order, the body run once per element.
-					if st.Where != nil || st.Order != "" || st.Limit != nil {
+					if st.Where != nil || st.Order != "" || st.OrderExpr != nil || st.Limit != nil {
 						return nil, &BuildError{st.Line, fmt.Sprintf("`for %s in %s` walks a list value; where/by/limit filter an entity's rows — shape the list before the loop", st.Var, st.Coll)}
 					}
 					wl := cloneNameSet(loc)
@@ -2961,6 +2997,12 @@ func (e *env) action(a *ast.Action) (Action, error) {
 							reads[n] = true
 						}
 					}
+				}
+				if st.OrderExpr != nil {
+					if err := e.checkPure(st.OrderExpr, wl, st.Line, "a `for … by <expr>` ordering"); err != nil {
+						return nil, err
+					}
+					out.OrderBy = e.low(st.OrderExpr)
 				}
 				if st.Order != "" && !e.entityFields[st.Coll][st.Order] && st.Order != "id" {
 					return nil, &BuildError{st.Line, fmt.Sprintf("entity %q has no field %q to order by", st.Coll, st.Order)}
@@ -3135,6 +3177,9 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	case callsService:
 		act.Placement = Server
 		act.Reason = "calls an external service — egress routes through the authority, never the client"
+	case a.StandIn:
+		act.Placement = Server
+		act.Reason = "stands in for a host's server action a fragment expects (`expect action`)"
 	case callsProc:
 		act.Placement = Server
 		act.Reason = "calls a `proc`, which is unconditionally server-executed — no client mirror of proc code exists"
@@ -3226,7 +3271,7 @@ func isProcessEntry(p *ast.Proc) bool {
 func (e *env) procIn(p *ast.Proc, actionSigs map[string]actionSig) (Proc, error) {
 	e.inProc = true
 	defer func() { e.inProc = false }()
-	pr := Proc{Name: p.Name, Ret: p.Ret, RetList: p.RetList, RetMap: p.RetMap, RetKey: p.RetKey}
+	pr := Proc{Name: p.Name, Ret: p.Ret, RetList: p.RetList, RetMap: p.RetMap, RetKey: p.RetKey, RetDepth: p.RetDepth}
 	locals := map[string]bool{}  // every name in scope: params + `let`s seen so far
 	mutable := map[string]bool{} // the subset declared `let mut`, and so reassignable
 	types := map[string]string{} // each name's declared/inferred type — see checkBitwiseTypes
@@ -3252,7 +3297,7 @@ func (e *env) procIn(p *ast.Proc, actionSigs map[string]actionSig) (Proc, error)
 		default:
 			types[prm.Name] = prm.Type
 		}
-		pr.Params = append(pr.Params, Param{Name: prm.Name, Type: prm.Type, Optional: prm.Optional, List: prm.List, Map: prm.Map, Key: prm.Key})
+		pr.Params = append(pr.Params, Param{Name: prm.Name, Type: prm.Type, Optional: prm.Optional, List: prm.List, Map: prm.Map, Key: prm.Key, Depth: prm.Depth})
 	}
 	for _, prm := range p.Params {
 		if err := e.checkNotShared(prm.Name, p.Line); err != nil {
@@ -3591,6 +3636,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 				ds.Ret = sig.ret
 				ds.RetList = sig.retList
 				ds.RetMap = sig.retMap
+				ds.RetDepth = sig.retDepth
 				out = append(out, ds)
 				continue
 			}
@@ -3626,6 +3672,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 				ds.Ret = sig.ret
 				ds.RetList = sig.retList
 				ds.RetMap = sig.retMap
+				ds.RetDepth = sig.retDepth
 			}
 			out = append(out, ds)
 		case ast.Act:
@@ -3751,6 +3798,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 				js.Bind = st.Bind
 				js.Ret = task.sig.ret
 				js.RetList = task.sig.retList
+				js.RetDepth = task.sig.retDepth
 			}
 			out = append(out, js)
 		case ast.ExprStmt:
@@ -4231,12 +4279,23 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 		case "sha256Bytes", "hmacSha256":
 			// A digest (runtime/cryptobuiltins.go): a byte buffer in, one out.
 			return bytesType
+		case "p256PrivateKey", "p256PublicKey", "p256Ecdh", "es256Sign", "fromBase64UrlRaw":
+			// Web Push primitives (runtime/webcrypto.go): byte buffers out.
+			return bytesType
+		case "uploadBytes":
+			// a stored upload's content (runtime/upload.go)
+			return bytesType
+		case "httpSend":
+			return "int"
 		case "base64UrlRaw", "bcryptHash":
 			return "text"
 		case "bcryptMatches":
 			return "bool"
 		case "indexOf":
-			// indexOf(s, sub, from) -> int, a rune index or -1.
+			// indexOf(s, sub, from) -> int, a rune index or -1; over a list,
+			// the element's position; over a byte buffer, the first byte equal
+			// to an int sub, or in a list of byte values (runtime/eval.go's
+			// bytesIndexOf).
 			return "int"
 		case "byteLen":
 			// byteLen(s) -> int, s's real UTF-8 byte length (as opposed to
@@ -4249,6 +4308,11 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			// checksum primitive, as sha256Hex is its digest one: a table
 			// lookup per byte the evaluator cannot make cheap.
 			return "int"
+		case "bytesPut":
+			// bytesPut(dst, at, src) -> bytes: dst with src's bytes written
+			// over dst[at..at+len(src)] — the same length, the rest of dst
+			// unchanged (runtime/bytesval.go). A page edit's copy_from_slice.
+			return bytesType
 		case "bytesCmp", "bytesCmpRange", "uintLE":
 			// The byte-level primitives a binary format is read with, each a
 			// loop the evaluator cannot make cheap: bytesCmp(a, b) -> int is
@@ -4284,7 +4348,7 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			return bytesType
 		case "connOpen":
 			return "bool"
-		case "sleepMs", "shutdownConn":
+		case "sleepMs", "shutdownConn", "closeWrite":
 			return "bool"
 		case "monoMs", "nowMs", "signals":
 			// signals() is a channel handle, the same int channel() mints.
@@ -4319,8 +4383,14 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			// one the operating system chose for listen(0) — or 0 for a
 			// listener whose bind failed.
 			return "int"
-		case "closeListener", "grantRead":
+		case "closeListener", "grantRead", "grantDir", "makeDir":
 			return "bool"
+		case "listDir":
+			// listDir(path) -> [text]: the regular files directly in path,
+			// sorted (runtime/dirs.go).
+			return arrayType
+		case "readStdinLine":
+			return "text"
 		case "writeStdout", "writeStderr":
 			return "bool"
 		case "readStdin":
@@ -4344,7 +4414,7 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			return "int"
 		case "recv":
 			return "text" // channels are text-only in this milestone — see LANGUAGE.md
-		case "send":
+		case "send", "trySend":
 			return "bool"
 		case "appendFile", "truncateFile", "fileExists":
 			// appendFile/truncateFile: true on success, a failure is a runtime
@@ -4387,12 +4457,19 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			// floatFromBits(b) -> float, the IEEE-754 bit-cast inverse of
 			// floatBits(f) -> int.
 			return "float"
-		case "exp", "ln", "sqrt":
+		case "exp", "ln", "sqrt", "sin", "cos":
 			return "float"
 		case "u64Cmp", "u64Min", "u64Max", "u64SatSub", "u64Div", "u64Rem", "u64Parse":
 			// the u64 builtins (runtime/u64.go): an int's 64 bits read unsigned.
 			return "int"
 		case "u64Text", "u64ParseError":
+			return "text"
+		case "validUtf8":
+			// validUtf8(b) -> bool (runtime/eval.go): a byte buffer's bytes
+			// are well-formed UTF-8.
+			return "bool"
+		case "jsonQuote":
+			// jsonQuote(s) -> text (runtime/eval.go): s as a JSON string.
 			return "text"
 		case "u64ToFloat":
 			return "float"
@@ -4401,6 +4478,13 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			// reinterpreted as a signed 64-bit int — always int-typed, the
 			// same as toInt/floor/round, regardless of the float's value.
 			return "int"
+		case "take":
+			// take(xs, n) is the first n elements of a list, a prefix of a text.
+			if len(t.Args) == 2 {
+				if at := inferProcType(t.Args[0], types); at == arrayType {
+					return at
+				}
+			}
 		case "slice":
 			// slice(s, start, end) is a substring of a text and a sublist of
 			// a list — the same type it was handed.
@@ -4524,13 +4608,34 @@ func (e *env) structExprType(ex ast.Expr, types map[string]string) string {
 		}
 	}
 	// An element of a struct's list field has the field's declared element
-	// type — the one place an array's element type is not erased.
+	// type — the one place an array's element type is not erased — except a
+	// nested list field's element, which is itself a list.
 	if ix, ok := ex.(ast.Index); ok {
 		if g, ok := ix.Obj.(ast.Get); ok {
+			if fields, ok := e.structs[e.structExprType(g.Obj, types)]; ok {
+				if f, ok := fields[g.Field]; ok && f.depth > 1 {
+					return arrayType
+				}
+			}
 			if fields, ok := e.structs[e.structExprType(g.Obj, types)]; ok {
 				if f, ok := fields[g.Field]; ok && f.list {
 					return f.typ
 				}
+			}
+		}
+	}
+	// A call of a declared proc has the proc's declared return type, so
+	// `let mut q = emptyQuery(raw)` is a struct local whose fields can be
+	// written and read like one built from a literal.
+	if c, ok := ex.(ast.Call); ok {
+		if sig, ok := e.procSigs[c.Name]; ok {
+			switch {
+			case sig.retList:
+				return arrayType
+			case sig.retMap:
+				return mapTag(sig.retKey, sig.ret)
+			default:
+				return sig.ret
 			}
 		}
 	}
@@ -5415,6 +5520,17 @@ func (c *viewCtx) lowerRange(rg ast.Range, node *Node, sc scope, line int) error
 				}
 			}
 		}
+	}
+	if rg.OrderExpr != nil {
+		olocals := viewScope(sc.locals)
+		olocals[rg.Var] = true
+		if err := c.e.checkPure(rg.OrderExpr, olocals, line, "an ordering `by <expr>`"); err != nil {
+			return err
+		}
+		if err := c.checkRowFields(rg.OrderExpr, c.bindRange(sc, rg), line); err != nil {
+			return err
+		}
+		node.OrderBy = c.e.low(rg.OrderExpr)
 	}
 	if rg.Order != "" {
 		if !c.e.entities[rg.Coll] {
@@ -6327,6 +6443,14 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			if p != Client {
 				return nil, &BuildError{0, fmt.Sprintf("upload binds %q, which is authoritative; it must store the URL in a @client state", t.Bind)}
 			}
+			// A `[text]` cell takes many files: each one's URL is appended.
+			multiple := c.e.stateList[t.Bind]
+			if multiple && c.e.stateTypes[t.Bind] != "text" {
+				return nil, &BuildError{0, fmt.Sprintf("upload binds %q, a list of %s; an upload's URLs are text, so a many-file upload binds a [text] cell", t.Bind, c.e.stateTypes[t.Bind])}
+			}
+			if !multiple && c.e.stateTypes[t.Bind] != "text" {
+				return nil, &BuildError{0, fmt.Sprintf("upload binds %q, a %s; an upload's URL is text — bind a text cell, or a [text] cell for many files", t.Bind, c.e.stateTypes[t.Bind])}
+			}
 			id := c.id("b", c.nb)
 			c.nb++
 			c.addDep(t.Bind, id)
@@ -6334,7 +6458,24 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, Node{Kind: "upload", Bind: t.Bind, Label: label, ID: id})
+			out = append(out, Node{Kind: "upload", Bind: t.Bind, Label: label, ID: id, Multiple: multiple})
+
+		case ast.Camera:
+			p, ok := c.e.states[t.Bind]
+			if !ok {
+				return nil, &BuildError{t.Line, fmt.Sprintf("camera binds unknown state %q", t.Bind)}
+			}
+			if p != Client || c.e.stateList[t.Bind] || c.e.stateTypes[t.Bind] != "text" {
+				return nil, &BuildError{t.Line, fmt.Sprintf("camera binds %q; a capture's URL goes in a @client text cell", t.Bind)}
+			}
+			id := c.id("b", c.nb)
+			c.nb++
+			c.addDep(t.Bind, id)
+			label, err := c.lowerSegs(t.Label, sc, false)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, Node{Kind: "camera", Bind: t.Bind, Label: label, ID: id})
 
 		case ast.Use:
 			params, ok := c.e.components[t.Name]
@@ -6985,10 +7126,11 @@ func checkNoIndexIf(ex ast.Expr, wire map[string]bool, line int, allow func(ast.
 // must never be able to write one into source at all. checkNoIO is the
 // syntactic barrier that guarantees that, exactly mirroring checkNoBitwise's
 // shape and its single call site inside check().
-var ioBuiltins = map[string]bool{"readFile": true, "writeFile": true, "appendFile": true, "fileExists": true, "truncateFile": true, "fileSize": true, "fileModTime": true, "readFileAt": true, "writeFileAt": true, "syncFile": true, "renameFile": true, "removeFile": true, "lockFile": true, "httpGet": true, "httpPost": true,
+var ioBuiltins = map[string]bool{"httpSend": true, "readFile": true, "writeFile": true, "appendFile": true, "fileExists": true, "truncateFile": true, "fileSize": true, "fileModTime": true, "readFileAt": true, "writeFileAt": true, "syncFile": true, "renameFile": true, "removeFile": true, "lockFile": true, "httpGet": true, "httpPost": true,
 	"connect": true, "connectTls": true, "readBytes": true, "writeBytes": true, "closeConn": true, "setTimeoutMs": true, "connError": true, "pollBytes": true, "connOpen": true,
 	"closeListener": true, "listenError": true, "listenerPort": true, "grantRead": true,
-	"writeStdout": true, "writeStderr": true, "readStdin": true}
+	"grantDir": true, "listDir": true, "makeDir": true,
+	"writeStdout": true, "writeStderr": true, "readStdin": true, "readStdinLine": true}
 
 // checkNoIO rejects a call to readFile/writeFile/httpGet/httpPost anywhere
 // outside a proc body. checkProcExpr (proc bodies) never calls check(), so a
@@ -7065,7 +7207,7 @@ func checkNoIO(ex ast.Expr, line int) error {
 // re-evaluate outside any proc call — must never be able to write one into
 // source at all. checkNoConcurrency is ioBuiltins/checkNoIO's exact shape,
 // applied to this set instead.
-var concurrencyBuiltins = map[string]bool{"channel": true, "send": true, "recv": true, "sleepMs": true, "monoMs": true, "nowMs": true, "signals": true, "awaitAny": true, "closeChannel": true}
+var concurrencyBuiltins = map[string]bool{"channel": true, "send": true, "trySend": true, "recv": true, "sleepMs": true, "monoMs": true, "nowMs": true, "signals": true, "awaitAny": true, "closeChannel": true}
 
 // checkNoConcurrency rejects a call to channel/send/recv anywhere outside a
 // proc body, mirroring checkNoIO exactly (see its doc) — checkProcExpr (proc
@@ -7151,6 +7293,21 @@ func checkNoConcurrency(ex ast.Expr, line int) error {
 // rather than inventing a second one.
 var listenBuiltins = map[string]bool{"listen": true, "listenOn": true, "listenTls": true, "accept": true}
 
+// OwnBarrierBuiltins is every proc-only builtin refused outside a proc by
+// its own barrier (ioBuiltins, concurrencyBuiltins, listenBuiltins) rather
+// than checkBuiltins' generic SiteProc rule, sorted — the table the
+// self-hosted checker ports (selfhost/check.fct's ownBarrierBuiltins).
+func OwnBarrierBuiltins() []string {
+	var out []string
+	for _, set := range []map[string]bool{ioBuiltins, concurrencyBuiltins, listenBuiltins} {
+		for n := range set {
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // checkEntryOnlyBuiltins rejects grantRead(...) anywhere but the process
 // entry point (`proc main`): a read grant must come from the one body that
 // runs before any request, connection or client input exists — see
@@ -7160,13 +7317,15 @@ func checkEntryOnlyBuiltins(ex ast.Expr, isEntry bool, line int) error {
 		return nil
 	}
 	var found bool
+	var name string
 	ast.WalkExpr(ex, func(x ast.Expr) {
-		if c, ok := x.(ast.Call); ok && c.Name == "grantRead" {
+		if c, ok := x.(ast.Call); ok && (c.Name == "grantRead" || c.Name == "grantDir") {
 			found = true
+			name = c.Name
 		}
 	})
 	if found {
-		return &BuildError{line, "grantRead(...) is only available in `proc main(args: [text]) -> int` — a file becomes readable outside the sandbox only when the operator names it (an argument or an environment variable) to the process entry point, before any request or connection exists"}
+		return &BuildError{line, name + "(...) is only available in `proc main(args: [text]) -> int` — a file becomes readable outside the sandbox only when the operator names it (an argument or an environment variable) to the process entry point, before any request or connection exists"}
 	}
 	return nil
 }
@@ -7355,7 +7514,9 @@ func (c *viewCtx) checkRowFields(ex ast.Expr, sc scope, line int) error {
 		inner := sc
 		if t.Var != "" {
 			inner = sc.with(t.Var)
-			if c.e.stateList[t.Coll] {
+			if lt, ok := c.e.actLocalTypes[t.Coll]; ok && lt.list && !c.e.entities[t.Coll] {
+				inner.varTypes[t.Var] = vtype{core: lt.core}
+			} else if c.e.stateList[t.Coll] {
 				// Over a list cell the item is an element of the cell's type.
 				inner.varTypes[t.Var] = vtype{core: c.e.stateTypes[t.Coll]}
 			} else {
@@ -7390,8 +7551,14 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 		}
 	case ast.Agg:
 		if !e.entities[t.Coll] {
-			if !e.stateList[t.Coll] {
-				return &BuildError{line, fmt.Sprintf("%s(...) needs a collection to range over; %q is neither an entity nor a `[T]` list state", t.Op, t.Coll)}
+			localList := false
+			if lt, ok := e.actLocalTypes[t.Coll]; ok && lt.list {
+				// An action's own list-typed local (a parameter, or a `let` a
+				// proc answered): its elements, exactly as a list cell's.
+				localList = true
+			}
+			if !e.stateList[t.Coll] && !localList {
+				return &BuildError{line, fmt.Sprintf("%s(...) needs a collection to range over; %q is neither an entity, a `[T]` list state, nor an action's list local", t.Op, t.Coll)}
 			}
 			// An aggregate over a `[T]` list cell ranges its elements the way
 			// `for x in <list>` does: count, exists and list over them, the
@@ -7400,7 +7567,7 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 			// would leave the browser, which has no aggregates, holding it — and a
 			// field aggregate names the value it reduces, since an element
 			// has no fields to name.
-			if e.states[t.Coll] != "server" && e.states[t.Coll] != "private" {
+			if !localList && e.states[t.Coll] != "server" && e.states[t.Coll] != "private" {
 				return &BuildError{line, fmt.Sprintf("%s(...) over %q: an aggregate runs on the authority, so the cell must live there — declare it `state %s: [T] = [] @server`", t.Op, t.Coll, t.Coll)}
 			}
 			if isFieldAgg(t.Op) && t.Sel == nil {
@@ -7490,6 +7657,10 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 			if len(t.Args) != 1 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly one argument", t.Name)}
 			}
+		case "httpSend":
+			if len(t.Args) != 4 {
+				return &BuildError{line, "httpSend(method, url, headers, body) takes exactly four arguments"}
+			}
 		case "writeFile", "httpPost", "appendFile", "truncateFile":
 			if len(t.Args) != 2 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly two arguments", t.Name)}
@@ -7514,7 +7685,7 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 			if len(t.Args) != 1 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly one argument", t.Name)}
 			}
-		case "readFileAt", "writeFileAt", "pollBytes", "crc32", "uintLE":
+		case "readFileAt", "writeFileAt", "pollBytes", "crc32", "uintLE", "bytesPut":
 			if len(t.Args) != 3 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly three arguments", t.Name)}
 			}
@@ -7522,9 +7693,9 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 			if len(t.Args) != 1 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly one argument", t.Name)}
 			}
-		case "readStdin":
+		case "readStdin", "readStdinLine":
 			if len(t.Args) != 0 {
-				return &BuildError{line, "readStdin() takes no arguments"}
+				return &BuildError{line, t.Name + "() takes no arguments"}
 			}
 		case "sleepMs":
 			if len(t.Args) != 1 {
@@ -7550,7 +7721,7 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 			if len(t.Args) != 3 {
 				return &BuildError{line, "listenTls(port, identity, password) takes exactly three arguments: a port, a PKCS#12 identity file and its password"}
 			}
-		case "listen", "accept", "closeConn", "connError", "connPeer", "shutdownConn", "connOpen", "closeListener", "listenError", "listenerPort", "grantRead":
+		case "listen", "accept", "closeConn", "connError", "connPeer", "shutdownConn", "closeWrite", "connOpen", "closeListener", "listenError", "listenerPort", "grantRead", "grantDir", "listDir", "makeDir":
 			if len(t.Args) != 1 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly one argument", t.Name)}
 			}
@@ -7559,8 +7730,8 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly two arguments", t.Name)}
 			}
 		case "channel":
-			if len(t.Args) != 0 {
-				return &BuildError{line, "channel() takes no arguments"}
+			if len(t.Args) > 1 {
+				return &BuildError{line, "channel() takes no arguments, or one: channel(n), a buffer of n values"}
 			}
 		case "totpSecret":
 			if len(t.Args) != 0 {
@@ -7630,9 +7801,9 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 			if len(t.Args) != 1 {
 				return &BuildError{line, "recv(ch) takes exactly one argument (the channel)"}
 			}
-		case "send":
+		case "send", "trySend":
 			if len(t.Args) != 2 {
-				return &BuildError{line, "send(ch, value) takes exactly two arguments"}
+				return &BuildError{line, t.Name + "(ch, value) takes exactly two arguments"}
 			}
 		default:
 			if fn, isFn := e.deriveFns[t.Name]; isFn {
@@ -7740,8 +7911,14 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 				if rb.list {
 					return &BuildError{line, fmt.Sprintf("%q is a list of %s — access a field on one element, not the whole list", r.Name, rb.rec)}
 				}
-				if _, ok := e.records[rb.rec][t.Field]; !ok {
-					return &BuildError{line, fmt.Sprintf("record %s has no field %q", rb.rec, t.Field)}
+				_, recField := e.records[rb.rec][t.Field]
+				_, structField := e.structs[rb.rec][t.Field]
+				if !recField && !structField {
+					kind := "record"
+					if e.structs[rb.rec] != nil {
+						kind = "struct"
+					}
+					return &BuildError{line, fmt.Sprintf("%s %s has no field %q", kind, rb.rec, t.Field)}
 				}
 				return nil
 			}
@@ -7782,9 +7959,9 @@ func builtinCapability(name string) (string, bool) {
 	case "readFile", "writeFile", "appendFile", "fileExists", "truncateFile",
 		"fileSize", "fileModTime", "readFileAt", "writeFileAt", "syncFile", "renameFile", "removeFile", "lockFile":
 		return "io.file", true
-	case "httpGet", "httpPost", "connect", "connectTls":
+	case "httpGet", "httpPost", "httpSend", "connect", "connectTls":
 		return "io.net", true
-	case "writeStdout", "writeStderr", "readStdin", "signals", "exitProcess", "processStats":
+	case "writeStdout", "writeStderr", "readStdin", "readStdinLine", "signals", "exitProcess", "processStats":
 		// io.console: the process's own stdio, for a program run as a
 		// command (`facet exec`, runtime/stdio.go). A server's stdout is its
 		// operator log, so writing to it is opted into by name.
@@ -7794,12 +7971,13 @@ func builtinCapability(name string) (string, bool) {
 		// is configured (ports, keys, credentials), so reading it is opted
 		// into by name like any other channel to the outside.
 		return "io.env", true
-	case "readBytes", "writeBytes", "closeConn", "setTimeoutMs", "connError", "connPeer", "shutdownConn", "pollBytes", "connOpen":
+	case "readBytes", "writeBytes", "closeConn", "setTimeoutMs", "connError", "connPeer", "shutdownConn", "closeWrite", "pollBytes", "connOpen":
 		// I/O on a connection handle, whichever way it was minted: an
 		// outbound connect() (io.net) or a daemon's accept() (io.net.listen).
 		return netConnCap, true
-	case "grantRead":
-		// io.file: it makes a file readable (runtime/grants.go).
+	case "grantRead", "grantDir", "listDir", "makeDir":
+		// io.file: a file or directory made usable, a directory listed or
+		// made (runtime/grants.go, runtime/dirs.go).
 		return "io.file", true
 	case "closeListener", "listenError", "listenerPort":
 		// Operations on a listener handle: the listener's own capability.
@@ -8031,9 +8209,14 @@ func pureBuiltinArity(name string) (int, bool) {
 	switch name {
 	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day",
 		"ago", "compact", "commas", "iso", "fromIso", "first", "fromJson", "bytes", "toFloat", "toInt", "toMoney", "slug",
-		"textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits", "exp", "ln", "sqrt",
-		"u64Text", "u64Parse", "u64ParseError", "u64ToFloat", "sha256Bytes", "base64UrlRaw", "bcryptHash":
+		"textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits", "exp", "ln", "sqrt", "sin", "cos",
+		"u64Text", "u64Parse", "u64ParseError", "u64ToFloat", "sha256Bytes", "base64UrlRaw", "bcryptHash",
+		"p256PublicKey", "fromBase64UrlRaw", "uploadBytes", "validUtf8", "jsonQuote":
 		return 1, true
+	case "p256PrivateKey":
+		return 0, true
+	case "p256Ecdh", "es256Sign":
+		return 2, true
 	case "print":
 		// print(value): a debugging aid, not real arithmetic/string/date
 		// computation like the rest of this group — arity-checked the exact
@@ -8285,7 +8468,9 @@ func (e *env) checkDeriveArgs(ex ast.Expr, sc scope, line int) error {
 		inner := sc
 		if t.Var != "" {
 			inner = sc.with(t.Var)
-			if e.stateList[t.Coll] {
+			if lt, ok := e.actLocalTypes[t.Coll]; ok && lt.list && !e.entities[t.Coll] {
+				inner.varTypes[t.Var] = vtype{core: lt.core}
+			} else if e.stateList[t.Coll] {
 				// Over a list cell the item is an element of the cell's type.
 				inner.varTypes[t.Var] = vtype{core: e.stateTypes[t.Coll]}
 			} else {
@@ -8563,6 +8748,9 @@ func (e *env) dispatchRoute(ap *ast.API, msg *WireMessage, acts map[string]*Acti
 		act, ok := acts[v.Action]
 		if !ok {
 			return &BuildError{ap.Line, fmt.Sprintf("%s variant %q runs unknown action %q", msg.Name, v.WireName(), v.Action)}
+		}
+		if act.Internal {
+			return &BuildError{ap.Line, fmt.Sprintf("%s variant %q runs @internal action %q — an internal action is never reached over HTTP", msg.Name, v.WireName(), v.Action)}
 		}
 		bound := map[string]bool{}
 		if v.BodyParam != "" {
@@ -9219,7 +9407,7 @@ func irParams(ps []ast.Param) []Param {
 // intercept the app's own traffic.
 func reservedWebhookPath(p string) bool {
 	switch p {
-	case "/", "/event", "/live", "/api", "/upload", "/admin", "/facet.js",
+	case "/", "/event", "/api", "/upload", "/admin", "/facet.js",
 		"/healthz", "/readyz", "/metrics", "/billing/webhook":
 		return true
 	}
@@ -9476,4 +9664,64 @@ func checkRunGraph(acts []Action, byName map[string]*Action) error {
 		}
 	}
 	return nil
+}
+
+// requiredArity is how many leading arguments a call to an action with these
+// parameters must pass: through its last required parameter. The optional
+// ones after it may be left off — the runtime binds an omitted one to its
+// zero with given() false, exactly as an absent JSON field — so a call site
+// written against a narrower signature (a fragment's `post(draft)`) reaches
+// an action that grew optional parameters (`post(body, is_nsfw?, …)`).
+func requiredArity(params []Param) int {
+	n := 0
+	for i, p := range params {
+		if !p.Optional {
+			n = i + 1
+		}
+	}
+	return n
+}
+
+// requiredAstArity is requiredArity over the parsed parameters.
+func requiredAstArity(params []ast.Param) int {
+	n := 0
+	for i, p := range params {
+		if !p.Optional {
+			n = i + 1
+		}
+	}
+	return n
+}
+
+// servedGETRoute reports whether the app answers a GET at path with something
+// other than a page: a declared `api GET` route (its `{param}` segments match
+// any value, as a page's `:param` does), a `stream`, the `contract` route and
+// its history/diff, or a file the runtime serves under /uploads/ or /assets/.
+func servedGETRoute(g *IR, path string) bool {
+	for _, a := range g.APIs {
+		if a.Method == "GET" && routeMatches(apiPattern(a.Path), path) {
+			return true
+		}
+	}
+	for _, st := range g.Streams {
+		if routeMatches(apiPattern(st.Path), path) {
+			return true
+		}
+	}
+	if g.Contract != nil && (path == g.Contract.Path || strings.HasPrefix(path, g.Contract.Path+"/")) {
+		return true
+	}
+	return strings.HasPrefix(path, "/uploads/") || strings.HasPrefix(path, "/assets/")
+}
+
+// apiPattern writes an api route's `{param}` segments as a page route's
+// `:param`, so one matcher answers both.
+func apiPattern(p string) string {
+	segs := strings.Split(p, "/")
+	for i, sg := range segs {
+		if strings.HasPrefix(sg, "{") && strings.HasSuffix(sg, "}") {
+			segs[i] = ":" + strings.TrimSuffix(strings.TrimPrefix(sg, "{"), "}")
+		}
+	}
+	return strings.Join(segs, "/")
 }

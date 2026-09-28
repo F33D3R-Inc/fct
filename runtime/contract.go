@@ -257,7 +257,7 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 		// matching bind-the-whole-body case. Every other body shape keeps the
 		// per-field object it already had.
 		wholeBodyWireType := ""
-		if len(bodyWireParams) == 1 && isWireTypeOrMessage(bodyWireParams[0].Type, g) {
+		if len(bodyWireParams) == 1 && !bodyWireParams[0].List && isWireTypeOrMessage(bodyWireParams[0].Type, g) {
 			wholeBodyWireType = bodyWireParams[0].Type
 		}
 		binary := a.Ret == "bytes" // the reply is a file, answered as the body itself
@@ -357,6 +357,9 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 		paths[a.Path][strings.ToLower(a.Method)] = op
 	}
 	for _, t := range g.Types {
+		if t.Internal {
+			continue // a library's own value object, never on the wire
+		}
 		props := map[string]any{}
 		var req []string
 		for _, f := range t.Fields {

@@ -69,6 +69,68 @@ app StoreFacetQL:
     proc rtFqlClient(w: RtWorld) -> FqlClient:
         return FqlClient{endpoint: FqlEndpoint{dbmsId: "facet", baseUrl: w.fqlBase, token: w.fqlToken}, timeoutMs: 15000, trustFile: ""}
 
+    # ── the rate limiter (Go: fqClient.do) ─────────────────────────────
+    # A 429 is FacetQL's rate limiter asking this identity to slow down, not
+    # a failure of the request — nothing in it was applied — so every engine
+    # call the runtime makes is sent again after a pause, at most
+    # rtFqRateRetries times: a burst (a cold start loading every entity at
+    # once) is paced instead of aborting. The pause is the Retry-After the
+    # engine named (at most 5 s), else 250 ms (fqRetryAfter).
+    proc rtFqRateRetries() -> int:
+        return 8
+
+    proc rtFqRateLimited(e: FqlError) -> bool:
+        return e.kind == "Status" && e.status == 429
+
+    proc rtFqPause(e: FqlError) -> int:
+        let mut ms = 250
+        if e.hasRetryAfter && e.retryAfterSecs > 0:
+            ms = e.retryAfterSecs * 1000
+            if ms > 5000:
+                ms = 5000
+        let slept = sleepMs(ms)
+        return slept
+
+    proc rtFqSend(c: FqlClient, method: text, url: text, json: bool, body: text, context: text) -> FqlSendR uses io.net:
+        let mut r = do fqlSend(c, method, url, json, body, context)
+        let mut attempt = 0
+        loop !r.ok && rtFqRateLimited(r.err) && attempt < rtFqRateRetries():
+            let p = do rtFqPause(r.err)
+            r = do fqlSend(c, method, url, json, body, context)
+            attempt = attempt + 1
+        return r
+
+    proc rtFqPostJson(c: FqlClient, path: text, payload: text, context: text) -> FqlSendR uses io.net:
+        let r = do rtFqSend(c, "POST", fqlEndpointUrl(c.endpoint, path), true, payload, context)
+        return r
+
+    proc rtFqQueryAll(c: FqlClient, request: FqlQueryRequest) -> FqlNodesResult uses io.net:
+        let mut r = do fqlQueryAll(c, request)
+        let mut attempt = 0
+        loop !r.ok && rtFqRateLimited(r.err) && attempt < rtFqRateRetries():
+            let p = do rtFqPause(r.err)
+            r = do fqlQueryAll(c, request)
+            attempt = attempt + 1
+        return r
+
+    proc rtFqGetNode(c: FqlClient, address: text) -> FqlNodeResult uses io.net:
+        let mut r = do fqlGetNode(c, address)
+        let mut attempt = 0
+        loop !r.ok && rtFqRateLimited(r.err) && attempt < rtFqRateRetries():
+            let p = do rtFqPause(r.err)
+            r = do fqlGetNode(c, address)
+            attempt = attempt + 1
+        return r
+
+    proc rtFqTransaction(c: FqlClient, operations: [FqlTxOp]) -> FqlUnitResult uses io.net:
+        let mut r = do fqlTransaction(c, operations)
+        let mut attempt = 0
+        loop !r.ok && rtFqRateLimited(r.err) && attempt < rtFqRateRetries():
+            let p = do rtFqPause(r.err)
+            r = do fqlTransaction(c, operations)
+            attempt = attempt + 1
+        return r
+
     # ── addresses and rows ──────────────────────────────────────────────
     proc rtFqAddress(entity: text, id: int) -> text:
         let mut digits = "" + id
@@ -106,7 +168,38 @@ app StoreFacetQL:
         return pt
 
     # rtColValue: colValue — what a column stores for a value.
+    # rtColumnValue: columnValue — a value as a column holds it: nothing in
+    # a nullable column; otherwise the declared type, converted as coerce
+    # converts (every write applies it, and every read back from a store).
+    proc rtColumnValue(f: IRField, v: Val) -> Val:
+        if v.kind == "none":
+            if f.optional:
+                return v
+            if f.ref != "" || f.type == "int" || f.type == "money" || f.type == "date":
+                let z = do intVal(0)
+                return z
+            if f.type == "float":
+                let fz = do floatVal(0.0)
+                return fz
+            if f.type == "bool":
+                let bz = do boolVal(false)
+                return bz
+            let tz = do textVal("")
+            return tz
+        if f.ref != "":
+            let r = do rtCoerce(v, "int")
+            return r
+        if f.enumName != "":
+            let en = do rtCoerce(v, "text")
+            return en
+        if f.type in ["int", "money", "date", "float", "bool", "text", "datetime"]:
+            let c = do rtCoerce(v, f.type)
+            return c
+        return v
+
     proc rtColValue(w: RtWorld, f: IRField, v: Val) -> Val:
+        if v.kind == "none" && f.optional:
+            return v
         if f.ref != "" || f.type == "int":
             let iv = do intVal(valToInt(v))
             return iv
@@ -136,35 +229,11 @@ app StoreFacetQL:
 
     # rtNormalize: normalize — a stored value back into a row.
     proc rtNormalize(w: RtWorld, f: IRField, v: JVal) -> Val:
-        if v.kind == "none" || v.kind == "null":
-            if f.ref != "" || f.type == "int":
-                let z = do intVal(0)
-                return z
-            if f.type == "float":
-                let fz = do floatVal(0.0)
-                return fz
-            if f.type == "bool":
-                let bz = do boolVal(false)
-                return bz
-            let tz = do textVal("")
-            return tz
-        if v.kind == "num":
-            if f.type == "float":
-                let fv = do floatVal(toFloat(v.s))
-                return fv
-            let iv = do intVal(toInt(v.s))
-            return iv
-        if v.kind == "bool":
-            let bv = do boolVal(v.s == "true")
-            return bv
-        if v.kind == "str":
-            let mut s = v.s
-            if f.secret:
-                s = do rtDecryptSecret(w, s)
-            let tv = do textVal(s)
-            return tv
-        let rv = do rtJValToVal(v)
-        return rv
+        let mut d = do rtJValToVal(v)
+        if v.kind == "str" && f.secret:
+            d = do textVal(rtDecryptSecret(w, v.s))
+        let c = do rtColumnValue(f, d)
+        return c
 
     proc rtNodeRecord(w: RtWorld, e: IREntity, data: text) -> Val:
         let mut raw = do jNone()
@@ -198,7 +267,7 @@ app StoreFacetQL:
         w.fqlToken = p.token
         w.storeOn = true
         let c = do rtFqlClient(w)
-        let ping = do fqlSend(c, "GET", fqlEndpointUrl(c.endpoint, "/"), false, "", "GET /")
+        let ping = do rtFqSend(c, "GET", fqlEndpointUrl(c.endpoint, "/"), false, "", "GET /")
         if !ping.ok:
             return RtStoreResult{ok: false, err: "connect to FacetQL at " + p.base + ": " + fqlErrorDisplay(ping.err), w: w}
         let mig = do rtStoreMigrate(w)
@@ -216,7 +285,7 @@ app StoreFacetQL:
 
     proc rtAdminList(w: RtWorld, path: text) -> RtAdminList uses io.net:
         let c = do rtFqlClient(w)
-        let r = do fqlSend(c, "GET", fqlEndpointUrl(c.endpoint, path), false, "", "GET " + path)
+        let r = do rtFqSend(c, "GET", fqlEndpointUrl(c.endpoint, path), false, "", "GET " + path)
         let none = do jNone()
         if !r.ok:
             if r.err.kind == "Unauthorized" && r.err.status == 403:
@@ -303,7 +372,7 @@ app StoreFacetQL:
             else:
                 let name = do rtSafeName("idx_" + wantKinds[i] + "_" + wantFields[i], wantKinds[i], wantFields[i])
                 let body = "{\"name\":" + jsonQuote(name) + ",\"kind\":" + jsonQuote(wantKinds[i]) + ",\"field\":" + jsonQuote(wantFields[i]) + ",\"unique\":" + rtBoolWord(wantUnique[i]) + "}"
-                let made = do fqlPostJson(c, "/admin/indexes", body, "POST /admin/indexes")
+                let made = do rtFqPostJson(c, "/admin/indexes", body, "POST /admin/indexes")
                 if !made.ok:
                     if made.err.kind == "Unauthorized" && made.err.status == 403:
                         let warn2 = writeStderr("facet: declaring FacetQL indexes and references needs an admin identity, and this token is not one (FACETQL_TOKEN, or the token in FACET_DATABASE_URL): /admin/indexes and /admin/references are admin-only\n")
@@ -353,7 +422,7 @@ app StoreFacetQL:
             else:
                 let rname = do rtSafeName("fk_" + refEnts[k] + "_" + refFields[k], refEnts[k], refFields[k])
                 let rbody = "{\"name\":" + jsonQuote(rname) + ",\"kind\":" + jsonQuote(refEnts[k]) + ",\"field\":" + jsonQuote(refFields[k]) + ",\"parent_kind\":" + jsonQuote(refParents[k]) + ",\"parent_field\":\"id\",\"on_delete\":" + jsonQuote(refOnDelete[k]) + "}"
-                let madeRef = do fqlPostJson(c, "/admin/references", rbody, "POST /admin/references")
+                let madeRef = do rtFqPostJson(c, "/admin/references", rbody, "POST /admin/references")
                 if !madeRef.ok:
                     if madeRef.err.kind == "Unauthorized" && madeRef.err.status == 403:
                         let warn4 = writeStderr("facet: declaring FacetQL indexes and references needs an admin identity, and this token is not one (FACETQL_TOKEN, or the token in FACET_DATABASE_URL): /admin/indexes and /admin/references are admin-only\n")
@@ -408,42 +477,53 @@ app StoreFacetQL:
     # rtStoreLoad: Init's load — every durable entity's rows, by id.
     proc rtStoreLoad(w0: RtWorld) -> RtStoreResult uses io.net:
         let mut w = w0
-        let c = do rtFqlClient(w)
         let mut e = 0
         loop e < len(w.g.entities):
             let ent = w.g.entities[e]
             if !ent.ephemeral:
-                let n = do sjNull()
-                let req = FqlQueryRequest{hasKind: true, kind: ent.name, hasOwner: false, owner: "", hasWhere: false, whereValue: n, hasItemVar: true, itemVar: "item", hasOrder: true, order: "id", desc: false, hasAfter: false, after: "", hasLimit: true, limit: 500}
-                let all = do fqlQueryAll(c, req)
-                if !all.ok:
-                    return RtStoreResult{ok: false, err: "load " + ent.name + ": " + fqlErrorDisplay(all.err), w: w}
-                let mut rows = []
-                let mut max = 0
-                let mut i = 0
-                loop i < len(all.v):
-                    let row = do rtNodeRecord(w, ent, all.v[i].data)
-                    let idv = do valGet(row, "id")
-                    let id = do valToInt(idv)
-                    if id > max:
-                        max = id
-                    rows = append(rows, row)
-                    i = i + 1
-                let mut live = rows
-                if ent.softDelete:
-                    live = []
-                    let mut k = 0
-                    loop k < len(rows):
-                        let av = do valGet(rows[k], "archived")
-                        let arch = do valTruthy(av)
-                        if !arch:
-                            live = append(live, rows[k])
-                        k = k + 1
-                w = do rtSetEntRows(w, ent.name, live)
-                let ei = do rtEntIndex(w, ent.name)
-                if ei >= 0:
-                    w.nextIds[ei] = max
+                let r = do rtStoreLoadEntity(w, ent)
+                if !r.ok:
+                    return r
+                w = r.w
             e = e + 1
+        return RtStoreResult{ok: true, err: "", w: w}
+
+    # rtStoreLoadEntity: one entity's rows into the working set — a
+    # @softdelete entity's archived rows left out (liveRows), every id
+    # counted toward the next one.
+    proc rtStoreLoadEntity(w0: RtWorld, ent: IREntity) -> RtStoreResult uses io.net:
+        let mut w = w0
+        let c = do rtFqlClient(w)
+        let n = do sjNull()
+        let req = FqlQueryRequest{hasKind: true, kind: ent.name, hasOwner: false, owner: "", hasWhere: false, whereValue: n, hasItemVar: true, itemVar: "item", hasOrder: true, order: "id", desc: false, hasAfter: false, after: "", hasLimit: true, limit: 500}
+        let all = do rtFqQueryAll(c, req)
+        if !all.ok:
+            return RtStoreResult{ok: false, err: "load " + ent.name + ": " + fqlErrorDisplay(all.err), w: w}
+        let mut rows = []
+        let mut max = 0
+        let mut i = 0
+        loop i < len(all.v):
+            let row = do rtNodeRecord(w, ent, all.v[i].data)
+            let idv = do valGet(row, "id")
+            let id = do valToInt(idv)
+            if id > max:
+                max = id
+            rows = append(rows, row)
+            i = i + 1
+        let mut live = rows
+        if ent.softDelete:
+            live = []
+            let mut k = 0
+            loop k < len(rows):
+                let av = do valGet(rows[k], "archived")
+                let arch = do valTruthy(av)
+                if !arch:
+                    live = append(live, rows[k])
+                k = k + 1
+        w = do rtSetEntRows(w, ent.name, live)
+        let ei = do rtEntIndex(w, ent.name)
+        if ei >= 0 && max > w.nextIds[ei]:
+            w.nextIds[ei] = max
         return RtStoreResult{ok: true, err: "", w: w}
 
     # ── committing ──────────────────────────────────────────────────────
@@ -476,6 +556,8 @@ app StoreFacetQL:
                     liveAddrs = append(liveAddrs, addr)
                     liveAt = append(liveAt, len(txOps))
                     txOps = append(txOps, tx)
+            if op.kind == "audit":
+                txOps = append(txOps, fqlTxInsertNode(op.entity, "__audit", 0, 0, 0, 0, op.row.t, false))
             if op.kind == "delete":
                 let addr2 = do rtFqAddress(op.entity, op.id)
                 let dropped = do rtDropLive(liveAddrs, liveAt, addr2)
@@ -496,7 +578,7 @@ app StoreFacetQL:
                 txOps = append(txOps, fqlTxClearKind(op.entity))
             i = i + 1
         let c = do rtFqlClient(w)
-        let r = do fqlTransaction(c, txOps)
+        let r = do rtFqTransaction(c, txOps)
         if !r.ok:
             return RtStoreResult{ok: false, err: "commit failed: " + fqlErrorDisplay(r.err), w: w}
         return RtStoreResult{ok: true, err: "", w: w}

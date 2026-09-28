@@ -431,6 +431,10 @@ func runApp(b *appBundle, args []string) int {
 	switch cmd {
 	case "", "serve", "run":
 		return serveGraph(b.IR, args, describeBundle(b))
+	case "facetql":
+		// The engine this app stores its rows in, carried by the same binary:
+		// a deployment's app image is also its database image.
+		return cmdFacetQL(args)
 	case "version", "-v", "--version":
 		fmt.Printf("%s — built by facet %s from %s on %s\n", b.App, b.Toolchain, b.Entry, b.Built)
 		return 0
@@ -517,7 +521,16 @@ func migrateGraph(graph *ir.IR, apply bool) int {
 // container that moved its port does not need its health check edited too.
 func healthcheck(args []string) int {
 	addr := resolveAddr(args)
-	url := "http://" + localAddr(addr) + "/healthz"
+	// --path: the probe path, /healthz (the app's) unless named — `--path /`
+	// is the FacetQL engine's liveness probe, for a container running
+	// `<binary> facetql`.
+	path := "/healthz"
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--path" || args[i] == "-path" {
+			path = args[i+1]
+		}
+	}
+	url := "http://" + localAddr(addr) + path
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {

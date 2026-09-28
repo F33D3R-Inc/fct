@@ -2,6 +2,7 @@ package selfhost
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
@@ -138,6 +139,94 @@ func TestIRJSONRoundTripsCompilerStatements(t *testing.T) {
 		d := postExprJSON(t, ts, "runIRStmtRoundTrip", string(want))
 		if got, _ := d["irStmtBack"].(string); got != string(want) {
 			t.Errorf("statement %d (%s):\n  got  %s\n  want %s", i, st.Op, got, want)
+		}
+	}
+}
+
+// The reader decodes every JSON string escape as encoding/json does — a
+// \uXXXX of any code point to its UTF-8 (one to three bytes), a surrogate
+// pair to the one character it spells (four bytes), a lone surrogate to
+// U+FFFD, and \b \f \/ by name — so a document another encoder escaped
+// differently still reads back to the same values.
+func TestIRJSONReaderDecodesEveryEscape(t *testing.T) {
+	ts := loadIRJSONApp(t)
+	for _, lit := range []string{
+		`"caf\u00e9"`, `"\u65e5\u672c"`, `"\ud83d\ude00 grin"`, `"lone \ud800 high"`,
+		`"lone \udc00 low"`, `"bs\b ff\f sl\/"`, `"\u0041\u00df\u0800\uffff"`, `"sep\u2028\u2029"`,
+	} {
+		src := `{"kind":"lit","val":` + lit + `,"vtype":"text"}`
+		var e ir.Expr
+		if err := json.Unmarshal([]byte(src), &e); err != nil {
+			t.Fatalf("fixture %s: %v", lit, err)
+		}
+		want, err := json.Marshal(&e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d := postExprJSON(t, ts, "runIRExprRoundTrip", src)
+		if got, _ := d["irExprBack"].(string); got != string(want) {
+			t.Errorf("%s:\n  got  %s\n  want %s", lit, got, want)
+		}
+	}
+}
+
+// The span API (jObjectSpans / jArraySpans / jSpanText) slices each value
+// out of the document exactly as written: every top-level member, every
+// page and every component of a real IR, compact and indented, is the same
+// bytes encoding/json's RawMessage holds for it.
+func TestIRJSONSpansSliceTheDocument(t *testing.T) {
+	ts := loadIRJSONApp(t)
+	for _, path := range []string{"../examples/chirp.fct", "../examples/layered/playground.fct", "../../facets/layered_demo.fct", "testdata/jsonescapes/app.fct"} {
+		g, err := compile.File(path)
+		if err != nil {
+			t.Fatalf("compile %s: %v", path, err)
+		}
+		compact, err := json.Marshal(g)
+		if err != nil {
+			t.Fatal(err)
+		}
+		indented, err := json.MarshalIndent(g, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, doc := range [][]byte{compact, indented} {
+			var top map[string]json.RawMessage
+			if err := json.Unmarshal(doc, &top); err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]string{}
+			for k, v := range top {
+				want[k] = string(v)
+			}
+			for _, arr := range []string{"pages", "components"} {
+				var elems []json.RawMessage
+				if raw, ok := top[arr]; ok && string(raw) != "null" {
+					if err := json.Unmarshal(raw, &elems); err != nil {
+						t.Fatal(err)
+					}
+				}
+				for i, e := range elems {
+					want[fmt.Sprintf("%s[%d]", arr, i)] = string(e)
+				}
+			}
+			d := postExprJSON(t, ts, "runIRSpans", string(doc))
+			report, _ := d["irSpans"].(string)
+			var pairs [][2]string
+			if err := json.Unmarshal([]byte(report), &pairs); err != nil {
+				t.Fatalf("%s: report is not JSON: %v\n%.300s", path, err, report)
+			}
+			got := map[string]string{}
+			for _, p := range pairs {
+				got[p[0]] = p[1]
+			}
+			if len(got) != len(want) {
+				t.Fatalf("%s: %d spans, want %d", path, len(got), len(want))
+			}
+			for k, w := range want {
+				if got[k] != w {
+					t.Errorf("%s %s:\n  got  %.200s\n  want %.200s", path, k, got[k], w)
+				}
+			}
 		}
 	}
 }

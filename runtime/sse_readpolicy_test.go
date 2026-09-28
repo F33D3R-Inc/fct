@@ -139,9 +139,9 @@ func TestLiveStreamFiltersReadPolicyGatedRows(t *testing.T) {
 	bob := jarClient(t)
 	getPage(t, bob, ts.URL+"/?as=bob")
 
-	aliceFrames, aliceCancel := sseFrames(t, alice, ts.URL+"/live")
+	aliceFrames, aliceCancel := sseFrames(t, alice, ts.URL+"/api/_live")
 	defer aliceCancel()
-	bobFrames, bobCancel := sseFrames(t, bob, ts.URL+"/live")
+	bobFrames, bobCancel := sseFrames(t, bob, ts.URL+"/api/_live")
 	defer bobCancel()
 
 	// Drain each connection's opening "hello" snapshot (also read:-filtered by

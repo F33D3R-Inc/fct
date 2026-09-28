@@ -1,0 +1,1572 @@
+import "fqcli_text.fct"
+import "facetql_cli.fct"
+import "fabric_json.fct"
+import "http_client.fct"
+
+app FqCli:
+    # fqcli.fct — the `facetql` operator CLI, every command but the server
+    # itself: facetql/src/main.rs's init, backup and restore, cli/mod.rs's
+    # user/index/reference/get/put/delete/query/stats client (over
+    # cli/client.rs's HTTP calls and cli/output.rs's rendering) and routes,
+    # with clap's command line as facetql's derive builds it: the same
+    # arguments, env fallbacks, help screens, usage errors and exit codes.
+    # `facet facetql` runs fqserver.fct for `start` (and no command) and this
+    # program for everything else.
+    #
+    # The data directory is `--data-dir`, else FACETQL_DATA_DIR (or its
+    # deprecated ENOCHIAN_DATA_DIR), else ~/.facetql — which the launcher
+    # hands over as FACETQL_DEFAULT_DATA_DIR, since only a directory the
+    # operator named can be granted (grantDir) outside this program's sandbox.
+
+    # ── output ─────────────────────────────────────────────────────────
+    proc fqcOut(s: text) -> bool uses io.console:
+        let ok = writeStdout(s + "\n")
+        return ok
+
+    proc fqcErr(s: text) -> bool uses io.console:
+        let ok = writeStderr(s + "\n")
+        return ok
+
+    # ── the environment (config.rs's apply_legacy_env_aliases) ─────────
+    proc fqcAliased() -> [text]:
+        return ["FACETQL_TOKENS", "FACETQL_MASTER_KEY", "FACETQL_DATA_DIR", "FACETQL_PORT", "FACETQL_TLS_IDENTITY", "FACETQL_TLS_IDENTITY_PASSWORD"]
+
+    # fqcEnvName: the variable a read of `name` finds — its ENOCHIAN_*
+    # spelling when only that is set.
+    proc fqcEnvName(name: text) -> text uses io.env:
+        let aliased = do fqcAliased()
+        if !(name in aliased) || envSet(name):
+            return name
+        let legacy = "ENOCHIAN_" + slice(name, 8, len(name))
+        if envSet(legacy):
+            return legacy
+        return name
+
+    proc fqcEnvSet(name: text) -> bool uses io.env:
+        let n = do fqcEnvName(name)
+        return envSet(n)
+
+    proc fqcEnv(name: text) -> text uses io.env:
+        let n = do fqcEnvName(name)
+        return envVar(n)
+
+    proc fqcAliasWarnings() -> bool uses io.console, io.env:
+        let aliased = do fqcAliased()
+        let mut i = 0
+        loop i < len(aliased):
+            let n = do fqcEnvName(aliased[i])
+            if n != aliased[i]:
+                let w = writeStderr("warning: " + n + " is deprecated and will be removed in a future release — set " + aliased[i] + " instead. Using its value for now.\n")
+            i = i + 1
+        return true
+
+    # ── the command line (clap, as main.rs and cli/mod.rs derive it) ───
+    # FqcFlag: one `--long` option; value is its value name ("" for a
+    # switch), kind "text" | "usize" | "u16" | "choice", env the variable
+    # clap falls back to.
+    struct FqcFlag:
+        name: text
+        value: text
+        required: bool
+        kind: text
+        choices: [text]
+        env: text
+        dflt: text
+
+    struct FqcLeaf:
+        path: text
+        flags: [FqcFlag]
+        positionals: [text]
+
+    proc fqcSwitch(name: text) -> FqcFlag:
+        return FqcFlag{name: name, value: "", required: false, kind: "text", choices: [], env: "", dflt: ""}
+
+    proc fqcOpt(name: text, value: text, required: bool) -> FqcFlag:
+        return FqcFlag{name: name, value: value, required: required, kind: "text", choices: [], env: "", dflt: ""}
+
+    # The options every client command flattens in (ClientArgs), then the
+    # global --data-dir.
+    proc fqcClientFlags() -> [FqcFlag]:
+        return [FqcFlag{name: "url", value: "URL", required: false, kind: "text", choices: [], env: "FACETQL_URL", dflt: "http://localhost:8080"}, FqcFlag{name: "token", value: "TOKEN", required: false, kind: "text", choices: [], env: "FACETQL_TOKEN", dflt: ""}, fqcSwitch("json")]
+
+    proc fqcDataDirFlag() -> FqcFlag:
+        return FqcFlag{name: "data-dir", value: "DATA_DIR", required: false, kind: "text", choices: [], env: "FACETQL_DATA_DIR", dflt: ""}
+
+    proc fqcLeafOf(path: text) -> FqcLeaf:
+        let client = do fqcClientFlags()
+        let dd = do fqcDataDirFlag()
+        if path == "init":
+            return FqcLeaf{path: path, flags: [dd], positionals: []}
+        if path == "start":
+            return FqcLeaf{path: path, flags: [FqcFlag{name: "port", value: "PORT", required: false, kind: "u16", choices: [], env: "FACETQL_PORT", dflt: "8080"}, FqcFlag{name: "tls-identity", value: "TLS_IDENTITY", required: false, kind: "text", choices: [], env: "FACETQL_TLS_IDENTITY", dflt: ""}, FqcFlag{name: "tls-identity-password", value: "TLS_IDENTITY_PASSWORD", required: false, kind: "text", choices: [], env: "FACETQL_TLS_IDENTITY_PASSWORD", dflt: ""}, dd], positionals: []}
+        if path == "backup":
+            return FqcLeaf{path: path, flags: [dd], positionals: ["OUTPUT_DIR"]}
+        if path == "restore":
+            return FqcLeaf{path: path, flags: [dd], positionals: ["INPUT_DIR"]}
+        if path == "user create":
+            return FqcLeaf{path: path, flags: [fqcSwitch("admin")] + client + [dd], positionals: ["OWNER"]}
+        if path == "user delete":
+            return FqcLeaf{path: path, flags: [fqcSwitch("yes")] + client + [dd], positionals: ["OWNER"]}
+        if path == "index create":
+            return FqcLeaf{path: path, flags: [fqcOpt("kind", "KIND", true), fqcOpt("field", "FIELD", true), fqcSwitch("unique"), fqcSwitch("text")] + client + [dd], positionals: ["NAME"]}
+        if path == "index drop" || path == "reference drop":
+            return FqcLeaf{path: path, flags: [fqcSwitch("yes")] + client + [dd], positionals: ["NAME"]}
+        if path == "reference create":
+            return FqcLeaf{path: path, flags: [fqcOpt("kind", "KIND", true), fqcOpt("field", "FIELD", true), fqcOpt("parent-kind", "PARENT_KIND", true), fqcOpt("parent-field", "PARENT_FIELD", false), FqcFlag{name: "on-delete", value: "ON_DELETE", required: true, kind: "choice", choices: ["cascade", "restrict", "set-null"], env: "", dflt: ""}] + client + [dd], positionals: ["NAME"]}
+        if path == "get":
+            return FqcLeaf{path: path, flags: client + [dd], positionals: ["ADDRESS"]}
+        if path == "put":
+            return FqcLeaf{path: path, flags: [fqcOpt("kind", "KIND", true), fqcOpt("data", "DATA", true), fqcSwitch("public")] + client + [dd], positionals: ["ADDRESS"]}
+        if path == "delete":
+            return FqcLeaf{path: path, flags: [fqcSwitch("yes")] + client + [dd], positionals: ["ADDRESS"]}
+        if path == "query":
+            return FqcLeaf{path: path, flags: [fqcOpt("kind", "KIND", true), FqcFlag{name: "limit", value: "LIMIT", required: false, kind: "usize", choices: [], env: "", dflt: ""}, fqcOpt("order", "ORDER", false), fqcSwitch("desc")] + client + [dd], positionals: []}
+        if path == "routes":
+            return FqcLeaf{path: path, flags: [fqcSwitch("json"), dd], positionals: []}
+        # stats, user list, index list, reference list
+        return FqcLeaf{path: path, flags: client + [dd], positionals: []}
+
+    proc fqcTopCommands() -> [text]:
+        return ["init", "start", "backup", "restore", "user", "index", "reference", "get", "put", "delete", "query", "stats", "routes", "help"]
+
+    proc fqcGroupActions(group: text) -> [text]:
+        if group == "user":
+            return ["create", "list", "delete", "help"]
+        return ["create", "list", "drop", "help"]
+
+    proc fqcFlagText(f: FqcFlag) -> text:
+        if f.value == "":
+            return "--" + f.name
+        return "--" + f.name + " <" + f.value + ">"
+
+    # strsim::jaro over chars — how clap measures a near miss.
+    proc fqcJaro(a0: text, b0: text) -> float:
+        let a = split(a0, "")
+        let b = split(b0, "")
+        let al = len(a)
+        let bl = len(b)
+        if al == 0 && bl == 0:
+            return 1.0
+        if al == 0 || bl == 0:
+            return 0.0
+        let mut range = al / 2
+        if bl > al:
+            range = bl / 2
+        if range > 0:
+            range = range - 1
+        let mut af = []
+        let mut bf = []
+        let mut k = 0
+        loop k < al:
+            af = append(af, false)
+            k = k + 1
+        k = 0
+        loop k < bl:
+            bf = append(bf, false)
+            k = k + 1
+        let mut matches = 0
+        let mut i = 0
+        loop i < al:
+            let mut lo = 0
+            if i > range:
+                lo = i - range
+            let mut hi = i + range + 1
+            if hi > bl:
+                hi = bl
+            let mut j = lo
+            let mut found = false
+            loop j < hi && !found:
+                if a[i] == b[j] && !bf[j]:
+                    af[i] = true
+                    bf[j] = true
+                    matches = matches + 1
+                    found = true
+                j = j + 1
+            i = i + 1
+        if matches == 0:
+            return 0.0
+        let mut t = 0
+        let mut bi = 0
+        i = 0
+        loop i < al:
+            if af[i]:
+                loop !bf[bi]:
+                    bi = bi + 1
+                if a[i] != b[bi]:
+                    t = t + 1
+                bi = bi + 1
+            i = i + 1
+        t = t / 2
+        let m = toFloat(matches)
+        return (m / toFloat(al) + m / toFloat(bl) + toFloat(matches - t) / m) / 3.0
+
+    # clap's did_you_mean: every candidate over 0.7, least confident first
+    # (a tie after the ones already there).
+    proc fqcSimilar(v: text, candidates: [text]) -> [text]:
+        let mut names = []
+        let mut confs = []
+        let mut i = 0
+        loop i < len(candidates):
+            let c = do fqcJaro(v, candidates[i])
+            if c > 0.7:
+                let mut p = 0
+                loop p < len(confs) && confs[p] <= c:
+                    p = p + 1
+                names = slice(names, 0, p) + [candidates[i]] + slice(names, p, len(names))
+                confs = slice(confs, 0, p) + [c] + slice(confs, p, len(confs))
+            i = i + 1
+        return names
+
+    # The one clap offers for an argument or a value: the most confident.
+    proc fqcSuggest(v: text, candidates: [text]) -> text:
+        let all = do fqcSimilar(v, candidates)
+        if len(all) == 0:
+            return ""
+        return all[len(all) - 1]
+
+    # The tip for an unknown subcommand: every similar one.
+    proc fqcSubcommandTip(v: text, candidates: [text]) -> text:
+        let all = do fqcSimilar(v, candidates)
+        if len(all) == 0:
+            return ""
+        if len(all) == 1:
+            return "a similar subcommand exists: '" + all[0] + "'"
+        return "some similar subcommands exist: '" + join(all, "', '") + "'"
+
+    proc fqcMore() -> text:
+        return "\nFor more information, try '--help'.\n"
+
+    # The usage line clap prints under an error: the full form, or the
+    # required form (the options that are required or were used, then the
+    # positionals) — the full form again when that would name nothing.
+    proc fqcFullUsage(leaf: FqcLeaf) -> text:
+        let mut u = "facetql " + leaf.path + " [OPTIONS]"
+        let mut i = 0
+        loop i < len(leaf.flags):
+            if leaf.flags[i].required:
+                u = u + " " + fqcFlagText(leaf.flags[i])
+            i = i + 1
+        i = 0
+        loop i < len(leaf.positionals):
+            u = u + " <" + leaf.positionals[i] + ">"
+            i = i + 1
+        return u
+
+    proc fqcRequiredUsage(leaf: FqcLeaf, used: [text]) -> text:
+        let mut parts = ""
+        let mut i = 0
+        loop i < len(leaf.flags):
+            if leaf.flags[i].required || leaf.flags[i].name in used:
+                parts = parts + " " + fqcFlagText(leaf.flags[i])
+            i = i + 1
+        i = 0
+        loop i < len(leaf.positionals):
+            parts = parts + " <" + leaf.positionals[i] + ">"
+            i = i + 1
+        if parts == "":
+            let full = do fqcFullUsage(leaf)
+            return full
+        return "facetql " + leaf.path + parts
+
+    struct FqcUsageErr:
+        text: text
+
+    proc fqcUsageFail(msg: text, tip: text, usage: text) -> text:
+        let mut out = "error: " + msg + "\n"
+        if tip != "":
+            out = out + "\n  tip: " + tip + "\n"
+        if usage != "":
+            out = out + "\nUsage: " + usage + "\n"
+        return out + fqcMore()
+
+    # FqcArgs: a parsed leaf — each option's value ("" and absent when not
+    # given: `given` says which were), and the positionals.
+    struct FqcArgs:
+        ok: bool
+        exit: int
+        out: text
+        err: text
+        names: [text]
+        values: [text]
+        positionals: [text]
+
+    proc fqcArgsFail(err: text) -> FqcArgs:
+        return FqcArgs{ok: false, exit: 2, out: "", err: err, names: [], values: [], positionals: []}
+
+    proc fqcArgsHelp(path: text, short: bool) -> FqcArgs uses io.env:
+        let h = do fqcHelp(path, short)
+        return FqcArgs{ok: false, exit: 0, out: h, err: "", names: [], values: [], positionals: []}
+
+    proc fqcFlagAt(leaf: FqcLeaf, name: text) -> int:
+        let mut i = 0
+        loop i < len(leaf.flags):
+            if leaf.flags[i].name == name:
+                return i
+            i = i + 1
+        return -1
+
+    # Rust's `<uN>::from_str` failure text for what an option was given, ""
+    # when it parses (an optional '+', then digits, within max).
+    proc fqcUintError(v: text, maxDigits: text) -> text:
+        if v == "":
+            return "cannot parse integer from empty string"
+        let bs = textToBytes(v)
+        let mut i = 0
+        if bs[0] == 43 && len(bs) > 1:
+            i = 1
+        let mut digits = ""
+        loop i < len(bs):
+            if bs[i] < 48 || bs[i] > 57:
+                return "invalid digit found in string"
+            digits = digits + charAt(v, i)
+            i = i + 1
+        let mut d = digits
+        loop len(d) > 1 && charAt(d, 0) == "0":
+            d = slice(d, 1, len(d))
+        if len(d) > len(maxDigits) || (len(d) == len(maxDigits) && d > maxDigits):
+            return "number too large to fit in target type"
+        return ""
+
+    # clap's ranged integer parser: i64::from_str, then the range —
+    # "N is not in LO..=HI" naming the number as parsed.
+    proc fqcRangedError(v: text, lo: int, hi: int) -> text:
+        if v == "":
+            return "cannot parse integer from empty string"
+        let bs = textToBytes(v)
+        let mut i = 0
+        let mut neg = false
+        if (bs[0] == 43 || bs[0] == 45) && len(bs) > 1:
+            neg = bs[0] == 45
+            i = 1
+        let mut n = 0
+        loop i < len(bs):
+            if bs[i] < 48 || bs[i] > 57:
+                return "invalid digit found in string"
+            let d = bs[i] - 48
+            if !neg && (n > 922337203685477580 || (n == 922337203685477580 && d > 7)):
+                return "number too large to fit in target type"
+            if neg && (n > 922337203685477580 || (n == 922337203685477580 && d > 8)):
+                return "number too small to fit in target type"
+            n = n * 10 + d
+            i = i + 1
+        if neg:
+            n = 0 - n
+        if n < lo || n > hi:
+            return "" + n + " is not in " + lo + "..=" + hi
+        return ""
+
+    proc fqcCheckValue(f: FqcFlag, v: text) -> text:
+        let shown = "'" + v + "' for '" + fqcFlagText(f) + "'"
+        if f.kind == "usize":
+            let e = do fqcUintError(v, "18446744073709551615")
+            if e != "":
+                return "error: invalid value " + shown + ": " + e + "\n" + fqcMore()
+        if f.kind == "u16":
+            let e2 = do fqcRangedError(v, 0, 65535)
+            if e2 != "":
+                return "error: invalid value " + shown + ": " + e2 + "\n" + fqcMore()
+        if f.kind == "choice" && !(v in f.choices):
+            let mut out = "error: invalid value " + shown + "\n  [possible values: " + join(f.choices, ", ") + "]\n"
+            let near = do fqcSuggest(v, f.choices)
+            if near != "":
+                out = out + "\n  tip: a similar value exists: '" + near + "'\n"
+            return out + fqcMore()
+        return ""
+
+    # fqcParseLeaf: clap's parse of one leaf command's arguments.
+    proc fqcParseLeaf(leaf: FqcLeaf, args: [text]) -> FqcArgs uses io.env:
+        let mut names = []
+        let mut values = []
+        let mut pos = []
+        let mut used = []
+        let mut rest = false
+        let mut i = 0
+        loop i < len(args):
+            let a = args[i]
+            if rest || a == "-" || charAt(a, 0) != "-":
+                if len(pos) >= len(leaf.positionals):
+                    let full = do fqcFullUsage(leaf)
+                    let f0 = do fqcUsageFail("unexpected argument '" + a + "' found", "", full)
+                    let r0 = do fqcArgsFail(f0)
+                    return r0
+                pos = append(pos, a)
+                i = i + 1
+            else:
+                if a == "--":
+                    rest = true
+                    i = i + 1
+                else:
+                    if a == "-h" || a == "--help":
+                        let h = do fqcArgsHelp(leaf.path, a == "-h")
+                        return h
+                    if slice(a, 0, 2) != "--":
+                        let full1 = do fqcFullUsage(leaf)
+                        let mut tip1 = ""
+                        if len(leaf.positionals) > 0:
+                            tip1 = "to pass '" + a + "' as a value, use '-- " + a + "'"
+                        let f1 = do fqcUsageFail("unexpected argument '" + a + "' found", tip1, full1)
+                        let r1 = do fqcArgsFail(f1)
+                        return r1
+                    let body = slice(a, 2, len(a))
+                    let eq = indexOf(body, "=", 0)
+                    let mut name = body
+                    let mut inline = ""
+                    let mut hasInline = false
+                    if eq >= 0:
+                        name = slice(body, 0, eq)
+                        inline = slice(body, eq + 1, len(body))
+                        hasInline = true
+                    let at = do fqcFlagAt(leaf, name)
+                    if at < 0:
+                        let mut longs = []
+                        let mut q = 0
+                        loop q < len(leaf.flags):
+                            longs = append(longs, leaf.flags[q].name)
+                            q = q + 1
+                        longs = append(longs, "help")
+                        let near = do fqcSuggest(name, longs)
+                        let mut tip = ""
+                        let mut used2 = used
+                        if near != "":
+                            tip = "a similar argument exists: '--" + near + "'"
+                            used2 = append(used2, near)
+                        else:
+                            if len(leaf.positionals) > 0:
+                                tip = "to pass '" + a + "' as a value, use '-- " + a + "'"
+                        let usage = do fqcRequiredUsage(leaf, used2)
+                        let f2 = do fqcUsageFail("unexpected argument '" + a + "' found", tip, usage)
+                        let r2 = do fqcArgsFail(f2)
+                        return r2
+                    let f = leaf.flags[at]
+                    if name in used:
+                        let full3 = do fqcFullUsage(leaf)
+                        let f3 = do fqcUsageFail("the argument '" + fqcFlagText(f) + "' cannot be used multiple times", "", full3)
+                        let r3 = do fqcArgsFail(f3)
+                        return r3
+                    used = append(used, name)
+                    if f.value == "":
+                        if hasInline:
+                            let usage4 = do fqcRequiredUsage(leaf, used)
+                            let f4 = do fqcUsageFail("unexpected value '" + inline + "' for '--" + name + "' found; no more were expected", "", usage4)
+                            let r4 = do fqcArgsFail(f4)
+                            return r4
+                        names = append(names, name)
+                        values = append(values, "true")
+                        i = i + 1
+                    else:
+                        let mut v = inline
+                        if !hasInline:
+                            if i + 1 >= len(args) || (charAt(args[i + 1], 0) == "-" && args[i + 1] != "-"):
+                                if i + 1 < len(args):
+                                    let full5 = do fqcFullUsage(leaf)
+                                    let f5 = do fqcUsageFail("unexpected argument '" + args[i + 1] + "' found", "", full5)
+                                    let r5 = do fqcArgsFail(f5)
+                                    return r5
+                                let mut msg = "error: a value is required for '" + fqcFlagText(f) + "' but none was supplied\n"
+                                if f.kind == "choice":
+                                    msg = msg + "  [possible values: " + join(f.choices, ", ") + "]\n"
+                                let r6 = do fqcArgsFail(msg + fqcMore())
+                                return r6
+                            v = args[i + 1]
+                            i = i + 1
+                        let bad = do fqcCheckValue(f, v)
+                        if bad != "":
+                            let r7 = do fqcArgsFail(bad)
+                            return r7
+                        names = append(names, name)
+                        values = append(values, v)
+                        i = i + 1
+        # env fallbacks, then what is still missing
+        let mut k = 0
+        loop k < len(leaf.flags):
+            let f8 = leaf.flags[k]
+            if f8.env != "" && !(f8.name in names):
+                let set = do fqcEnvSet(f8.env)
+                if set:
+                    let ev = do fqcEnv(f8.env)
+                    let bad2 = do fqcCheckValue(f8, ev)
+                    if bad2 != "":
+                        let r8 = do fqcArgsFail(bad2)
+                        return r8
+                    names = append(names, f8.name)
+                    values = append(values, ev)
+            k = k + 1
+        let mut missing = []
+        k = 0
+        loop k < len(leaf.flags):
+            if leaf.flags[k].required && !(leaf.flags[k].name in names):
+                missing = append(missing, fqcFlagText(leaf.flags[k]))
+            k = k + 1
+        k = len(pos)
+        loop k < len(leaf.positionals):
+            missing = append(missing, "<" + leaf.positionals[k] + ">")
+            k = k + 1
+        if len(missing) > 0:
+            let usage9 = do fqcRequiredUsage(leaf, used)
+            let r9 = do fqcArgsFail("error: the following required arguments were not provided:\n  " + join(missing, "\n  ") + "\n\nUsage: " + usage9 + "\n" + fqcMore())
+            return r9
+        return FqcArgs{ok: true, exit: 0, out: "", err: "", names: names, values: values, positionals: pos}
+
+    proc fqcGiven(a: FqcArgs, name: text) -> bool:
+        return name in a.names
+
+    proc fqcValue(a: FqcArgs, name: text) -> text:
+        let mut i = 0
+        loop i < len(a.names):
+            if a.names[i] == name:
+                return a.values[i]
+            i = i + 1
+        return ""
+
+    # A help screen with clap's `[env: NAME=value]` filled in.
+    proc fqcHelp(path: text, short: bool) -> text uses io.env:
+        let mut h = do fqcHelpText(path, short)
+        let vars = ["FACETQL_DATA_DIR", "FACETQL_PORT", "FACETQL_TLS_IDENTITY", "FACETQL_TLS_IDENTITY_PASSWORD", "FACETQL_TOKEN", "FACETQL_URL"]
+        let mut i = 0
+        loop i < len(vars):
+            let v = do fqcEnv(vars[i])
+            h = replace(h, "{" + vars[i] + "}", v)
+            i = i + 1
+        return h
+
+    # ── validation (cli/mod.rs) ────────────────────────────────────────
+    struct FqcCheck:
+        ok: bool
+        err: CliError
+
+    proc fqcFine() -> FqcCheck:
+        let e = do cliErrorAborted()
+        return FqcCheck{ok: true, err: e}
+
+    proc fqcInvalid(msg: text) -> FqcCheck:
+        let e = do cliErrorInvalidInput(msg)
+        return FqcCheck{ok: false, err: e}
+
+    # char::is_whitespace / is_control for the characters an argument can
+    # carry: Unicode White_Space and the C0/C1 controls.
+    proc fqcBadSegmentChar(c: text) -> bool:
+        if c == "/":
+            return true
+        let bs = textToBytes(c)
+        let b = bs[0]
+        if len(bs) == 1:
+            return b <= 32 || b == 127
+        let cp = do fqcCodePoint(bs)
+        if cp >= 128 && cp <= 159:
+            return true
+        return cp == 133 || cp == 160 || cp == 5760 || (cp >= 8192 && cp <= 8202) || cp == 8232 || cp == 8233 || cp == 8239 || cp == 8287 || cp == 12288
+
+    proc fqcCodePoint(bs: [int]) -> int:
+        let n = len(bs)
+        if n == 2:
+            return ((bs[0] & 31) << 6) | (bs[1] & 63)
+        if n == 3:
+            return ((bs[0] & 15) << 12) | ((bs[1] & 63) << 6) | (bs[2] & 63)
+        return ((bs[0] & 7) << 18) | ((bs[1] & 63) << 12) | ((bs[2] & 63) << 6) | (bs[3] & 63)
+
+    proc fqcValidateSegment(label: text, value: text) -> FqcCheck:
+        if value == "":
+            let e = do fqcInvalid(label + " must not be empty")
+            return e
+        let cs = split(value, "")
+        let mut i = 0
+        loop i < len(cs):
+            let bad = do fqcBadSegmentChar(cs[i])
+            if bad:
+                let e2 = do fqcInvalid("invalid " + label + " " + sjDebugStr(value) + ": must not contain '/', whitespace, or control characters")
+                return e2
+            i = i + 1
+        let ok = do fqcFine()
+        return ok
+
+    proc fqcValidateKind(kind: text) -> FqcCheck:
+        if trim(kind) == "":
+            let e = do fqcInvalid("kind must not be empty")
+            return e
+        let ok = do fqcFine()
+        return ok
+
+    proc fqcValidateField(field: text) -> FqcCheck:
+        if trim(field) == "":
+            let e = do fqcInvalid("field must not be empty")
+            return e
+        let ok = do fqcFine()
+        return ok
+
+    proc fqcValidateIndexName(name: text) -> FqcCheck:
+        if name == "" || byteLen(name) > 64:
+            let e = do fqcInvalid("index name must be 1..=64 bytes")
+            return e
+        let bs = textToBytes(name)
+        let mut i = 0
+        loop i < len(bs):
+            let b = bs[i]
+            let ok = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b == 45
+            if !ok:
+                let e2 = do fqcInvalid("invalid index name " + sjDebugStr(name) + ": may contain only letters, digits, '_' and '-'")
+                return e2
+            i = i + 1
+        let fine = do fqcFine()
+        return fine
+
+    # ── confirmation ───────────────────────────────────────────────────
+    proc fqcConfirm(skip: bool, prompt: text) -> FqcCheck uses io.console:
+        if skip:
+            let ok = do fqcFine()
+            return ok
+        let w = writeStderr(prompt + " [y/N]: ")
+        let line = readStdinLine()
+        let answer = lower(trim(line))
+        if line != "" && (answer == "y" || answer == "yes"):
+            let ok2 = do fqcFine()
+            return ok2
+        let e = do cliErrorAborted()
+        return FqcCheck{ok: false, err: e}
+
+    # ── the HTTP client (cli/client.rs) ────────────────────────────────
+    struct FqcClient:
+        ok: bool
+        err: CliError
+        base: text
+        token: text
+
+    proc fqcClientOf(a: FqcArgs) -> FqcClient:
+        let e = do cliErrorMissingToken()
+        let token = do fqcValue(a, "token")
+        if token == "":
+            return FqcClient{ok: false, err: e, base: "", token: ""}
+        let mut base = "http://localhost:8080"
+        let given = do fqcGiven(a, "url")
+        if given:
+            base = fqcValue(a, "url")
+        loop len(base) > 0 && charAt(base, len(base) - 1) == "/":
+            base = slice(base, 0, len(base) - 1)
+        return FqcClient{ok: true, err: e, base: base, token: token}
+
+    struct FqcReply:
+        ok: bool
+        err: CliError
+        status: int
+        body: text
+
+    proc fqcSend(c: FqcClient, method: text, path: text, body: text) -> FqcReply uses io.net:
+        let mut headers = [HttpHeader{name: "x-api-key", value: c.token}]
+        if method == "POST":
+            headers = [HttpHeader{name: "content-type", value: "application/json"}] + headers
+        let r = do httpExchange(HttpRequest{method: method, url: c.base + path, headers: headers, body: body, timeoutMs: 0})
+        if !r.ok:
+            let mut msg = "request failed: " + r.err
+            if slice(r.err, 0, 13) == "builder error":
+                msg = "request failed: builder error"
+            else:
+                if slice(r.err, 0, 8) == "connect " || slice(r.err, 0, 11) == "connectTls ":
+                    msg = "could not connect to the server — is `facetql start` running at the given --url?"
+                else:
+                    if contains(r.err, "i/o timeout"):
+                        msg = "request timed out"
+            let e = do cliErrorRequest(msg)
+            return FqcReply{ok: false, err: e, status: 0, body: ""}
+        let fine = do cliErrorAborted()
+        return FqcReply{ok: true, err: fine, status: r.status, body: r.body}
+
+    struct FqcJson:
+        ok: bool
+        err: CliError
+        v: SjV
+
+    proc fqcJsonFail(e: CliError) -> FqcJson:
+        return FqcJson{ok: false, err: e, v: sjNull()}
+
+    # read_json: a 2xx body as JSON, anything else the server's refusal.
+    proc fqcReadJson(r: FqcReply) -> FqcJson:
+        if !r.ok:
+            let f = do fqcJsonFail(r.err)
+            return f
+        if r.status < 200 || r.status >= 300:
+            let e = do cliErrorApi(r.status, r.body)
+            let f2 = do fqcJsonFail(e)
+            return f2
+        let d = do sjDecode([], r.body, "value")
+        if !d.ok:
+            let e2 = do cliErrorRequest("invalid JSON from server: " + d.err)
+            let f3 = do fqcJsonFail(e2)
+            return f3
+        return FqcJson{ok: true, err: r.err, v: d.v}
+
+    proc fqcReadJsonArray(r: FqcReply) -> FqcJson:
+        let j = do fqcReadJson(r)
+        if j.ok && j.v.kind != "arr":
+            let e = do cliErrorRequest("expected a JSON array from server, got: " + sjValueText(j.v))
+            let f = do fqcJsonFail(e)
+            return f
+        return j
+
+    proc fqcExpectSuccess(r: FqcReply) -> FqcCheck:
+        if !r.ok:
+            return FqcCheck{ok: false, err: r.err}
+        if r.status < 200 || r.status >= 300:
+            let e = do cliErrorApi(r.status, r.body)
+            return FqcCheck{ok: false, err: e}
+        let ok = do fqcFine()
+        return ok
+
+    # ── rendering (cli/output.rs) ──────────────────────────────────────
+    proc fqcPretty(v: SjV) -> text:
+        let p = sjPretty(sjValueText(v))
+        return p
+
+    proc fqcMember(v: SjV, key: text) -> SjV:
+        if v.kind == "obj":
+            let mut i = 0
+            loop i < len(v.keys):
+                if v.keys[i] == key:
+                    return v.items[i]
+                i = i + 1
+        return sjAbsent()
+
+    # `v.get(key).and_then(Value::as_str).unwrap_or(fallback)`
+    proc fqcStr(v: SjV, key: text, fallback: text) -> text:
+        let m = do fqcMember(v, key)
+        if m.kind == "str":
+            return m.s
+        return fallback
+
+    # visibility / role_str: a string as itself, anything else as JSON, "-"
+    # when absent.
+    proc fqcShown(v: SjV, key: text) -> text:
+        let m = do fqcMember(v, key)
+        if m.kind == "absent":
+            return "-"
+        if m.kind == "str":
+            return m.s
+        return sjValueText(m)
+
+    # `{:<width$}`: padded to width characters (the widths are byte lengths,
+    # as output.rs measures them).
+    proc fqcPad(s: text, width: int) -> text:
+        let mut out = s
+        let mut n = len(s)
+        loop n < width:
+            out = out + " "
+            n = n + 1
+        return out
+
+    proc fqcRenderNode(node: SjV) -> text:
+        let mut out = "address:    " + fqcStr(node, "address", "-") + "\n"
+        out = out + "kind:       " + fqcStr(node, "kind", "-") + "\n"
+        out = out + "owner:      " + fqcStr(node, "owner", "-") + "\n"
+        out = out + "visibility: " + fqcShown(node, "visibility") + "\n"
+        out = out + "claimed_by: " + fqcStr(node, "claimed_by", "-") + "\n"
+        let coord = do fqcMember(node, "coordinate")
+        if coord.kind != "absent":
+            out = out + "coordinate: " + sjValueText(coord) + "\n"
+        return out + "data:       " + fqcStr(node, "data", "-")
+
+    proc fqcRenderNodes(nodes: [SjV]) -> text:
+        if len(nodes) == 0:
+            return "(no rows)"
+        let mut out = ""
+        let mut i = 0
+        loop i < len(nodes):
+            if i > 0:
+                out = out + "\n---\n"
+            out = out + fqcRenderNode(nodes[i])
+            i = i + 1
+        return out + "\n\n" + len(nodes) + " row(s)"
+
+    proc fqcRenderUsers(users: [SjV]) -> text:
+        if len(users) == 0:
+            return "(no users)"
+        let mut width = 5
+        let mut i = 0
+        loop i < len(users):
+            let o = do fqcMember(users[i], "owner")
+            if o.kind == "str" && byteLen(o.s) > width:
+                width = byteLen(o.s)
+            i = i + 1
+        let mut out = fqcPad("OWNER", width) + "  ROLE\n"
+        i = 0
+        loop i < len(users):
+            out = out + fqcPad(fqcStr(users[i], "owner", "-"), width) + "  " + fqcShown(users[i], "role") + "\n"
+            i = i + 1
+        return out + "\n" + len(users) + " user(s)"
+
+    proc fqcColumnWidth(rows: [SjV], header: text, key: text, fallback: text) -> int:
+        let mut w = byteLen(header)
+        let mut i = 0
+        loop i < len(rows):
+            let c = byteLen(fqcStr(rows[i], key, fallback))
+            if c > w:
+                w = c
+            i = i + 1
+        return w
+
+    proc fqcRenderIndexes(indexes: [SjV]) -> text:
+        if len(indexes) == 0:
+            return "(no indexes declared)"
+        let nw = do fqcColumnWidth(indexes, "NAME", "name", "-")
+        let kw = do fqcColumnWidth(indexes, "KIND", "kind", "-")
+        let fw = do fqcColumnWidth(indexes, "FIELD", "field", "-")
+        let mut out = fqcPad("NAME", nw) + "  " + fqcPad("KIND", kw) + "  " + fqcPad("FIELD", fw) + "  MODE\n"
+        let mut i = 0
+        loop i < len(indexes):
+            let x = indexes[i]
+            out = out + fqcPad(fqcStr(x, "name", "-"), nw) + "  " + fqcPad(fqcStr(x, "kind", "-"), kw) + "  " + fqcPad(fqcStr(x, "field", "-"), fw) + "  " + fqcStr(x, "mode", "ordered") + "\n"
+            i = i + 1
+        return out + "\n" + len(indexes) + " index(es)"
+
+    proc fqcReferenceRule(r: SjV) -> text:
+        let mut parent = fqcStr(r, "parent_kind", "-")
+        let pf = do fqcMember(r, "parent_field")
+        if pf.kind == "str":
+            parent = parent + "." + pf.s
+        return fqcStr(r, "kind", "-") + "." + fqcStr(r, "field", "-") + " -> " + parent
+
+    proc fqcRenderReferences(refs: [SjV]) -> text:
+        if len(refs) == 0:
+            return "(no references declared)"
+        let nw = do fqcColumnWidth(refs, "NAME", "name", "-")
+        let mut rw = byteLen("REFERENCE")
+        let mut i = 0
+        loop i < len(refs):
+            let w = byteLen(fqcReferenceRule(refs[i]))
+            if w > rw:
+                rw = w
+            i = i + 1
+        let mut out = fqcPad("NAME", nw) + "  " + fqcPad("REFERENCE", rw) + "  ON DELETE\n"
+        i = 0
+        loop i < len(refs):
+            out = out + fqcPad(fqcStr(refs[i], "name", "-"), nw) + "  " + fqcPad(fqcReferenceRule(refs[i]), rw) + "  " + fqcStr(refs[i], "on_delete", "-") + "\n"
+            i = i + 1
+        return out + "\n" + len(refs) + " reference(s)"
+
+    # ── commands ───────────────────────────────────────────────────────
+    # FqcDone: what a command ends with — 0, or a CliError reported as
+    # report_error does (`error: {err}` and its exit code).
+    proc fqcReport(e: CliError) -> int uses io.console:
+        let w = writeStderr("error: " + cliErrorDisplay(e) + "\n")
+        let code = do cliErrorExitCode(e)
+        return code
+
+    proc fqcCmdUser(action: text, a: FqcArgs) -> int uses io.console, io.net:
+        let json = do fqcGiven(a, "json")
+        if action == "create" || action == "delete":
+            let owner = a.positionals[0]
+            let v = do fqcValidateSegment("owner", owner)
+            if !v.ok:
+                let c0 = do fqcReport(v.err)
+                return c0
+            if action == "delete":
+                let yes = do fqcGiven(a, "yes")
+                let cf = do fqcConfirm(yes, "Revoke every persistent token for owner " + sjDebugStr(owner) + "?")
+                if !cf.ok:
+                    let c1 = do fqcReport(cf.err)
+                    return c1
+            let cl = do fqcClientOf(a)
+            if !cl.ok:
+                let c2 = do fqcReport(cl.err)
+                return c2
+            if action == "delete":
+                let r = do fqcSend(cl, "DELETE", "/admin/users/" + owner, "")
+                let s = do fqcExpectSuccess(r)
+                if !s.ok:
+                    let c3 = do fqcReport(s.err)
+                    return c3
+                let o = do fqcOut("Revoked persistent identity " + sjDebugStr(owner) + ".")
+                return 0
+            let mut role = "user"
+            let admin = do fqcGiven(a, "admin")
+            if admin:
+                role = "admin"
+            let r2 = do fqcSend(cl, "POST", "/admin/users", "{\"owner\":" + sjQuote(owner) + ",\"role\":" + sjQuote(role) + "}")
+            let j = do fqcReadJson(r2)
+            if !j.ok:
+                let c4 = do fqcReport(j.err)
+                return c4
+            if json:
+                let o2 = do fqcOut(fqcPretty(j.v))
+                return 0
+            let token = do fqcStr(j.v, "token", "")
+            let rm = do fqcMember(j.v, "role")
+            let mut shownRole = ""
+            if rm.kind != "absent":
+                shownRole = sjValueText(rm)
+                loop len(shownRole) > 0 && charAt(shownRole, 0) == "\"":
+                    shownRole = slice(shownRole, 1, len(shownRole))
+                loop len(shownRole) > 0 && charAt(shownRole, len(shownRole) - 1) == "\"":
+                    shownRole = slice(shownRole, 0, len(shownRole) - 1)
+            let o3 = do fqcOut("Created identity " + sjDebugStr(owner) + " (role " + shownRole + ").")
+            let o4 = do fqcOut("token: " + token)
+            let e5 = do fqcErr("This token is shown once and cannot be retrieved again. Store it now; if lost, revoke and create a new one.")
+            return 0
+        let cl2 = do fqcClientOf(a)
+        if !cl2.ok:
+            let c5 = do fqcReport(cl2.err)
+            return c5
+        let r3 = do fqcSend(cl2, "GET", "/admin/users", "")
+        let j2 = do fqcReadJsonArray(r3)
+        if !j2.ok:
+            let c6 = do fqcReport(j2.err)
+            return c6
+        if json:
+            let o5 = do fqcOut(fqcPretty(j2.v))
+            return 0
+        let o6 = do fqcOut(fqcRenderUsers(j2.v.items))
+        return 0
+
+    proc fqcCmdIndex(action: text, a: FqcArgs) -> int uses io.console, io.net:
+        let json = do fqcGiven(a, "json")
+        if action == "list":
+            let cl = do fqcClientOf(a)
+            if !cl.ok:
+                let c0 = do fqcReport(cl.err)
+                return c0
+            let r = do fqcSend(cl, "GET", "/admin/indexes", "")
+            let j = do fqcReadJsonArray(r)
+            if !j.ok:
+                let c1 = do fqcReport(j.err)
+                return c1
+            if json:
+                let o = do fqcOut(fqcPretty(j.v))
+                return 0
+            let o1 = do fqcOut(fqcRenderIndexes(j.v.items))
+            return 0
+        let name = a.positionals[0]
+        let vn = do fqcValidateIndexName(name)
+        if !vn.ok:
+            let c2 = do fqcReport(vn.err)
+            return c2
+        if action == "drop":
+            let yes = do fqcGiven(a, "yes")
+            let cf = do fqcConfirm(yes, "Drop index " + sjDebugStr(name) + "? Queries it served fall back to sorting a full scan; rebuilding it re-reads the kind.")
+            if !cf.ok:
+                let c3 = do fqcReport(cf.err)
+                return c3
+            let cl2 = do fqcClientOf(a)
+            if !cl2.ok:
+                let c4 = do fqcReport(cl2.err)
+                return c4
+            let r2 = do fqcSend(cl2, "DELETE", "/admin/indexes/" + name, "")
+            let s = do fqcExpectSuccess(r2)
+            if !s.ok:
+                let c5 = do fqcReport(s.err)
+                return c5
+            let o2 = do fqcOut("Dropped index " + sjDebugStr(name) + ".")
+            return 0
+        let kind = do fqcValue(a, "kind")
+        let field = do fqcValue(a, "field")
+        let vk = do fqcValidateKind(kind)
+        if !vk.ok:
+            let c6 = do fqcReport(vk.err)
+            return c6
+        let vf = do fqcValidateField(field)
+        if !vf.ok:
+            let c7 = do fqcReport(vf.err)
+            return c7
+        let unique = do fqcGiven(a, "unique")
+        let isText = do fqcGiven(a, "text")
+        if isText && unique:
+            let e = do cliErrorInvalidInput("--unique cannot be combined with --text: a text index stores windows of a value, not the value. Declare an ordered unique index over the same field instead.")
+            let c8 = do fqcReport(e)
+            return c8
+        let mut mode = "ordered"
+        if isText:
+            mode = "text"
+        let cl3 = do fqcClientOf(a)
+        if !cl3.ok:
+            let c9 = do fqcReport(cl3.err)
+            return c9
+        let mut u = "false"
+        if unique:
+            u = "true"
+        let r3 = do fqcSend(cl3, "POST", "/admin/indexes", "{\"field\":" + sjQuote(field) + ",\"kind\":" + sjQuote(kind) + ",\"mode\":" + sjQuote(mode) + ",\"name\":" + sjQuote(name) + ",\"unique\":" + u + "}")
+        let j2 = do fqcReadJson(r3)
+        if !j2.ok:
+            let c10 = do fqcReport(j2.err)
+            return c10
+        if json:
+            let o3 = do fqcOut(fqcPretty(j2.v))
+            return 0
+        if isText:
+            let o4 = do fqcOut("Declared text index " + sjDebugStr(name) + " on " + kind + "." + field + ".")
+            let e4 = do fqcErr("Backfilled from every existing " + kind + " node. Searching " + sjDebugStr(field) + " with contains/starts_with/ends_with now reads the rows whose text holds the query's three-byte windows instead of every node of the kind.")
+            return 0
+        let mut rule = ""
+        if unique:
+            rule = " (unique)"
+        let o5 = do fqcOut("Declared index " + sjDebugStr(name) + " on " + kind + "." + field + rule + ".")
+        let e5 = do fqcErr("Backfilled from every existing " + kind + " node. Queries on this kind ordering by " + sjDebugStr(field) + " now read through the index instead of sorting a full scan.")
+        return 0
+
+    proc fqcCmdReference(action: text, a: FqcArgs) -> int uses io.console, io.net:
+        let json = do fqcGiven(a, "json")
+        if action == "list":
+            let cl = do fqcClientOf(a)
+            if !cl.ok:
+                let c0 = do fqcReport(cl.err)
+                return c0
+            let r = do fqcSend(cl, "GET", "/admin/references", "")
+            let j = do fqcReadJsonArray(r)
+            if !j.ok:
+                let c1 = do fqcReport(j.err)
+                return c1
+            if json:
+                let o = do fqcOut(fqcPretty(j.v))
+                return 0
+            let o1 = do fqcOut(fqcRenderReferences(j.v.items))
+            return 0
+        let name = a.positionals[0]
+        let vn = do fqcValidateIndexName(name)
+        if !vn.ok:
+            let c2 = do fqcReport(vn.err)
+            return c2
+        if action == "drop":
+            let yes = do fqcGiven(a, "yes")
+            let cf = do fqcConfirm(yes, "Drop reference " + sjDebugStr(name) + "? Deletes stop cascading immediately, so rows that referenced a deleted node are left behind with nothing pointing them out.")
+            if !cf.ok:
+                let c3 = do fqcReport(cf.err)
+                return c3
+            let cl2 = do fqcClientOf(a)
+            if !cl2.ok:
+                let c4 = do fqcReport(cl2.err)
+                return c4
+            let r2 = do fqcSend(cl2, "DELETE", "/admin/references/" + name, "")
+            let s = do fqcExpectSuccess(r2)
+            if !s.ok:
+                let c5 = do fqcReport(s.err)
+                return c5
+            let o2 = do fqcOut("Dropped reference " + sjDebugStr(name) + ".")
+            return 0
+        let kind = do fqcValue(a, "kind")
+        let field = do fqcValue(a, "field")
+        let parentKind = do fqcValue(a, "parent-kind")
+        let hasParentField = do fqcGiven(a, "parent-field")
+        let parentField = do fqcValue(a, "parent-field")
+        let onDelete = do fqcValue(a, "on-delete")
+        let checks = [fqcValidateKind(kind), fqcValidateField(field), fqcValidateKind(parentKind)]
+        let mut i = 0
+        loop i < len(checks):
+            if !checks[i].ok:
+                let c6 = do fqcReport(checks[i].err)
+                return c6
+            i = i + 1
+        if hasParentField:
+            let vp = do fqcValidateField(parentField)
+            if !vp.ok:
+                let c7 = do fqcReport(vp.err)
+                return c7
+        let wire = replace(onDelete, "-", "_")
+        let cl3 = do fqcClientOf(a)
+        if !cl3.ok:
+            let c8 = do fqcReport(cl3.err)
+            return c8
+        let mut body = "{\"field\":" + sjQuote(field) + ",\"kind\":" + sjQuote(kind) + ",\"name\":" + sjQuote(name) + ",\"on_delete\":" + sjQuote(wire) + ",\"parent_kind\":" + sjQuote(parentKind)
+        if hasParentField:
+            body = body + ",\"parent_field\":" + sjQuote(parentField)
+        let r3 = do fqcSend(cl3, "POST", "/admin/references", body + "}")
+        let j2 = do fqcReadJson(r3)
+        if !j2.ok:
+            let c9 = do fqcReport(j2.err)
+            return c9
+        if json:
+            let o3 = do fqcOut(fqcPretty(j2.v))
+            return 0
+        let mut parent = parentKind
+        if hasParentField:
+            parent = parentKind + "." + parentField
+        let o4 = do fqcOut("Declared reference " + sjDebugStr(name) + ": " + kind + "." + field + " -> " + parent + " on delete " + onDelete + ".")
+        return 0
+
+    proc fqcCmdGet(a: FqcArgs) -> int uses io.console, io.net:
+        let address = a.positionals[0]
+        let v = do fqcValidateSegment("address", address)
+        if !v.ok:
+            let c0 = do fqcReport(v.err)
+            return c0
+        let cl = do fqcClientOf(a)
+        if !cl.ok:
+            let c1 = do fqcReport(cl.err)
+            return c1
+        let r = do fqcSend(cl, "GET", "/node/" + address, "")
+        let j = do fqcReadJson(r)
+        if !j.ok:
+            let c2 = do fqcReport(j.err)
+            return c2
+        let json = do fqcGiven(a, "json")
+        if json:
+            let o = do fqcOut(fqcPretty(j.v))
+            return 0
+        let o1 = do fqcOut(fqcRenderNode(j.v))
+        return 0
+
+    proc fqcCmdPut(a: FqcArgs) -> int uses io.console, io.net:
+        let address = a.positionals[0]
+        let kind = do fqcValue(a, "kind")
+        let v = do fqcValidateSegment("address", address)
+        if !v.ok:
+            let c0 = do fqcReport(v.err)
+            return c0
+        let vk = do fqcValidateKind(kind)
+        if !vk.ok:
+            let c1 = do fqcReport(vk.err)
+            return c1
+        let d = do sjDecode([], fqcValue(a, "data"), "value")
+        if !d.ok:
+            let e = do cliErrorInvalidInput("--data is not valid JSON: " + d.err)
+            let c2 = do fqcReport(e)
+            return c2
+        let data = sjValueText(d.v)
+        let cl = do fqcClientOf(a)
+        if !cl.ok:
+            let c3 = do fqcReport(cl.err)
+            return c3
+        let mut pub = "false"
+        let isPublic = do fqcGiven(a, "public")
+        if isPublic:
+            pub = "true"
+        let r = do fqcSend(cl, "POST", "/node", "{\"address\":" + sjQuote(address) + ",\"data\":" + sjQuote(data) + ",\"kind\":" + sjQuote(kind) + ",\"public\":" + pub + ",\"q\":0,\"x\":0,\"y\":0,\"z\":0}")
+        let j = do fqcReadJson(r)
+        if !j.ok:
+            let c4 = do fqcReport(j.err)
+            return c4
+        let json = do fqcGiven(a, "json")
+        if json:
+            let o = do fqcOut(fqcPretty(j.v))
+            return 0
+        let written = do fqcStr(j.v, "address", address)
+        let o1 = do fqcOut("Wrote node " + sjDebugStr(written) + " (kind " + sjDebugStr(kind) + ").")
+        return 0
+
+    proc fqcCmdDelete(a: FqcArgs) -> int uses io.console, io.net:
+        let address = a.positionals[0]
+        let v = do fqcValidateSegment("address", address)
+        if !v.ok:
+            let c0 = do fqcReport(v.err)
+            return c0
+        let yes = do fqcGiven(a, "yes")
+        let cf = do fqcConfirm(yes, "Delete node " + sjDebugStr(address) + "?")
+        if !cf.ok:
+            let c1 = do fqcReport(cf.err)
+            return c1
+        let cl = do fqcClientOf(a)
+        if !cl.ok:
+            let c2 = do fqcReport(cl.err)
+            return c2
+        let r = do fqcSend(cl, "DELETE", "/node/" + address, "")
+        let s = do fqcExpectSuccess(r)
+        if !s.ok:
+            let c3 = do fqcReport(s.err)
+            return c3
+        let o = do fqcOut("Deleted node " + sjDebugStr(address) + ".")
+        return 0
+
+    proc fqcCmdQuery(a: FqcArgs) -> int uses io.console, io.net:
+        let kind = do fqcValue(a, "kind")
+        let vk = do fqcValidateKind(kind)
+        if !vk.ok:
+            let c0 = do fqcReport(vk.err)
+            return c0
+        let cl = do fqcClientOf(a)
+        if !cl.ok:
+            let c1 = do fqcReport(cl.err)
+            return c1
+        let mut desc = "false"
+        let isDesc = do fqcGiven(a, "desc")
+        if isDesc:
+            desc = "true"
+        let mut body = "{\"desc\":" + desc + ",\"kind\":" + sjQuote(kind)
+        let hasLimit = do fqcGiven(a, "limit")
+        if hasLimit:
+            let lim = do fqcValue(a, "limit")
+            let mut digits = lim
+            if charAt(digits, 0) == "+":
+                digits = slice(digits, 1, len(digits))
+            loop len(digits) > 1 && charAt(digits, 0) == "0":
+                digits = slice(digits, 1, len(digits))
+            body = body + ",\"limit\":" + digits
+        let hasOrder = do fqcGiven(a, "order")
+        if hasOrder:
+            body = body + ",\"order\":" + sjQuote(fqcValue(a, "order"))
+        let r = do fqcSend(cl, "POST", "/nodes/query", body + "}")
+        let j = do fqcReadJson(r)
+        if !j.ok:
+            let c2 = do fqcReport(j.err)
+            return c2
+        let json = do fqcGiven(a, "json")
+        if json:
+            let o = do fqcOut(fqcPretty(j.v))
+            return 0
+        let nodes = do fqcMember(j.v, "nodes")
+        let mut rows = []
+        if nodes.kind == "arr":
+            rows = nodes.items
+        let o1 = do fqcOut(fqcRenderNodes(rows))
+        return 0
+
+    proc fqcCmdStats(a: FqcArgs) -> int uses io.console, io.net:
+        let cl = do fqcClientOf(a)
+        if !cl.ok:
+            let c0 = do fqcReport(cl.err)
+            return c0
+        let mut kinds = []
+        let mut counts = []
+        let mut total = 0
+        let mut offset = 0
+        let mut more = true
+        loop more:
+            let r = do fqcSend(cl, "GET", "/nodes?limit=500&offset=" + offset, "")
+            let j = do fqcReadJsonArray(r)
+            if !j.ok:
+                let c1 = do fqcReport(j.err)
+                return c1
+            let mut i = 0
+            loop i < len(j.v.items):
+                let k = do fqcStr(j.v.items[i], "kind", "<unknown>")
+                let at = do fqcIndexOf(kinds, k)
+                if at < 0:
+                    # kept sorted by bytes, as the BTreeMap keeps them
+                    let mut p = 0
+                    loop p < len(kinds) && kinds[p] < k:
+                        p = p + 1
+                    kinds = slice(kinds, 0, p) + [k] + slice(kinds, p, len(kinds))
+                    counts = slice(counts, 0, p) + [1] + slice(counts, p, len(counts))
+                else:
+                    counts[at] = counts[at] + 1
+                total = total + 1
+                i = i + 1
+            if len(j.v.items) < 500:
+                more = false
+            else:
+                offset = offset + 500
+        let json = do fqcGiven(a, "json")
+        if json:
+            let mut by = ""
+            let mut q = 0
+            loop q < len(kinds):
+                if q > 0:
+                    by = by + ","
+                by = by + sjQuote(kinds[q]) + ":" + counts[q]
+                q = q + 1
+            let o = do fqcOut(sjPretty("{\"by_kind\":{" + by + "},\"total\":" + total + "}"))
+            return 0
+        if len(kinds) == 0:
+            let o1 = do fqcOut("(no nodes visible to this token)")
+            return 0
+        let mut width = 4
+        let mut w = 0
+        loop w < len(kinds):
+            if byteLen(kinds[w]) > width:
+                width = byteLen(kinds[w])
+            w = w + 1
+        let o2 = do fqcOut(fqcPad("KIND", width) + "  COUNT")
+        w = 0
+        loop w < len(kinds):
+            let o3 = do fqcOut(fqcPad(kinds[w], width) + "  " + counts[w])
+            w = w + 1
+        let o4 = do fqcOut("\n" + total + " node(s) across " + len(kinds) + " kind(s)")
+        return 0
+
+    proc fqcIndexOf(xs: [text], x: text) -> int:
+        let mut i = 0
+        loop i < len(xs):
+            if xs[i] == x:
+                return i
+            i = i + 1
+        return -1
+
+    proc fqcCmdRoutes(a: FqcArgs) -> int uses io.console:
+        let routes = do fqcRoutes()
+        let json = do fqcGiven(a, "json")
+        if json:
+            let mut rows = ""
+            let mut i = 0
+            loop i < len(routes):
+                if i > 0:
+                    rows = rows + ","
+                let r = routes[i]
+                rows = rows + "{\"caller\":" + sjQuote(r.caller) + ",\"cost_class\":" + sjQuote(r.cost) + ",\"method\":" + sjQuote(r.method) + ",\"path\":" + sjQuote(r.path) + ",\"rule\":" + sjQuote(r.rule) + "}"
+                i = i + 1
+            let o = do fqcOut(sjPretty("[" + rows + "]"))
+            return 0
+        let mut mw = 6
+        let mut pw = 4
+        let mut i2 = 0
+        loop i2 < len(routes):
+            if byteLen(routes[i2].method) > mw:
+                mw = byteLen(routes[i2].method)
+            if byteLen(routes[i2].path) > pw:
+                pw = byteLen(routes[i2].path)
+            i2 = i2 + 1
+        let aw = 13
+        let mut out = fqcPad("METHOD", mw) + "  " + fqcPad("PATH", pw) + "  " + fqcPad("CALLER", aw) + "  " + fqcPad("COST", 9) + "  RULE\n"
+        i2 = 0
+        loop i2 < len(routes):
+            let r2 = routes[i2]
+            out = out + fqcPad(r2.method, mw) + "  " + fqcPad(r2.path, pw) + "  " + fqcPad(r2.caller, aw) + "  " + fqcPad(r2.cost, 9) + "  " + r2.rule + "\n"
+            i2 = i2 + 1
+        let o2 = do fqcOut(out + "\n" + len(routes) + " route(s)")
+        return 0
+
+    # ── the data directory (main.rs: init, backup, restore) ────────────
+    # fqcDataDir: config::data_dir() — as the operator wrote it.
+    proc fqcDataDir(a: FqcArgs) -> text uses io.env:
+        let given = do fqcGiven(a, "data-dir")
+        if given:
+            let v = do fqcValue(a, "data-dir")
+            return v
+        let d = envVar("FACETQL_DEFAULT_DATA_DIR")
+        return d
+
+    # Path::join: a relative name under dir.
+    proc fqcJoin(dir: text, name: text) -> text:
+        if dir == "":
+            return name
+        if charAt(dir, len(dir) - 1) == "/":
+            return dir + name
+        return dir + "/" + name
+
+    # data_files: every file the data directory holds but temp files and
+    # the lock file, sorted.
+    proc fqcDataFiles(dir: text) -> [text] uses io.file:
+        let names = listDir(fqcDirPath(dir))
+        let mut out = []
+        let mut i = 0
+        loop i < len(names):
+            let n = names[i]
+            let tmp = len(n) >= 4 && slice(n, len(n) - 4, len(n)) == ".tmp"
+            if !tmp && n != "facetql.lock":
+                out = append(out, n)
+            i = i + 1
+        return out
+
+    # The path the io.file builtins are handed for a directory: "." for the
+    # empty one (Path "" reads as the current directory).
+    proc fqcDirPath(dir: text) -> text:
+        if dir == "":
+            return "."
+        return dir
+
+    # std::fs::copy: the file's bytes, in 1 MiB pieces, over whatever dst held.
+    proc fqcCopy(src: text, dst: text) -> bool uses io.file:
+        let size = fileSize(src)
+        let t = writeFile(dst, "")
+        let mut off = 0
+        loop off < size:
+            let mut n = size - off
+            if n > 1048576:
+                n = 1048576
+            let chunk = readFileAt(src, off, n)
+            let w = writeFileAt(dst, off, chunk)
+            off = off + n
+        return true
+
+    proc fqcCmdInit(dir: text) -> int uses io.console, io.file:
+        let m = makeDir(fqcDirPath(dir))
+        let o = do fqcOut("Initialized FacetQL data directory at " + dir)
+        return 0
+
+    proc fqcCmdBackup(dir: text, output: text) -> int uses io.console, io.file:
+        let m = makeDir(fqcDirPath(output))
+        let files = do fqcDataFiles(dir)
+        let mut i = 0
+        loop i < len(files):
+            let c = do fqcCopy(fqcJoin(dir, files[i]), fqcJoin(output, files[i]))
+            i = i + 1
+        let o = do fqcOut("Backed up " + len(files) + " data file(s) from " + dir + " to " + output)
+        return 0
+
+    proc fqcCmdRestore(dir: text, input: text) -> int uses io.console, io.file:
+        let existing = do fqcDataFiles(dir)
+        if len(existing) > 0:
+            let e = do fqcErr("refusing to restore: the target data directory (" + dir + ") already has data (" + join(existing, ", ") + "). Move it aside first if you really want to overwrite it.")
+            return 1
+        let m = makeDir(fqcDirPath(dir))
+        let files = listDir(fqcDirPath(input))
+        let mut i = 0
+        loop i < len(files):
+            let c = do fqcCopy(fqcJoin(input, files[i]), fqcJoin(dir, files[i]))
+            i = i + 1
+        let o = do fqcOut("Restored " + len(files) + " data file(s) from " + input + " into " + dir)
+        return 0
+
+    # ── dispatch ───────────────────────────────────────────────────────
+    proc fqcTopUsageFail(msg: text, tip: text) -> text:
+        let f = do fqcUsageFail(msg, tip, "facetql [OPTIONS] [COMMAND]")
+        return f
+
+    proc fqcPrint(out: text, err: text, code: int) -> int uses io.console:
+        if out != "":
+            let o = writeStdout(out)
+        if err != "":
+            let e = writeStderr(err)
+        return code
+
+    proc fqcHelpFor(path: text, words: [text]) -> int uses io.console, io.env:
+        let mut p = path
+        let mut i = 0
+        loop i < len(words):
+            let mut next = words[i]
+            if p != "":
+                next = p + " " + words[i]
+            let h0 = do fqcHelpText(next, false)
+            if h0 == "":
+                let mut usage = "facetql [OPTIONS] [COMMAND]"
+                if p != "":
+                    usage = "facetql " + p + " [OPTIONS] <COMMAND>"
+                let f = do fqcUsageFail("unrecognized subcommand '" + words[i] + "'", "", usage)
+                let c = do fqcPrint("", f, 2)
+                return c
+            p = next
+            i = i + 1
+        let h = do fqcHelp(p, false)
+        let c2 = do fqcPrint(h, "", 0)
+        return c2
+
+    proc main(args: [text]) -> int uses io.console, io.env, io.file, io.net:
+        let warned = do fqcAliasWarnings()
+        # the data directory the launcher resolved from the environment
+        let defaultDir = envVar("FACETQL_DEFAULT_DATA_DIR")
+        let g0 = grantDir(defaultDir)
+        # top level: the global --data-dir, -h/--help, -V/--version, then
+        # the command
+        let mut i = 0
+        let mut cmd = ""
+        let mut before = []
+        loop i < len(args) && cmd == "":
+            let a = args[i]
+            if a == "-h" || a == "--help":
+                let h = do fqcHelp("", a == "-h")
+                let c0 = do fqcPrint(h, "", 0)
+                return c0
+            if a == "-V" || a == "--version":
+                let c1 = do fqcPrint("facetql 0.13.0\n", "", 0)
+                return c1
+            if a == "--data-dir" || slice(a, 0, 11) == "--data-dir=":
+                before = append(before, a)
+                if a == "--data-dir" && i + 1 < len(args):
+                    before = append(before, args[i + 1])
+                    i = i + 1
+                i = i + 1
+            else:
+                if charAt(a, 0) == "-" && a != "-":
+                    let mut name = slice(a, 2, len(a))
+                    let eq = indexOf(name, "=", 0)
+                    if eq >= 0:
+                        name = slice(name, 0, eq)
+                    let mut tip = ""
+                    let mut usage = "facetql [OPTIONS] [COMMAND]"
+                    if slice(a, 0, 2) == "--":
+                        let near = do fqcSuggest(name, ["data-dir", "help", "version"])
+                        if near != "":
+                            tip = "a similar argument exists: '--" + near + "'"
+                            if near == "data-dir":
+                                usage = "facetql --data-dir <DATA_DIR>"
+                            else:
+                                usage = "facetql --" + near
+                    let f = do fqcUsageFail("unexpected argument '" + a + "' found", tip, usage)
+                    let c2 = do fqcPrint("", f, 2)
+                    return c2
+                cmd = a
+                i = i + 1
+        let rest = before + slice(args, i, len(args))
+        if cmd == "":
+            # no command is `start`, which the launcher runs itself; only a
+            # malformed global option reaches here
+            let p0 = do fqcParseLeaf(FqcLeaf{path: "", flags: [fqcDataDirFlag()], positionals: []}, rest)
+            if !p0.ok:
+                let c3 = do fqcPrint(p0.out, p0.err, p0.exit)
+                return c3
+            let c4 = do fqcPrint("", "error: `facetql` with no command is `facetql start`, which `facet facetql` runs\n", 2)
+            return c4
+        let commands = do fqcTopCommands()
+        if !(cmd in commands):
+            let tip2 = do fqcSubcommandTip(cmd, commands)
+            let f2 = do fqcTopUsageFail("unrecognized subcommand '" + cmd + "'", tip2)
+            let c5 = do fqcPrint("", f2, 2)
+            return c5
+        if cmd == "help":
+            let c6 = do fqcHelpFor("", rest)
+            return c6
+        let mut path = cmd
+        let mut leafArgs = rest
+        if cmd == "user" || cmd == "index" || cmd == "reference":
+            let actions = do fqcGroupActions(cmd)
+            let mut j = 0
+            let mut action = ""
+            let mut gBefore = []
+            loop j < len(rest) && action == "":
+                let b = rest[j]
+                if b == "-h" || b == "--help":
+                    let hg = do fqcHelp(cmd, b == "-h")
+                    let c7 = do fqcPrint(hg, "", 0)
+                    return c7
+                if b == "--data-dir" || slice(b, 0, 11) == "--data-dir=":
+                    gBefore = append(gBefore, b)
+                    if b == "--data-dir" && j + 1 < len(rest):
+                        gBefore = append(gBefore, rest[j + 1])
+                        j = j + 1
+                    j = j + 1
+                else:
+                    action = b
+                    j = j + 1
+            if action == "":
+                let hg2 = do fqcHelp(cmd, false)
+                let c8 = do fqcPrint("", hg2, 2)
+                return c8
+            if !(action in actions):
+                let tip3 = do fqcSubcommandTip(action, actions)
+                let f3 = do fqcUsageFail("unrecognized subcommand '" + action + "'", tip3, "facetql " + cmd + " [OPTIONS] <COMMAND>")
+                let c9 = do fqcPrint("", f3, 2)
+                return c9
+            if action == "help":
+                let c10 = do fqcHelpFor(cmd, slice(rest, j, len(rest)))
+                return c10
+            path = cmd + " " + action
+            leafArgs = gBefore + slice(rest, j, len(rest))
+        let leaf = do fqcLeafOf(path)
+        let a = do fqcParseLeaf(leaf, leafArgs)
+        if !a.ok:
+            let c11 = do fqcPrint(a.out, a.err, a.exit)
+            return c11
+        let dir = do fqcDataDir(a)
+        if cmd == "start":
+            let c12 = do fqcPrint("", "error: `facetql start` is run by `facet facetql` itself\n", 2)
+            return c12
+        if cmd == "init" || cmd == "backup" || cmd == "restore":
+            let g1 = grantDir(fqcDirPath(dir))
+            if cmd == "init":
+                let c13 = do fqcCmdInit(dir)
+                return c13
+            let other = a.positionals[0]
+            let g2 = grantDir(fqcDirPath(other))
+            if cmd == "backup":
+                let c14 = do fqcCmdBackup(dir, other)
+                return c14
+            let c15 = do fqcCmdRestore(dir, other)
+            return c15
+        if cmd == "user":
+            let c16 = do fqcCmdUser(slice(path, 5, len(path)), a)
+            return c16
+        if cmd == "index":
+            let c17 = do fqcCmdIndex(slice(path, 6, len(path)), a)
+            return c17
+        if cmd == "reference":
+            let c18 = do fqcCmdReference(slice(path, 10, len(path)), a)
+            return c18
+        if cmd == "get":
+            let c19 = do fqcCmdGet(a)
+            return c19
+        if cmd == "put":
+            let c20 = do fqcCmdPut(a)
+            return c20
+        if cmd == "delete":
+            let c21 = do fqcCmdDelete(a)
+            return c21
+        if cmd == "query":
+            let c22 = do fqcCmdQuery(a)
+            return c22
+        if cmd == "stats":
+            let c23 = do fqcCmdStats(a)
+            return c23
+        let c24 = do fqcCmdRoutes(a)
+        return c24

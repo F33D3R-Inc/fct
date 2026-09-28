@@ -353,15 +353,15 @@ func TestTheClientRendersEveryPageTheServerSends(t *testing.T) {
 // this catches came from combinations a fixture would not have: a param-less
 // component nested inside a list inside a layout shared by five routes.
 func TestTheRealAppRendersOnEveryRoute(t *testing.T) {
-	app, err := filepath.Abs("../../facets/home.fct")
+	app, err := filepath.Abs("../../facets/f33d3r_com.fct")
 	if err != nil || !fileExists(app) {
-		t.Skip("facets/home.fct not present")
+		t.Skip("facets/f33d3r_com.fct not present")
 	}
 
 	e := startEngine(t)
 	a := startAppFile(t, e, app)
 
-	if code, body := a.action("signup", "alice", "hunter2hunter2"); code != 200 {
+	if code, body := a.action("webSignup", "alice", "hunter2hunter2"); code != 200 {
 		t.Fatalf("signup: %d %s", code, body)
 	}
 	if code, body := a.action("post", "a post to render"); code != 200 {
@@ -369,7 +369,8 @@ func TestTheRealAppRendersOnEveryRoute(t *testing.T) {
 	}
 
 	for _, route := range []string{
-		"/", "/profile/alice", "/post/1", "/notifications", "/search",
+		"/", "/profile/alice", "/post/1", "/notifications", "/search", "/explore", "/bookmarks",
+		"/messages", "/live", "/wallet", "/settings", "/articles", "/communities", "/create",
 	} {
 		t.Run(route, func(t *testing.T) {
 			code, html := a.get(route)
@@ -427,7 +428,7 @@ func fileExists(p string) bool {
 //
 // This is the one shape that separates the two page walks, and no other test in
 // the tree has it. `TestTheRealAppRendersOnEveryRoute` runs the real app, but
-// every aggregate in `facets/home.fct` sits inside a `use` argument or an `if`
+// every aggregate in the app's pages sits inside a `use` argument or an `if`
 // condition — regions whose fill function sets the render path itself — so the
 // client happened to be reading from the same address the server wrote to, and
 // the char-for-char comparison agreed by accident.

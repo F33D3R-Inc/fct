@@ -767,12 +767,18 @@ app FabricDaemonConfigSelfHost:
         let shorter = do sjU64Gt(cadence.livenessProbeMs, silence)
         if shorter:
             return dcInvalid("silence_budget_ms (" + sjU64Text(silence) + ") is shorter than one probe interval (" + sjU64Text(cadence.livenessProbeMs) + "): every instance would be declared unreachable between probes")
-        let mut readPreference = ReadPreference{kind: "Primary", region: ""}
-        if file.hasReadPreference:
-            readPreference = file.readPreference
+        # config.rs: a probe as slow as the silence budget could never keep
+        # an instance alive (its heartbeat is stamped when the sweep began),
+        # which the prober relies on; refused here.
         let mut probeTimeout = file.probeTimeoutMs
         if probeTimeout == 0:
             probeTimeout = 1
+        let inBudget = do sjU64Gt(silence, probeTimeout)
+        if !inBudget:
+            return dcInvalid("probe_timeout_ms (" + sjU64Text(probeTimeout) + ") is not shorter than silence_budget_ms (" + sjU64Text(silence) + "): an instance that answers its probe only at the timeout would already be declared unreachable")
+        let mut readPreference = ReadPreference{kind: "Primary", region: ""}
+        if file.hasReadPreference:
+            readPreference = file.readPreference
         let mut capacity = file.placementCapacity
         if capacity == 0:
             capacity = 1

@@ -1,0 +1,45 @@
+# runtime/rowindex_test.go's app, driven through both runtimes by
+# TestRuntimeParityRowIndex: indexed reads answer as the scan does.
+app RI:
+    entity Work:
+        id: int
+        author: int
+        quoted: int
+        tag: text
+        score: int
+    entity Like:
+        id: int
+        work: int
+        account: int
+    derive dto(w: Work, me: int): text = "" + w.id + ":" + count(q in Work where q.quoted == w.id) + "/" + count(l in Like where l.work == w.id) + "/" + exists(l in Like where l.work == w.id && l.account == me) + "/" + count(r in Work where r.author == w.author && r.score > 2)
+    action report(x: int, t: text, me: int) -> text:
+        return "" + count(q in Work where q.quoted == x) + "|" + exists(q in Work where q.quoted == x && q.score > 2) + "|" + count(q in Work where q.tag == t) + "|" + count(q in Work where x == q.author) + "|" + Work(x).score + "|" + join(list(q.id in Work where q.author == x by id desc limit 5), ",") + "|" + join(list(dto(w, me) in Work where w.author == x by id limit 7), ";") + "|" + count(q in Work where q.quoted == toInt("" + x))
+    action probes(x: int) -> text:
+        return "" + count(q in Work where q.author == Work(x).author) + "|" + count(q in Work where Work(x + 1).quoted == q.quoted) + "|" + count(q in Work where q.id in [x, x + 3, 7, 7, 1000]) + "|" + count(q in Work where q.quoted in [x, "3", 5]) + "|" + count(q in Work where q.quoted in [true]) + "|" + join(list(q.id in Work where q.tag in ["t1", "t" + x % 9] && q.score > 1 by id limit 6), ",")
+    derive heavy(w: Work, x: int): bool = w.score != 3 && !exists(l in Like where l.work == w.id && l.account == x)
+    action lists(x: int) -> text:
+        return join(list(w.id in Work where heavy(w, x) by id desc limit 9), ",") + "|" + join(list(w.id in Work where w.author == 1 + x % 17 by score desc limit 6), ",") + "|" + join(list(w.id in Work where heavy(w, x) by tag limit 8), ",") + "|" + join(list(w.id in Work where heavy(w, x) by quoted limit 8), ",") + "|" + join(list(w.id in Work where w.score > x % 5 limit 4), ",") + "|" + exists(w in Work where heavy(w, x) && w.author == x) + "|" + join(list(w.id in Work where heavy(w, x) by id limit 0), ",") + "|" + join(list(w.id in Work where heavy(w, x) by id desc limit 1000), ",")
+    action mutate(x: int) -> text:
+        let a = count(q in Work where q.quoted == x)
+        add Work { author: 1, quoted: x, tag: "new", score: 9 }
+        let b = count(q in Work where q.quoted == x)
+        set q in Work where q.id == 3:
+            quoted = x
+        let c = count(q in Work where q.quoted == x)
+        set q in Work where q.quoted == x && q.score == 9:
+            score = count(r in Work where r.quoted == x)
+        let d = count(q in Work where q.quoted == x && q.score > 9)
+        remove q in Work where q.id == 4
+        let e = count(q in Work where q.quoted == x) + count(q in Work where q.id == 4)
+        return "" + a + "," + b + "," + c + "," + d + "," + e
+    action addWork(author: int, quoted: int, tag: text, score: int):
+        add Work { author: author, quoted: quoted, tag: tag, score: score }
+    # The untyped path: fromJson's value lands as it is — nothing, text
+    # that reads as a number, a float (every JSON number decodes as one), a
+    # bool — the values an int field's lenient equality meets.
+    action addRawWork(author: int, quoted: text, tag: text, score: int):
+        add Work { author: author, quoted: fromJson(quoted), tag: fromJson(tag), score: score }
+    action addLike(work: int, account: int):
+        add Like { work: work, account: account }
+    view Home at "/":
+        text "ri"

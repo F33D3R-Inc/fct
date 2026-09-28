@@ -85,7 +85,7 @@ func ResolveConfig() Config {
 func (c Config) Warnings() []string {
 	var w []string
 	if c.DatabaseURL == "" {
-		w = append(w, "FACET_DATABASE_URL is not set — `facet run` connects to facetql://localhost:8080, which does not exist inside a container (the dev tools work without it).")
+		w = append(w, "FACET_DATABASE_URL is not set — `facet run` connects to facetql://localhost:8080 (start it with `facet facetql`), which does not exist inside a container (the dev tools work without it).")
 	} else if !strings.HasPrefix(c.DatabaseURL, "facetql://") {
 		w = append(w, "FACET_DATABASE_URL is not a facetql:// URL — FacetQL is the only datastore; use facetql://[token@]host:port.")
 	}

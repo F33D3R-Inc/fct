@@ -4,8 +4,8 @@ app RuntimePage:
     # runtime_page.fct — runtime/server.go's handlePage: the route match
     # (pageFor/matchRoute), the guard (guardOK, a screen's redirect to the
     # first enterable screen), the first paint (render_html.fct), the
-    # page's own IR (the graph with this page's view/bindings/depGraph, no
-    # pages, only the components it reaches, no css — the `#fa-ir` script),
+    # page's own IR (pageir.go: what facet.js reads, cut to what the page
+    # uses — the `#fa-ir` script),
     # the client bootstrap (clientState: the render scope minus @private
     # cells and entity collections, plus @regions/@more/@aggs/@seq — the
     # `#fa-state` script) and the document around them (the `page`
@@ -58,6 +58,11 @@ app RuntimePage:
         names: [text]
         all: [bool]
         fields: [text]
+        # ops: when logging, every union step taken, in order ("\x01name"
+        # for a whole collection, "name\x00field" for one field) — replayed
+        # onto another set, it gives exactly what the same walk would
+        logOps: bool
+        ops: [text]
 
     proc rtCollIndex(c: RtColls, name: text) -> int:
         let mut i = 0
@@ -69,6 +74,8 @@ app RuntimePage:
 
     proc rtCollAll(c0: RtColls, name: text) -> RtColls:
         let mut c = c0
+        if c.logOps:
+            c.ops = append(c.ops, "\x01" + name)
         let i = do rtCollIndex(c, name)
         if i >= 0:
             c.all[i] = true
@@ -80,6 +87,8 @@ app RuntimePage:
 
     proc rtCollField(c0: RtColls, name: text, field: text) -> RtColls:
         let mut c = c0
+        if c.logOps:
+            c.ops = append(c.ops, name + "\x00" + field)
         let i = do rtCollIndex(c, name)
         if i >= 0:
             let has = do rtCsvHas(c.fields[i], field)
@@ -243,13 +252,48 @@ app RuntimePage:
 
     # rtClientColls: clientColls — the collections a page's client still
     # reads whole (or in part), which is what crosses in the bootstrap.
+    #
+    # The walk after a page's own view and bindings (every component, the
+    # route guards' policies, the client actions) is the same for every
+    # page: it is walked once (rtAppCollOps) and its steps replayed.
     proc rtClientColls(g: IRGraph, page: IRPage) -> RtColls:
-        let mut c = RtColls{names: [], all: [], fields: []}
+        let mut c = RtColls{names: [], all: [], fields: [], logOps: false, ops: []}
         c = do rtWalkNodeExprs(g, page.view, c)
         let mut b = 0
         loop b < len(page.bindings):
             c = do rtCollectBareRefsList(g, page.bindings[b].expr, c)
             b = b + 1
+        let app = rtAppColls
+        if app.ok && app.comps == len(g.components) && app.acts == len(g.actions):
+            let mut o = 0
+            loop o < len(app.ops):
+                let op = app.ops[o]
+                if slice(op, 0, 1) == "\x01":
+                    c = do rtCollAll(c, slice(op, 1, len(op)))
+                else:
+                    let z = do rtIndexOfText(op, "\x00")
+                    c = do rtCollField(c, slice(op, 0, z), slice(op, z + 1, len(op)))
+                o = o + 1
+            return c
+        c = do rtAppCollsWalk(g, c)
+        return c
+
+    struct RtAppColls:
+        ok: bool
+        comps: int
+        acts: int
+        ops: [text]
+
+    shared rtAppColls: RtAppColls
+
+    # rtAppCollOps: the app-wide part of every page's walk, as steps.
+    proc rtIndexAppColls(g: IRGraph) -> int:
+        let logged = do rtAppCollsWalk(g, RtColls{names: [], all: [], fields: [], logOps: true, ops: []})
+        rtAppColls = RtAppColls{ok: true, comps: len(g.components), acts: len(g.actions), ops: logged.ops}
+        return 0
+
+    proc rtAppCollsWalk(g: IRGraph, c0: RtColls) -> RtColls:
+        let mut c = c0
         let mut k = 0
         loop k < len(g.components):
             c = do rtWalkNodeExprs(g, g.components[k].view, c)
@@ -365,32 +409,135 @@ app RuntimePage:
         let out = do rtObjectJSONRaw(keys, raws)
         return out
 
-    # rtPageIRJSON: the IR a page ships — this page's view, bindings and
-    # depGraph, no pages, the components it reaches, no css.
-    proc rtPageIRJSON(g0: IRGraph, pg: RtPage) -> text:
-        let mut g = g0
-        g.view = pg.page.view
-        g.bindings = pg.page.bindings
+    # rtPageIRJSON: runtime/pageir.go's pageIR — the IR a page ships, as
+    # exactly the fields facet.js reads, each cut to what this page can use,
+    # in ir.IR's field order and encodings: every state; the policies route
+    # guards name; the actions this page's view and the components it
+    # reaches dispatch (a node's action or `more`); those components; every
+    # route; the page's bindings, view and dependency graph.
+    proc rtPageIRJSON(g: IRGraph, pg: RtPage) -> text:
+        let mut roots = [pg.page.view]
+        let mut c = 0
+        loop c < len(g.components):
+            if pg.compUsed[c]:
+                roots = append(roots, g.components[c].view)
+            c = c + 1
+        let mut used = []
+        let mut r = 0
+        loop r < len(roots):
+            used = rtPageActionsUsed(roots[r], used)
+            r = r + 1
+        let mut out = "{\"states\":"
+        if len(g.states) == 0:
+            out = out + "null"
+        else:
+            out = out + "["
+            let mut i = 0
+            loop i < len(g.states):
+                if i > 0:
+                    out = out + ","
+                out = out + irStateJSON(g.states[i])
+                i = i + 1
+            out = out + "]"
+        let mut pols = ""
+        let mut p = 0
+        loop p < len(g.policies):
+            let mut guarded = false
+            let mut k = 0
+            loop k < len(g.routes):
+                if g.routes[k].requires != "" && g.routes[k].requires == g.policies[p].name:
+                    guarded = true
+                k = k + 1
+            if guarded:
+                if pols != "":
+                    pols = pols + ","
+                pols = pols + irPolicyJSON(g.policies[p])
+            p = p + 1
+        if pols == "":
+            out = out + ",\"policies\":null"
+        else:
+            out = out + ",\"policies\":[" + pols + "]"
+        let mut acts = ""
+        let mut a = 0
+        loop a < len(g.actions):
+            if rtTextIn(used, g.actions[a].name):
+                if acts != "":
+                    acts = acts + ","
+                acts = acts + irActionJSON(g.actions[a])
+            a = a + 1
+        if acts == "":
+            out = out + ",\"actions\":null"
+        else:
+            out = out + ",\"actions\":[" + acts + "]"
+        let mut comps = ""
+        let mut ci = 0
+        loop ci < len(g.components):
+            if pg.compUsed[ci]:
+                if comps != "":
+                    comps = comps + ","
+                comps = comps + irComponentJSON(g.components[ci])
+            ci = ci + 1
+        if comps != "":
+            out = out + ",\"components\":[" + comps + "]"
+        if len(g.routes) > 0:
+            out = out + ",\"routes\":["
+            let mut ri = 0
+            loop ri < len(g.routes):
+                if ri > 0:
+                    out = out + ","
+                out = out + irRouteJSON(g.routes[ri])
+                ri = ri + 1
+            out = out + "]"
+        out = out + ",\"bindings\":"
+        if len(pg.page.bindings) == 0:
+            out = out + "null"
+        else:
+            out = out + "["
+            let mut bi = 0
+            loop bi < len(pg.page.bindings):
+                if bi > 0:
+                    out = out + ","
+                out = out + irBindingJSON(pg.page.bindings[bi])
+                bi = bi + 1
+            out = out + "]"
+        out = out + ",\"view\":"
+        if len(pg.page.view) == 0:
+            out = out + "null"
+        else:
+            out = out + irNodesJSON(pg.page.view)
         let mut dk = []
         let mut dv = []
-        let mut i = 0
-        loop i < len(pg.page.depKeys):
-            dk = append(dk, pg.page.depKeys[i])
-            let parsed = do jsonParse(pg.page.depVals[i])
+        let mut di = 0
+        loop di < len(pg.page.depKeys):
+            dk = append(dk, pg.page.depKeys[di])
+            let parsed = do jsonParse(pg.page.depVals[di])
             dv = append(dv, parsed)
+            di = di + 1
+        let dj = do jvalJSON(JVal{kind: "obj", s: "", keys: dk, vals: dv})
+        return out + ",\"depGraph\":" + dj + "}"
+
+    # rtPageActionsUsed: `used` plus every action a node in `nodes` (at any
+    # depth) dispatches — a button's, a form's or a control's action, a
+    # list's `more`.
+    proc rtPageActionsUsed(nodes: [IRNode], used0: [text]) -> [text]:
+        let mut used = used0
+        let mut i = 0
+        loop i < len(nodes):
+            if nodes[i].action != "" && !rtTextIn(used, nodes[i].action):
+                used = append(used, nodes[i].action)
+            if nodes[i].more != "" && !rtTextIn(used, nodes[i].more):
+                used = append(used, nodes[i].more)
+            used = rtPageActionsUsed(nodes[i].children, used)
             i = i + 1
-        g.depGraph = JVal{kind: "obj", s: "", keys: dk, vals: dv}
-        g.pages = []
-        let mut comps = []
-        let mut c = 0
-        loop c < len(g0.components):
-            if pg.compUsed[c]:
-                comps = append(comps, g0.components[c])
-            c = c + 1
-        g.components = comps
-        g.css = ""
-        let j = do irGraphJSON(g)
-        return j
+        return used
+
+    proc rtTextIn(xs: [text], x: text) -> bool:
+        let mut i = 0
+        loop i < len(xs):
+            if xs[i] == x:
+                return true
+            i = i + 1
+        return false
 
     # rtHeadMeta: headMeta — the title and the description/OpenGraph tags.
     proc rtHeadMeta(pg: RtPage, sc: RtScope) -> text:
@@ -484,13 +631,25 @@ app RuntimePage:
         sc.matOn = true
         let rd0 = do rtRenderNew(sc)
         let rd = do rtChildren(pg, rd0, page.view, "", 0)
-        let irJSON = do rtPageIRJSON(w.g, pg)
+        let mut irJSON = ""
+        let mut cached = -1
+        let mut ci = 0
+        loop ci < len(w.irPaths):
+            if w.irPaths[ci] == page.path:
+                cached = ci
+            ci = ci + 1
+        if cached >= 0:
+            irJSON = w.irJSONs[cached]
+        else:
+            irJSON = do rtPageIRJSON(w.g, pg)
+            w.irPaths = append(w.irPaths, page.path)
+            w.irJSONs = append(w.irJSONs, irJSON)
         let stateJSON = do rtClientStateJSON(w, page, rd)
         let head = do rtHeadMeta(pg, rd.sc)
         let csrf = do rtCsrfToken(w, sid)
         let mut html = "<!doctype html>\n<html lang=\"en\"" + themeAttr + ">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
         html = html + head + "\n<meta name=\"fa-csrf\" content=\"" + csrf + "\">\n<link rel=\"stylesheet\" href=\"/facet.css?v=" + w.cssVer + "\">\n</head>\n<body>\n<div id=\"fa-root\" data-fa-mount>" + rd.html + "</div>\n<script type=\"application/json\" id=\"fa-ir\">" + irJSON + "</script>\n<script type=\"application/json\" id=\"fa-state\">" + stateJSON + "</script>\n<script src=\"/facet.js\"></script>\n</body>\n</html>\n"
-        let resp = HttpServerResponse{status: 200, reason: "", headers: [HttpHeader{name: "content-type", value: "text/html; charset=utf-8"}, HttpHeader{name: "content-language", value: "en"}, so.cookie], body: html}
+        let resp = HttpServerResponse{status: 200, reason: "", headers: [HttpHeader{name: "content-type", value: "text/html; charset=utf-8"}, HttpHeader{name: "content-language", value: rtLocaleFor(w, req)}, so.cookie], body: html}
         return RtPageOut{resp: resp, w: w}
 
     proc rtCookieHas(headers: [HttpHeader], name: text) -> bool:

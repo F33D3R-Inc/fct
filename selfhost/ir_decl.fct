@@ -66,6 +66,11 @@ app IRDeclSelfHost:
         type: text
         optional: bool
         list: bool
+        # map / key: a `{K: V}` proc parameter — type is V, key is K.
+        map: bool
+        key: text
+        # depth: a nested list (`[[T]]`), list with depth 2+
+        depth: int
 
     struct IRPolicy:
         name: text
@@ -81,6 +86,8 @@ app IRDeclSelfHost:
         params: [IRParam]
         requires: [IRRequire]
         optimistic: bool
+        # internal: `@internal` (ir.Action.Internal)
+        internal: bool
         ret: text
         retList: bool
         placement: text
@@ -100,6 +107,10 @@ app IRDeclSelfHost:
         params: [IRParam]
         ret: text
         retList: bool
+        # retMap / retKey: `-> {K: V}` — ret is V, retKey K.
+        retMap: bool
+        retKey: text
+        retDepth: int
         body: [IRStmt]
 
     struct IREnum:
@@ -146,7 +157,13 @@ app IRDeclSelfHost:
             let type = do jStr(p, "type")
             let optional = do jBool(p, "optional")
             let list = do jBool(p, "list")
-            out = append(out, IRParam{name: name, type: type, optional: optional, list: list})
+            let pmap = do jBool(p, "map")
+            let pkey = do jStr(p, "key")
+            let pdv = do jGet(p, "depth")
+            let mut pdepth = 0
+            if pdv.kind == "num":
+                pdepth = toInt(pdv.s)
+            out = append(out, IRParam{name: name, type: type, optional: optional, list: list, map: pmap, key: pkey, depth: pdepth})
             i = i + 1
         return out
 
@@ -251,6 +268,7 @@ app IRDeclSelfHost:
         let placement = do jStr(v, "placement")
         let reason = do jStr(v, "reason")
         let writes = do jTextListOf(v, "writes")
+        let internal = do jBool(v, "internal")
         let reads = do jTextListOf(v, "reads")
         let readsV = do jGet(v, "reads")
         let builtin = readsV.kind == "null"
@@ -263,13 +281,19 @@ app IRDeclSelfHost:
             let st = do irStmtFromJVal(bv.vals[k])
             body = append(body, st)
             k = k + 1
-        return IRAction{name: name, params: params, requires: reqs, optimistic: optimistic, ret: ret, retList: retList, placement: placement, reason: reason, writes: writes, reads: reads, seal: seal, body: body, builtin: builtin}
+        return IRAction{name: name, params: params, requires: reqs, optimistic: optimistic, ret: ret, retList: retList, placement: placement, reason: reason, writes: writes, reads: reads, seal: seal, body: body, builtin: builtin, internal: internal}
 
     proc irProcFromJVal(v: JVal) -> IRProc:
         let name = do jStr(v, "name")
         let params = do irParamsFromJVal(v, "params")
         let ret = do jStr(v, "ret")
         let retList = do jBool(v, "retList")
+        let retMap = do jBool(v, "retMap")
+        let retKey = do jStr(v, "retKey")
+        let rdv = do jGet(v, "retDepth")
+        let mut retDepth = 0
+        if rdv.kind == "num":
+            retDepth = toInt(rdv.s)
         let bv = do jGet(v, "body")
         let bn = len(bv.vals)
         let mut body = []
@@ -278,7 +302,7 @@ app IRDeclSelfHost:
             let st = do irStmtFromJVal(bv.vals[k])
             body = append(body, st)
             k = k + 1
-        return IRProc{name: name, params: params, ret: ret, retList: retList, body: body}
+        return IRProc{name: name, params: params, ret: ret, retList: retList, retMap: retMap, retKey: retKey, retDepth: retDepth, body: body}
 
     proc irEnumFromJVal(v: JVal) -> IREnum:
         let name = do jStr(v, "name")
@@ -288,14 +312,14 @@ app IRDeclSelfHost:
 
     # ── emitters ────────────────────────────────────────────────────────────
     proc irFieldJSON(f: IRField) -> text:
-        let nq = do jsonQuote(f.name)
-        let tq = do jsonQuote(f.type)
+        let nq = jsonQuote(f.name)
+        let tq = jsonQuote(f.type)
         let mut out = "{\"name\":" + nq + ",\"type\":" + tq
         if f.ref != "":
-            let q = do jsonQuote(f.ref)
+            let q = jsonQuote(f.ref)
             out = out + ",\"ref\":" + q
         if f.enumName != "":
-            let q = do jsonQuote(f.enumName)
+            let q = jsonQuote(f.enumName)
             out = out + ",\"enum\":" + q
         if f.index:
             out = out + ",\"index\":true"
@@ -306,7 +330,7 @@ app IRDeclSelfHost:
         if f.password:
             out = out + ",\"password\":true"
         if f.readPolicy != "":
-            let q = do jsonQuote(f.readPolicy)
+            let q = jsonQuote(f.readPolicy)
             out = out + ",\"readPolicy\":" + q
         if f.optional:
             out = out + ",\"optional\":true"
@@ -319,10 +343,10 @@ app IRDeclSelfHost:
         if f.hasMax:
             out = out + ",\"max\":" + f.max
         if f.matches != "":
-            let q = do jsonQuote(f.matches)
+            let q = jsonQuote(f.matches)
             out = out + ",\"matches\":" + q
         if f.onDelete != "":
-            let q = do jsonQuote(f.onDelete)
+            let q = jsonQuote(f.onDelete)
             out = out + ",\"onDelete\":" + q
         return out + "}"
 
@@ -335,13 +359,20 @@ app IRDeclSelfHost:
         loop i < n:
             if i > 0:
                 out = out + ","
-            let nq = do jsonQuote(ps[i].name)
-            let tq = do jsonQuote(ps[i].type)
+            let nq = jsonQuote(ps[i].name)
+            let tq = jsonQuote(ps[i].type)
             out = out + "{\"name\":" + nq + ",\"type\":" + tq
             if ps[i].optional:
                 out = out + ",\"optional\":true"
             if ps[i].list:
                 out = out + ",\"list\":true"
+            if ps[i].map:
+                out = out + ",\"map\":true"
+            if ps[i].key != "":
+                let kq = jsonQuote(ps[i].key)
+                out = out + ",\"key\":" + kq
+            if ps[i].depth != 0:
+                out = out + ",\"depth\":" + ps[i].depth
             out = out + "}"
             i = i + 1
         return out + "]"
@@ -350,8 +381,8 @@ app IRDeclSelfHost:
     # derive's deps come from sortedKeys (an allocated `[]` even when empty);
     # an entity derive's are never computed (nil, so `null`).
     proc irDeriveJSON(d: IRDerive, inEntity: bool) -> text:
-        let nq = do jsonQuote(d.name)
-        let tq = do jsonQuote(d.type)
+        let nq = jsonQuote(d.name)
+        let tq = jsonQuote(d.type)
         let mut out = "{\"name\":" + nq
         if len(d.params) > 0:
             let pj = do irParamsJSON(d.params)
@@ -368,7 +399,7 @@ app IRDeclSelfHost:
         return out + ",\"deps\":" + dj + "}"
 
     proc irEntityJSON(e: IREntity) -> text:
-        let nq = do jsonQuote(e.name)
+        let nq = jsonQuote(e.name)
         let mut out = "{\"name\":" + nq
         if e.softDelete:
             out = out + ",\"softDelete\":true"
@@ -401,17 +432,17 @@ app IRDeclSelfHost:
         return out + "}"
 
     proc irStateJSON(s: IRState) -> text:
-        let nq = do jsonQuote(s.name)
-        let tq = do jsonQuote(s.type)
+        let nq = jsonQuote(s.name)
+        let tq = jsonQuote(s.type)
         let mut out = "{\"name\":" + nq + ",\"type\":" + tq
         if s.elem != "":
-            let q = do jsonQuote(s.elem)
+            let q = jsonQuote(s.elem)
             out = out + ",\"elem\":" + q
         if s.list:
             out = out + ",\"list\":true"
         if s.optional:
             out = out + ",\"optional\":true"
-        let pq = do jsonQuote(s.placement)
+        let pq = jsonQuote(s.placement)
         out = out + ",\"placement\":" + pq
         if s.private:
             out = out + ",\"private\":true"
@@ -424,7 +455,7 @@ app IRDeclSelfHost:
         return out + "}"
 
     proc irPolicyJSON(p: IRPolicy) -> text:
-        let nq = do jsonQuote(p.name)
+        let nq = jsonQuote(p.name)
         let mut out = "{\"name\":" + nq
         if len(p.params) > 0:
             let pj = do irParamsJSON(p.params)
@@ -438,7 +469,7 @@ app IRDeclSelfHost:
         return out + "}"
 
     proc irActionJSON(a: IRAction) -> text:
-        let nq = do jsonQuote(a.name)
+        let nq = jsonQuote(a.name)
         let pj = do irParamsJSON(a.params)
         let mut out = "{\"name\":" + nq + ",\"params\":" + pj + ",\"requires\":"
         let rn = len(a.requires)
@@ -450,7 +481,7 @@ app IRDeclSelfHost:
             loop i < rn:
                 if i > 0:
                     out = out + ","
-                let rq = do jsonQuote(a.requires[i].name)
+                let rq = jsonQuote(a.requires[i].name)
                 out = out + "{\"name\":" + rq
                 if len(a.requires[i].args) > 0:
                     let aj = do irListJSON(a.requires[i].args)
@@ -460,15 +491,17 @@ app IRDeclSelfHost:
             out = out + "]"
         if a.optimistic:
             out = out + ",\"optimistic\":true"
+        if a.internal:
+            out = out + ",\"internal\":true"
         if a.ret != "":
-            let retq = do jsonQuote(a.ret)
+            let retq = jsonQuote(a.ret)
             out = out + ",\"ret\":" + retq
         if a.retList:
             out = out + ",\"retList\":true"
-        let plq = do jsonQuote(a.placement)
+        let plq = jsonQuote(a.placement)
         out = out + ",\"placement\":" + plq
         if a.reason != "":
-            let rsq = do jsonQuote(a.reason)
+            let rsq = jsonQuote(a.reason)
             out = out + ",\"reason\":" + rsq
         # A built-in auth action (authActions() in build.go: login, logout,
         # signup, …) is the one action with no body, and the builder leaves
@@ -492,19 +525,26 @@ app IRDeclSelfHost:
         return out + ",\"body\":" + bj + "}"
 
     proc irProcJSON(p: IRProc) -> text:
-        let nq = do jsonQuote(p.name)
+        let nq = jsonQuote(p.name)
         let pj = do irParamsJSON(p.params)
         let mut out = "{\"name\":" + nq + ",\"params\":" + pj
         if p.ret != "":
-            let rq = do jsonQuote(p.ret)
+            let rq = jsonQuote(p.ret)
             out = out + ",\"ret\":" + rq
         if p.retList:
             out = out + ",\"retList\":true"
+        if p.retMap:
+            out = out + ",\"retMap\":true"
+        if p.retKey != "":
+            let rkq = jsonQuote(p.retKey)
+            out = out + ",\"retKey\":" + rkq
+        if p.retDepth != 0:
+            out = out + ",\"retDepth\":" + p.retDepth
         let bj = do irStmtListJSON(p.body)
         return out + ",\"body\":" + bj + "}"
 
     proc irEnumJSON(e: IREnum) -> text:
-        let nq = do jsonQuote(e.name)
+        let nq = jsonQuote(e.name)
         let vj = do textListJSON(e.values)
         let wj = do textListJSON(e.wireNames)
         return "{\"name\":" + nq + ",\"values\":" + vj + ",\"wireNames\":" + wj + "}"

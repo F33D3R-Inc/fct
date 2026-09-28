@@ -297,7 +297,14 @@ app ParserDecl2SelfHost:
         name: text
         typeCore: text
         isList: bool
+        # isMap / mapKey: a `{K: V}` field — typeCore is V, mapKey K.
+        isMap: bool
+        mapKey: text
+        # depth: a nested list field (`[[T]]`) — typeCore is T
+        depth: int
         valid: bool
+        # line: the field's source line (0 when unknown)
+        line: int
 
     struct StructDecl:
         name: text
@@ -316,7 +323,8 @@ app ParserDecl2SelfHost:
         let opt = do typeIsOptional(ft)
         if opt:
             return false
-        let core = do typeCore(ft)
+        let core0 = do typeCore(ft)
+        let core = do nestedBase(core0)
         if core == "money":
             return false
         if core == "date":
@@ -327,10 +335,27 @@ app ParserDecl2SelfHost:
     proc buildStructField(spec: text) -> StructField:
         let fn = do paramNameOf(spec)
         let ft = do paramTypeRawOf(spec)
-        let core = do typeCore(ft)
+        let ms = do mapTypeSpec(ft)
+        if ms != "":
+            # parseStruct's `{K: V}` field: key int or text, value a type
+            # name other than money/date (not usable in a proc struct).
+            let mk = do mapSpecKey(ms)
+            let mv = do mapSpecVal(ms)
+            let nameOk = do isIdentToken(fn)
+            let valOk = do isTypeNameToken(mv)
+            let mok = nameOk && (mk == "int" || mk == "text") && valOk && mv != "money" && mv != "date"
+            return StructField{name: fn, typeCore: mv, isList: false, isMap: true, mapKey: mk, depth: 0, valid: mok, line: 0}
+        let core0 = do typeCore(ft)
         let isL = do typeIsList(ft)
+        # `[[T]]`: the element type peeled to T, the depth recorded
+        let mut core = core0
+        let mut depth = 0
+        let d0 = do nestedDepth(core0)
+        if isL && d0 > 0:
+            core = do nestedBase(core0)
+            depth = d0
         let ok = do structFieldSpecValid(spec)
-        return StructField{name: fn, typeCore: core, isList: isL, valid: ok}
+        return StructField{name: fn, typeCore: core, isList: isL, isMap: false, mapKey: "", depth: depth, valid: ok, line: 0}
 
     proc buildStructFields(specs: [text]) -> [StructField]:
         let n = len(specs)

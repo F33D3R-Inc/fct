@@ -70,6 +70,11 @@ app FabricdLib:
     shared fabricdRequests: int
     shared fabricdDispatch: int
     shared fabricdStopping: bool
+    # The telemetry pump's finished sample, handed to the loop: written by
+    # the pump, then "sample" on fabricdRequests, then the pump waits on
+    # fabricdSampleTaken until the loop has ingested it.
+    shared fabricdSampled: DaemonSample
+    shared fabricdSampleTaken: int
 
     proc fabricdSep() -> text:
         return bytesToText([31])
@@ -170,8 +175,9 @@ app FabricdLib:
         telemetry: DaemonTelemetry
 
     # ControlPlane::boot and the rest of Daemon::start before serving: the
-    # placement map bootstrapped, the first cycle run, the front door
-    # installed with that cycle's routing.
+    # placement map bootstrapped, the first cycle run (probes, no telemetry:
+    # that is the pump's), the front door installed with that cycle's
+    # routing. The source is handed back for the pump.
     proc fabricdBoot(settings: DaemonSettings, telemetry: DaemonTelemetry) -> FabricdBooted uses io.net:
         let boot = do daemonBootstrapPlacement(settings)
         let blank = do daemonControlNew(settings, "", 0, daemonBootstrapDeclared(settings))
@@ -179,13 +185,13 @@ app FabricdLib:
             return FabricdBooted{err: boot.err, control: blank, telemetry: telemetry}
         let started = do fabricdNowMs()
         let control = do daemonControlNew(settings, daemonTelemetryDescribe(telemetry), started, boot)
-        let cycled = do fabricdCycle(control, telemetry)
+        let cycled = do fabricdCycle(control)
         let fleet = do fabricdFleet(settings, cycled.control.doorRouting)
         if !fleet.ok:
             return FabricdBooted{err: fleet.err, control: blank, telemetry: telemetry}
         do fdInstall(fabricdFrontDoorConfig(settings), fleet.fleet)
         fabricdSnapshot = cycled.control.status
-        return FabricdBooted{err: "", control: cycled.control, telemetry: cycled.telemetry}
+        return FabricdBooted{err: "", control: cycled.control, telemetry: telemetry}
 
     # ------------------------------------------------------------ the cycle
 
@@ -193,17 +199,16 @@ app FabricdLib:
     # `routing` (the caller does, once the door is installed).
     struct FabricdCycled:
         control: DaemonControl
-        telemetry: DaemonTelemetry
         published: bool
         routing: TableRoutingTable
 
-    # ControlPlane::cycle with its I/O: probe and poll when due, publish the
-    # routing table to the front door when it moved, persist, copies started
-    # by the mover daemon.
-    proc fabricdCycle(c0: DaemonControl, t0: DaemonTelemetry) -> FabricdCycled uses io.net, io.file:
+    # ControlPlane::cycle with its I/O: probe when due, publish the routing
+    # table to the front door when it moved, persist, copies started by the
+    # mover daemon. Never telemetry: fabricdTelemetryPump samples beside the
+    # loop, so no /stats read, however slow, is on a probe's path.
+    proc fabricdCycle(c0: DaemonControl) -> FabricdCycled uses io.net, io.file:
         let now = do fabricdNowMs()
         let mut c = do daemonControlTickClock(c0, now)
-        let mut t = t0
         let probeDue = do daemonControlProbeDue(c, now)
         if probeDue:
             let targets = do daemonControlProbeTargets(c)
@@ -214,17 +219,12 @@ app FabricdLib:
                 ids = append(ids, targets[k].id)
                 k = k + 1
             c = daemonControlApplyProbes(c, now, ids, probes)
-        let pollDue = do daemonControlPollDue(c, now)
-        if pollDue:
-            let sampled = do daemonTelemetrySample(t, now)
-            t = sampled.telemetry
-            c = daemonControlApplySample(c, now, sampled.sample)
         let middle = do daemonControlCycleMiddle(c, fabricdNowMs())
         c = middle.control
         do fabricdStartCopies(middle.starts)
         c = daemonControlPersist(c)
         c = daemonControlFinishCycle(c, now)
-        return FabricdCycled{control: c, telemetry: t, published: middle.published, routing: middle.routing}
+        return FabricdCycled{control: c, published: middle.published, routing: middle.routing}
 
     # Hand each copy the loop decided on to the mover daemon.
     proc fabricdStartCopies(starts: [DaemonCopyStart]):
@@ -245,6 +245,17 @@ app FabricdLib:
         let now = do fabricdNowMs()
         let mut c = c0
         let kind = fields[0]
+        if kind == "migrate":
+            # control.rs `serve` for Migrate: the operator's move, then
+            # routing and the status published.
+            let target = ActionTarget{shardId: u64Parse(fields[1]), coordinate: Coordinate{x: toInt(fields[2]), y: toInt(fields[3])}}
+            let migrated = do daemonControlMigrate(c, target, fields[4])
+            let publishedM = do daemonControlPublishRouting(migrated.control)
+            if publishedM.published:
+                do fdPublishRouting(publishedM.routing)
+            c = daemonControlPublishStatus(publishedM.control, now)
+            do fabricdReply(toInt(fields[5]), migrated.ok, migrated.message)
+            return c
         if kind == "abort":
             let answered = do daemonControlAbort(c, toInt(fields[1]))
             let published = do daemonControlPublishRouting(answered.control)
@@ -289,11 +300,10 @@ app FabricdLib:
     # The drain: rollbacks, then cycles on the drain's own tighter cadence
     # until nothing is left running or the budget is spent, then the report
     # main.rs prints.
-    proc fabricdDrain(c0: DaemonControl, t0: DaemonTelemetry) -> DaemonShutdownReport uses io.net:
+    proc fabricdDrain(c0: DaemonControl) -> DaemonShutdownReport uses io.net:
         let now = do fabricdNowMs()
         let begun = do daemonControlDrainBegin(c0, now)
         let mut c = begun.control
-        let mut t = t0
         if begun.published:
             do fdPublishRouting(begun.routing)
         let step = do daemonDrainStepMs(c)
@@ -304,9 +314,8 @@ app FabricdLib:
                 going = false
             else:
                 let slept = sleepMs(step)
-                let cycled = do fabricdCycle(c, t)
+                let cycled = do fabricdCycle(c)
                 c = cycled.control
-                t = cycled.telemetry
                 if cycled.published:
                     do fdPublishRouting(cycled.routing)
                 fabricdSnapshot = c.status
@@ -338,10 +347,10 @@ app FabricdLib:
     # The control loop: cadence ticks, operator questions and mover reports
     # from one queue; `stop` drains and hands the report to main. A door's
     # poll ("door") renews its lease and is answered with the routing the
-    # loop last published.
-    proc fabricdControlLoop(c0: DaemonControl, t0: DaemonTelemetry) -> bool uses io.net, io.file:
+    # loop last published. A "sample" is the pump's finished sweep, ingested
+    # at once (control.rs run's `ingest` arm).
+    proc fabricdControlLoop(c0: DaemonControl) -> bool uses io.net, io.file:
         let mut c = c0
-        let mut t = t0
         let mut doors = []
         let requests = fabricdRequests
         let sep = do fabricdSep()
@@ -355,16 +364,18 @@ app FabricdLib:
                 let published = fdFleet
                 let sentDoor = send(toInt(fields[5]), rtfAnswer(published.routing, u64Parse(fields[2]), lease))
             c = fabricdWithDoors(c, doors)
+            if fields[0] == "sample":
+                c = daemonControlApplySample(c, fabricdSampled)
+                let taken = send(fabricdSampleTaken, "taken")
             if fields[0] == "tick":
-                let cycled = do fabricdCycle(c, t)
+                let cycled = do fabricdCycle(c)
                 c = cycled.control
-                t = cycled.telemetry
                 if cycled.published:
                     do fdPublishRouting(cycled.routing)
                 fabricdSnapshot = c.status
-            if fields[0] != "tick" && fields[0] != "door":
+            if fields[0] != "tick" && fields[0] != "door" && fields[0] != "sample":
                 if fields[0] == "stop":
-                    let report = do fabricdDrain(c, t)
+                    let report = do fabricdDrain(c)
                     let lines = do daemonShutdownLines(report)
                     let mut out = "report" + sep + daemonShutdownExitCode(report)
                     let mut k = 0
@@ -385,6 +396,32 @@ app FabricdLib:
             let stopping = fabricdStopping
             if !stopping:
                 let sent = send(requests, "tick")
+        return true
+
+    # control.rs pump_telemetry: sample the source on its own cadence,
+    # beside the loop, first at once; a tick missed while a sweep was slow is
+    # delayed, not bunched (the next is one interval after it fired). Each
+    # finished sample goes to the loop, and the pump waits until the loop has
+    # taken it. It samples nothing once the daemon is stopping.
+    proc fabricdTelemetryPump(t0: DaemonTelemetry, everyMs: int) -> bool uses io.net, io.file:
+        let mut t = t0
+        let requests = fabricdRequests
+        let taken = fabricdSampleTaken
+        let mut next = monoMs()
+        loop true:
+            let wait = next - monoMs()
+            if wait > 0:
+                let slept = sleepMs(wait)
+            let fired = monoMs()
+            let stopping = fabricdStopping
+            if !stopping:
+                let now = do fabricdNowMs()
+                let sampled = do daemonTelemetrySample(t, now)
+                t = sampled.telemetry
+                fabricdSampled = sampled.sample
+                let sent = send(requests, "sample")
+                let ack = recv(taken)
+            next = fired + everyMs
         return true
 
     proc fabricdRequestStop() -> bool:
@@ -516,6 +553,7 @@ app FabricdLib:
         fabricdSettings = settings
         fabricdRequests = channel()
         fabricdDispatch = channel()
+        fabricdSampleTaken = channel()
         fabricdStopping = false
         let dataListener = listenOn(daemonAddrHost(settings.dataListen), settings.dataListen.port)
         let dataBind = listenError(dataListener)
@@ -544,8 +582,9 @@ app FabricdLib:
             let failed = send(exit, "78")
             return true
         let sig = signals()
-        detach fabricdControlLoop(booted.control, booted.telemetry)
+        detach fabricdControlLoop(booted.control)
         detach fabricdTicker(settings.cadence.controlCycleMs)
+        detach fabricdTelemetryPump(booted.telemetry, settings.cadence.telemetryPollMs)
         detach fabricdAcceptLoop(dataListener, "data")
         detach fabricdAcceptLoop(adminListener, "admin")
         detach fabricdSignalWatch(sig)
@@ -602,6 +641,8 @@ app FabricdLib:
         let sep = do fabricdSep()
         let reply = channel()
         let mut msg = "abort" + sep + a.id + sep + reply
+        if a.kind == "Migrate":
+            msg = "migrate" + sep + sjU64Text(a.shard) + sep + a.x + sep + a.y + sep + a.destination + sep + reply
         if a.kind == "Transfer":
             let mut has = "0"
             if a.hasResident:
@@ -632,13 +673,13 @@ app FabricdLib:
         return target == "/routing/feed" || slice(target, 0, min(len(target), 14)) == "/routing/feed?"
 
     proc fabricdQueryParam(target: text, name: text) -> text:
-        let q = do indexOf(target, "?")
+        let q = do routingIndexOf(target, "?")
         if q < 0:
             return ""
         let pairs = split(slice(target, q + 1, len(target)), "&")
         let mut i = 0
         loop i < len(pairs):
-            let eq = do indexOf(pairs[i], "=")
+            let eq = do routingIndexOf(pairs[i], "=")
             if eq > 0 && slice(pairs[i], 0, eq) == name:
                 return slice(pairs[i], eq + 1, len(pairs[i]))
             i = i + 1

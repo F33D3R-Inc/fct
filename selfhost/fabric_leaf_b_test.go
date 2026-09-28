@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 
 	"facet/internal/compile"
@@ -180,6 +179,33 @@ func TestFabricLeafBPlan(t *testing.T) {
 	lbRunCases(t, "plan_check.fct", "runPlanCases", "planResult", "plan_rust.tsv")
 }
 
+// plan_rust.tsv against the crate itself: fabric_check's leafb-plan prints
+// plan.rs's answer to every input in plan_check.fct's digest, and every
+// line must be the golden's. (The first 2166 lines came from a scratch
+// binary; the in-tree printer reproduces them all, and the aggregate and
+// /changes routes were added from it.)
+func TestFabricLeafBPlanGoldenMatchesRust(t *testing.T) {
+	lines := lbReadGolden(t, "plan_rust.tsv")
+	var inputs, want []string
+	for _, kv := range lines {
+		inputs = append(inputs, kv[0])
+		want = append(want, kv[1])
+	}
+	got := laRust(t, "leafb-plan", inputs)
+	if len(got) != len(want) {
+		t.Fatalf("the crate answered %d lines for %d inputs", len(got), len(want))
+	}
+	bad := 0
+	for i := range want {
+		if got[i] != want[i] {
+			bad++
+			if bad <= 10 {
+				t.Errorf("case %d (%s):\n crate:  %s\n golden: %s", i, inputs[i], got[i], want[i])
+			}
+		}
+	}
+}
+
 // fabric_stats.fct's EngineStats decoder (wire.rs, serde derive over
 // serde_json) against serde_json::from_slice::<EngineStats>: the Rust ->
 // fct direction. The corpus includes 60 bodies serde_json itself encoded.
@@ -193,43 +219,10 @@ func TestFabricLeafBSample(t *testing.T) {
 	lbRunCheck(t, "stats_check.fct", "runSampleCheck", "sample_rust.tsv")
 }
 
-var (
-	lbCheckOnce sync.Once
-	lbCheckBin  string
-	lbCheckErr  string
-)
-
-// lbFabricCheck builds testdata/fabric_check once (the shared Rust harness
-// that links the real fabric crates) and returns its path, skipping the
-// calling test only when cargo is not installed.
+// lbFabricCheck: the fabric_check harness (fabricCheckBinary).
 func lbFabricCheck(t *testing.T) string {
 	t.Helper()
-	lbCheckOnce.Do(func() {
-		cargo, err := exec.LookPath("cargo")
-		if err != nil {
-			lbCheckErr = "cargo is not installed"
-			return
-		}
-		target := os.Getenv("FCT_FABRIC_CHECK_TARGET")
-		if target == "" {
-			target = filepath.Join(os.TempDir(), "fct-fabric-check")
-		}
-		cmd := exec.Command(cargo, "build", "--release", "--quiet")
-		cmd.Dir = filepath.Join("testdata", "fabric_check")
-		cmd.Env = append(os.Environ(), "CARGO_TARGET_DIR="+target)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			lbCheckErr = "cargo build failed: " + err.Error() + "\n" + string(out)
-			return
-		}
-		lbCheckBin = filepath.Join(target, "release", "fabric_check")
-	})
-	if lbCheckBin == "" {
-		if strings.HasPrefix(lbCheckErr, "cargo build failed") {
-			t.Fatal(lbCheckErr)
-		}
-		t.Skip("fabric_check unavailable: " + lbCheckErr)
-	}
-	return lbCheckBin
+	return fabricCheckBinary(t)
 }
 
 // The fct -> Rust direction: EngineStats values built in fct, encoded by

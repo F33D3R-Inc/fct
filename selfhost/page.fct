@@ -204,18 +204,17 @@ app PageSelfHost:
             let c = do pgCompact(b0)
             b = c
         let dirEnd = 24 + count * 4
-        # shift the directory tail right by one slot (back to front, so
-        # the overlapping move reads each byte before overwriting it)
-        let mut j = dirEnd - 1
-        loop j >= 24 + index * 4:
-            b[j + 4] = b[j]
-            j = j - 1
+        # shift the directory tail right by one slot and place the cell —
+        # page.rs's copy_within and copy_from_slice, written into the page
+        # in place (bytesPut), never a rebuilt page; the four bytes the
+        # shift opens are the new slot, set below
+        let at = 24 + index * 4
+        if dirEnd > at:
+            let tail = slice(b, at, dirEnd)
+            b = bytesPut(b, at + 4, tail)
         let fe = do pgFreeEnd(b)
         let freeEnd = fe - dl
-        let mut k = 0
-        loop k < dl:
-            b[freeEnd + k] = data[k]
-            k = k + 1
+        b = bytesPut(b, freeEnd, data)
         let a1 = do pgPut16(b, 8, freeEnd)
         let a2 = do pgPut16(a1, 6, count + 1)
         let a3 = do pgSetSlot(a2, index, freeEnd, dl)
@@ -233,12 +232,11 @@ app PageSelfHost:
         let count = do pgSlotCount(b0)
         if index < 0 || index >= count:
             return b0
-        let mut b = b0
         let dirEnd = 24 + count * 4
-        let mut j = 24 + (index + 1) * 4
-        loop j < dirEnd:
-            b[j - 4] = b[j]
-            j = j + 1
+        let at = 24 + index * 4
+        # copy_within(at+4..dirEnd, at): the directory tail moves left one
+        # slot; the last slot's old bytes stay, as the byte loop left them
+        let b = slice(b0, 0, at) + slice(b0, at + 4, dirEnd) + slice(b0, dirEnd - 4, len(b0))
         let r = do pgPut16(b, 6, count - 1)
         return r
 
@@ -252,11 +250,7 @@ app PageSelfHost:
         let dl = len(data)
         if oldLen == dl:
             let offset = do pgSlotOffset(b0, index)
-            let mut b = b0
-            let mut i = 0
-            loop i < dl:
-                b[offset + i] = data[i]
-                i = i + 1
+            let b = slice(b0, 0, offset) + data + slice(b0, offset + dl, len(b0))
             return PgEdit{ok: true, index: index, body: b}
         let removed = do pgRemoveCell(b0, index)
         let ins = do pgInsertCell(removed, index, data)
@@ -280,16 +274,16 @@ app PageSelfHost:
         return t
 
     # pgComputeCrc: crc32_parts over the body with bytes 16..20 excluded.
+    # (the runtime's crc32 over the body with those four bytes cut out —
+    # the same IEEE CRC, computed natively)
     proc pgComputeCrc(b: [int]) -> int:
-        let t = do pgCrcTable()
-        let mut crc = 4294967295
         let n = len(b)
-        let mut i = 0
-        loop i < n:
-            if i < 16 || i >= 20:
-                crc = t[(crc ^ b[i]) & 255] ^ (crc >> 8)
-            i = i + 1
-        return crc ^ 4294967295
+        if n <= 16:
+            return crc32(b, 0, n)
+        if n <= 20:
+            return crc32(b, 0, 16)
+        let parts = slice(b, 0, 16) + slice(b, 20, n)
+        return crc32(parts, 0, n - 4)
 
     # pgEncode: encode — the body with its CRC brought up to date.
     proc pgEncode(b: [int]) -> [int]:

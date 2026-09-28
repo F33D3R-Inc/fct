@@ -193,10 +193,20 @@ app FabricControllerCoreSelfHost:
         target: ActionTarget
         observedAtMs: int
         topologyGeneration: int
+        # decision.rs `requested_by_operator`: an operator asked for this on
+        # the operator port. No model score to clear — validate skips the
+        # execution threshold for it — and every other check still applies.
+        requestedByOperator: bool
 
     proc decisionEnvelopeNew(decision: OptimizationDecision, observedAtMs: int, topologyGeneration: int) -> DecisionEnvelope:
         let target = do actionTargetNew(decision.shardId, decision.coordinate)
-        return DecisionEnvelope{decision: decision, target: target, observedAtMs: observedAtMs, topologyGeneration: topologyGeneration}
+        return DecisionEnvelope{decision: decision, target: target, observedAtMs: observedAtMs, topologyGeneration: topologyGeneration, requestedByOperator: false}
+
+    # DecisionEnvelope::requested_by_operator: a request that promises
+    # nothing (no expected gain, no cost) and is certain of itself.
+    proc decisionEnvelopeRequestedByOperator(target: ActionTarget, action: OptimizationAction, observedAtMs: int, topologyGeneration: int) -> DecisionEnvelope:
+        let decision = OptimizationDecision{shardId: target.shardId, coordinate: target.coordinate, action: action, expectedGain: 0.0, estimatedCost: 0.0, confidence: 1.0}
+        return DecisionEnvelope{decision: decision, target: target, observedAtMs: observedAtMs, topologyGeneration: topologyGeneration, requestedByOperator: true}
 
     proc optimizationDecisionZero() -> OptimizationDecision:
         let noAction = do optimizationActionNoAction()
@@ -204,7 +214,7 @@ app FabricControllerCoreSelfHost:
 
     proc decisionEnvelopeZero() -> DecisionEnvelope:
         let decision = do optimizationDecisionZero()
-        return DecisionEnvelope{decision: decision, target: ActionTarget{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, observedAtMs: 0, topologyGeneration: 0}
+        return DecisionEnvelope{decision: decision, target: ActionTarget{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, observedAtMs: 0, topologyGeneration: 0, requestedByOperator: false}
 
     proc decisionEnvelopeAction(e: DecisionEnvelope) -> OptimizationAction:
         return e.decision.action
@@ -1326,7 +1336,7 @@ app FabricControllerCoreSelfHost:
             let r2 = do validateResultErr(e2)
             return r2
         let score = do optimizationDecisionScore(decision)
-        if decision.confidence < c.policy.minConfidence || score <= 0.0:
+        if !envelope.requestedByOperator && (decision.confidence < c.policy.minConfidence || score <= 0.0):
             let e3 = do validationErrorBelowExecutionThreshold(score, decision.confidence, c.policy.minConfidence)
             let r3 = do validateResultErr(e3)
             return r3
@@ -2431,6 +2441,35 @@ app FabricControllerCoreSelfHost:
     state demoDecisionEnvelopeResult: text = ""
     state demoMeasurementErrorsResult: text = ""
     state demoMechanismUnregisteredResult: text = ""
+
+    # decision.rs requested_by_operator, controller.rs's three tests of it:
+    # an operator's zero-score move is admitted where the same decision from
+    # the optimizer is BelowExecutionThreshold; an operator's move is still
+    # refused for an unhealthy destination, a superseded fleet and staleness.
+    proc demoOperatorRequest() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoWorldFleet()
+        let c = do fabricControllerDefault()
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let target = ActionTarget{shardId: 7, coordinate: Coordinate{x: 3, y: 4}}
+        let toB = do optimizationActionMove("db-b")
+        let requested = do decisionEnvelopeRequestedByOperator(target, toB, 1000, 1)
+        let score = do optimizationDecisionScore(requested.decision)
+        let admitted = do fabricControllerValidate(c, requested, view)
+        let mut proposed = requested
+        proposed.requestedByOperator = false
+        let refused = do fabricControllerValidate(c, proposed, view)
+        let degraded = do demoFleetWithB("degraded", 1, 0.2, 0.2)
+        let unhealthy = do fabricControllerValidate(c, requested, controlPlaneViewNew(topology, degraded, 1000))
+        let older = do fabricControllerValidate(c, decisionEnvelopeRequestedByOperator(target, toB, 1000, 0), view)
+        let stale = do fabricControllerValidate(c, requested, controlPlaneViewNew(topology, fleet, 100000))
+        return "score=" + score + "|admitted=" + admitted.ok + "|proposed=" + refused.err.kind + "|unhealthy=" + unhealthy.err.kind + "|older=" + older.err.kind + "|stale=" + stale.err.kind
+
+    state demoOperatorRequestResult: text = ""
+
+    action runFabricControllerCoreOperator():
+        let r = do demoOperatorRequest()
+        demoOperatorRequestResult = r
 
     action runFabricControllerCoreDemo():
         let r1 = do demoStaleDecision()

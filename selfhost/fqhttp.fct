@@ -44,7 +44,13 @@ app FqHttpSelfHost:
             if len(buf) > 65536:
                 let f = do hHeadFail(-1, "request head too large")
                 return f
-            let chunk = readBytes(c, 65536)
+            let badMethod = do hMethodInvalid(buf)
+            if badMethod:
+                let fm = do hHeadFail(-1, "invalid request method")
+                return fm
+            # hyper's first read buffer is 8 KiB (INIT_BUFFER_SIZE): a head
+            # is read without pulling a large body in behind it
+            let chunk = readBytes(c, 8192)
             if len(chunk) == 0:
                 if len(buf) == 0:
                     let f0 = do hHeadFail(0, "")
@@ -59,7 +65,7 @@ app FqHttpSelfHost:
         let head = do httpServerParseHead(buf, end)
         if head.state != 1:
             return HHead{state: head.state, err: head.err, req: head, framing: "none", length: 0}
-        let held = HttpServerRequest{state: 1, err: "", method: head.method, target: head.target, path: head.path, hasQuery: head.hasQuery, query: head.query, version: head.version, headers: head.headers, body: "", rest: httpBytesRange(buf, end, len(buf))}
+        let held = HttpServerRequest{state: 1, err: "", method: head.method, target: head.target, path: head.path, hasQuery: head.hasQuery, query: head.query, version: head.version, headers: head.headers, body: "", rest: slice(buf, end, len(buf))}
         let te = lower(httpHeaderValue(head.headers, "transfer-encoding"))
         if contains(te, "chunked"):
             return HHead{state: 1, err: "", req: held, framing: "chunked", length: 0}
@@ -76,6 +82,27 @@ app FqHttpSelfHost:
         if cl <= 0:
             return HHead{state: 1, err: "", req: held, framing: "none", length: 0}
         return HHead{state: 1, err: "", req: held, framing: "length", length: cl}
+
+    # hMethodInvalid: whether the bytes so far already rule out an HTTP
+    # request — a method byte that is not a token character. hyper
+    # (httparse) parses a head as it arrives and answers such a start at
+    # once rather than waiting for a blank line that may never come (a TLS
+    # ClientHello sent to a plain listener has none). Leading CRLFs are
+    # skipped as httparse skips them; scanning stops at the method's end.
+    proc hMethodInvalid(buf: [int]) -> bool:
+        let n = len(buf)
+        let mut i = 0
+        loop i < n && (buf[i] == 13 || buf[i] == 10):
+            i = i + 1
+        loop i < n:
+            let b = buf[i]
+            if b == 32:
+                return false
+            let alnum = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+            if !alnum && !(b == 33 || (b >= 35 && b <= 39) || b == 42 || b == 43 || b == 45 || b == 46 || b == 94 || b == 95 || b == 96 || b == 124 || b == 126):
+                return true
+            i = i + 1
+        return false
 
     # HBodyRead: state 1 = the body read (rest: what follows it); 2 = over
     # maxBody, unread (skip: body bytes to discard, those in rest first;
@@ -122,11 +149,11 @@ app FqHttpSelfHost:
                 if len(r.bytes) == 0:
                     return HBodyRead{state: 0, body: "", rest: [], skip: 0}
                 buf = buf + r.bytes
-            return HBodyRead{state: 1, body: bytesToText(httpBytesRange(buf, 0, length)), rest: httpBytesRange(buf, length, len(buf)), skip: 0}
+            return HBodyRead{state: 1, body: bytesToText(slice(buf, 0, length)), rest: slice(buf, length, len(buf)), skip: 0}
         loop true:
             let d = do httpServerDechunk(buf, 0, maxBody)
             if d.state == 1:
-                return HBodyRead{state: 1, body: bytesToText(d.bytes), rest: httpBytesRange(buf, d.end, len(buf)), skip: 0}
+                return HBodyRead{state: 1, body: bytesToText(d.bytes), rest: slice(buf, d.end, len(buf)), skip: 0}
             if d.state == -1:
                 return HBodyRead{state: -1, body: "", rest: [], skip: 0}
             if d.state == -2:
@@ -139,9 +166,14 @@ app FqHttpSelfHost:
             buf = buf + r2.bytes
         return HBodyRead{state: -1, body: "", rest: [], skip: 0}
 
-    # hDiscardBody: the unread body of a request whose answer went out
-    # without it, read and dropped (hyper's drain); ok false when the
-    # connection cannot carry another request.
+    # hDiscardBody: hyper's poll_drain_or_close_read, for the body of a
+    # request whose answer went out without reading it — one poll of the
+    # body: the bytes already held and whatever one read finds waiting
+    # now, never a wait for more. A body that ends within them is dropped
+    # and the connection carries the next request (rest: what follows it);
+    # one that does not is abandoned and the connection closes (ok false),
+    # so an unwanted upload costs neither the time nor the work of
+    # receiving it.
     struct HSkipped:
         ok: bool
         rest: [int]
@@ -149,31 +181,50 @@ app FqHttpSelfHost:
     proc hDiscardBody(c: int, held: [int], framing: text, length: int) -> HSkipped uses io.net.listen:
         if framing == "none":
             return HSkipped{ok: true, rest: held}
-        if framing == "chunked":
-            let d = do hReadBody(c, held, "chunked", 0, 9223372036854775807, -1)
-            return HSkipped{ok: d.state == 1, rest: d.rest}
-        let sk = do hSkipBody(c, held, length)
-        return sk
+        let mut buf = held
+        let mut polled = false
+        # more body outstanding than one poll can bring in: it cannot end
+        # within this poll, so the connection closes without reading it
+        if framing == "length" && length - len(buf) > 65536:
+            return HSkipped{ok: false, rest: []}
+        loop true:
+            if framing == "length":
+                if len(buf) >= length:
+                    return HSkipped{ok: true, rest: slice(buf, length, len(buf))}
+            else:
+                let d = do httpServerDechunk(buf, 0, 9223372036854775807)
+                if d.state == 1:
+                    return HSkipped{ok: true, rest: slice(buf, d.end, len(buf))}
+                if d.state != 0:
+                    return HSkipped{ok: false, rest: []}
+            if polled:
+                return HSkipped{ok: false, rest: []}
+            polled = true
+            let waiting = pollBytes(c, 65536, 0)
+            buf = buf + waiting
+        return HSkipped{ok: false, rest: []}
 
     # hSkipBody: discard `skip` body bytes (those in `held` first); what
     # follows them is the next request's start. ok false when the peer
     # closed first.
     proc hSkipBody(c: int, held: [int], skip: int) -> HSkipped uses io.net.listen:
         if len(held) >= skip:
-            return HSkipped{ok: true, rest: httpBytesRange(held, skip, len(held))}
+            return HSkipped{ok: true, rest: slice(held, skip, len(held))}
         let mut left = skip - len(held)
         loop left > 0:
             let chunk = readBytes(c, 65536)
             if len(chunk) == 0:
                 return HSkipped{ok: false, rest: []}
             if len(chunk) > left:
-                return HSkipped{ok: true, rest: httpBytesRange(chunk, left, len(chunk))}
+                return HSkipped{ok: true, rest: slice(chunk, left, len(chunk))}
             left = left - len(chunk)
         return HSkipped{ok: true, rest: []}
 
+    # hRange: bs[from..to] — the runtime's own slice of a byte buffer (one
+    # copy), never an element-at-a-time loop: a request body passes
+    # through it.
     proc hRange(bs: [int], from: int, to: int) -> [int]:
-        let r = do httpBytesRange(bs, from, to)
-        return r
+        return slice(bs, from, to)
 
     proc hIndexOf(s: text, c: text) -> int:
         let n = len(s)
@@ -553,7 +604,7 @@ app FqHttpSelfHost:
                                 hasTag = true
                             else:
                                 let st = sjWs(bs, nx.v.u)
-                                rest = append(rest, bytesToText(httpBytesRange(bs, st, el.i)))
+                                rest = append(rest, bytesToText(slice(bs, st, el.i)))
                             idx = idx + 1
             if ret.ok && !hasTag:
                 ret = sjRaw(k, "missing field `type`")
@@ -637,7 +688,7 @@ app FqHttpSelfHost:
         let closed2 = sjClose(bs, ret, sjEndMap(bs, k))
         if !closed2.ok:
             return closed2
-        let cs2 = do hTxContent(types, bytesToText(httpBytesRange(bs, i, closed2.i)), tag, closed2.i)
+        let cs2 = do hTxContent(types, bytesToText(slice(bs, i, closed2.i)), tag, closed2.i)
         return cs2
 
     # hDeTxOps: Vec<TxOpRequest>, as sjDeVec reads a Vec.
@@ -801,7 +852,7 @@ app FqHttpSelfHost:
             loop j < len(pat) && bs[i + j] == pat[j]:
                 j = j + 1
             if j == len(pat):
-                return bytesToText(httpBytesRange(bs, 0, i))
+                return bytesToText(slice(bs, 0, i))
             i = i - 1
         return err
 

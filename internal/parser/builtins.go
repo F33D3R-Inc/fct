@@ -39,6 +39,11 @@ var builtinSites = map[string]BuiltinSite{
 	"contains": SiteEverywhere, "take": SiteEverywhere, "split": SiteEverywhere, "join": SiteEverywhere,
 	"slice": SiteEverywhere, "charAt": SiteEverywhere, "replace": SiteEverywhere, "slug": SiteEverywhere,
 	"byteLen": SiteEverywhere,
+	// indexOf(s, sub, from) / indexOf(xs, x, from): a rune index or a list
+	// position, -1 when absent — what orders rows by a list's order
+	// (`for w in Work where w.id in ids by indexOf(ids, w.id, 0)`). A byte
+	// buffer's form stays in procs, where buffers live.
+	"indexOf": SiteEverywhere,
 	// dates and formatting
 	"year": SiteEverywhere, "month": SiteEverywhere, "day": SiteEverywhere,
 	"ago": SiteEverywhere, "compact": SiteEverywhere, "commas": SiteEverywhere, "iso": SiteEverywhere, "fromIso": SiteEverywhere,
@@ -55,6 +60,9 @@ var builtinSites = map[string]BuiltinSite{
 	// so an answer is predictable from Go's documentation. The authority's
 	// only, since the browser's evaluator would have to agree bit for bit.
 	"exp": SiteAuthority, "ln": SiteAuthority, "sqrt": SiteAuthority,
+	// sin/cos: the Hann window and the FFT twiddle factors signal analysis
+	// (facets/media/audio.fct) is written in; Go's math.Sin/Cos.
+	"sin": SiteAuthority, "cos": SiteAuthority,
 	// authentication secrets, stored files, signatures and content ids
 	"verifyPassword": SiteAuthority, "totpSecret": SiteAuthority, "totpValid": SiteAuthority, "randomToken": SiteAuthority,
 	"fileDigest": SiteAuthority, "ed25519Verify": SiteAuthority, "ecdsaP256Verify": SiteAuthority,
@@ -71,23 +79,40 @@ var builtinSites = map[string]BuiltinSite{
 
 	// proc bodies only
 	"append": SiteProc, "bytes": SiteProc, "textToBytes": SiteProc, "bytesToText": SiteProc,
+	// validUtf8(b) -> bool: whether a byte buffer is well-formed UTF-8 (no overlong form, no
+	// surrogate, nothing past U+10FFFF) — what a decoder written in fct (selfhost/fabric_json.fct)
+	// checks a string's raw bytes with instead of a per-byte loop
+	"validUtf8": SiteProc,
+	// jsonQuote(s) -> text: s as a JSON string literal, exactly as encoding/json's json.Marshal
+	// spells it (HTML-safe: <, >, & as \u003c/\u003e/\u0026; U+2028/U+2029 escaped; each invalid
+	// UTF-8 byte as the character U+FFFD) — what an IR or API encoder written in fct (selfhost/ir_expr.fct) quotes
+	// every string with instead of a per-byte loop
+	"jsonQuote":  SiteProc,
 	"aesGcmSeal": SiteProc, "aesGcmOpen": SiteProc, "aesGcmAuthentic": SiteProc, "randomBytes": SiteProc,
 	// indexOf(s, sub, from) -> int: the rune index of sub in s at or after from, -1 when absent —
 	// what a parser written in fct (selfhost/ir_json.fct) scans a document with instead of a
 	// charAt per byte (strings.Index, rune-indexed like slice/charAt)
-	"indexOf": SiteProc,
+
 	// keyed digests and password hashing over byte buffers (runtime/cryptobuiltins.go): what a
 	// self-hosted runtime signs its cookies and stores its credentials with
+	"p256PrivateKey": SiteProc, "p256PublicKey": SiteProc, "p256Ecdh": SiteProc, "es256Sign": SiteProc, "fromBase64UrlRaw": SiteProc, "httpSend": SiteProc,
+	// uploadBytes(ref) -> [int]: the content of one of this server's stored uploads (the value
+	// a `bytes` parameter holds), empty when ref is not one — what a proc decodes an upload from.
+	"uploadBytes": SiteProc,
 	"sha256Bytes": SiteProc, "hmacSha256": SiteProc, "base64UrlRaw": SiteProc, "bcryptHash": SiteProc, "bcryptMatches": SiteProc,
 	"readFile": SiteProc, "writeFile": SiteProc, "appendFile": SiteProc, "fileExists": SiteProc, "truncateFile": SiteProc,
-	"fileSize": SiteProc, "fileModTime": SiteProc, "readFileAt": SiteProc, "writeFileAt": SiteProc, "syncFile": SiteProc, "renameFile": SiteProc, "removeFile": SiteProc, "lockFile": SiteProc, "crc32": SiteProc, "bytesCmp": SiteProc, "bytesCmpRange": SiteProc, "uintLE": SiteProc, "toHex": SiteProc, "fromHex": SiteProc,
+	"fileSize": SiteProc, "fileModTime": SiteProc, "readFileAt": SiteProc, "writeFileAt": SiteProc, "syncFile": SiteProc, "renameFile": SiteProc, "removeFile": SiteProc, "lockFile": SiteProc, "crc32": SiteProc, "bytesCmp": SiteProc, "bytesCmpRange": SiteProc, "uintLE": SiteProc, "toHex": SiteProc, "fromHex": SiteProc, "bytesPut": SiteProc,
 	"httpGet": SiteProc, "httpPost": SiteProc,
 	"listen": SiteProc, "listenOn": SiteProc, "accept": SiteProc, "connect": SiteProc,
 	"readBytes": SiteProc, "writeBytes": SiteProc, "closeConn": SiteProc, "setTimeoutMs": SiteProc, "connError": SiteProc,
-	"pollBytes": SiteProc, "connOpen": SiteProc, "shutdownConn": SiteProc,
+	"pollBytes": SiteProc, "connOpen": SiteProc, "shutdownConn": SiteProc, "closeWrite": SiteProc,
 	"closeListener": SiteProc, "listenError": SiteProc, "listenerPort": SiteProc, "grantRead": SiteProc,
+	// grantDir(path) (main only): an operator-named directory the io.file builtins may use;
+	// listDir(path) -> [text] and makeDir(path) -> bool: a directory's files, and one made
+	// (runtime/grants.go, runtime/dirs.go); readStdinLine() -> text: one line of stdin.
+	"grantDir": SiteProc, "listDir": SiteProc, "makeDir": SiteProc, "readStdinLine": SiteProc,
 	"writeStdout": SiteProc, "writeStderr": SiteProc, "readStdin": SiteProc, "envVar": SiteProc, "envSet": SiteProc,
-	"channel": SiteProc, "send": SiteProc, "recv": SiteProc, "sleepMs": SiteProc, "monoMs": SiteProc, "nowMs": SiteProc, "signals": SiteProc,
+	"channel": SiteProc, "send": SiteProc, "trySend": SiteProc, "recv": SiteProc, "sleepMs": SiteProc, "monoMs": SiteProc, "nowMs": SiteProc, "signals": SiteProc,
 	"awaitAny": SiteProc, "closeChannel": SiteProc, "exitProcess": SiteProc, "processStats": SiteProc, "listenTls": SiteProc, "connPeer": SiteProc, "connectTls": SiteProc,
 }
 

@@ -107,7 +107,7 @@ func TestAggregateErrors(t *testing.T) {
 	cases := []struct{ name, expr, want string }{
 		{"exists needs a filter", "exists(Like)", "filtered form"},
 		{"filtered sum needs a field", "sum(l in Like where l.user == actor)", "needs a field"},
-		{"unknown collection", "count(x in Nope where x.id == 1)", "neither an entity nor a `[T]` list state"},
+		{"unknown collection", "count(x in Nope where x.id == 1)", "neither an entity, a `[T]` list state, nor an action"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -144,7 +144,7 @@ func TestAggregateOverListState(t *testing.T) {
 		}
 	}
 	bad := []struct{ expr, want string }{
-		{`count(w in total where w == 1) == 0`, "neither an entity nor a `[T]` list state"},
+		{`count(w in total where w == 1) == 0`, "neither an entity, a `[T]` list state, nor an action"},
 		{`count(w in pick where w == body) == 0`, "must live there"},
 		{`sum(w in words where w == body) > 0`, "sum needs a field"},
 		{`exists(words) `, "exists needs a filtered form"},

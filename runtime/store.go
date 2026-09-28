@@ -149,6 +149,12 @@ type Store interface {
 	// any instance can serve any request.
 	LoadSession(sid string) (*persistedSession, bool, error)
 	SaveSession(sid string, ps *persistedSession) error
+	// UpdateSession writes a session that is already in the shared table and
+	// reports found=false, writing nothing, when it is not — a peer ended it
+	// (revoke, re-key, logout) after this instance last read it. An existing
+	// session is only ever updated through this, never re-inserted, so a
+	// stale instance's write-back cannot bring an ended session back.
+	UpdateSession(sid string, ps *persistedSession) (found bool, err error)
 	DeleteSession(sid string) error
 	// DeleteVisitorSessions removes every session carrying a `session` key (the
 	// stable visitor key an app revokes by), whichever instance created it.
@@ -236,6 +242,7 @@ func Migrate(graph *ir.IR, apply bool) ([]string, error) {
 		return nil, err
 	}
 	defer store.Close()
+	tellSearched(store, graph)
 	return store.Migrate(graph.Entities, apply)
 }
 
@@ -245,25 +252,41 @@ func Migrate(graph *ir.IR, apply bool) ([]string, error) {
 // the store that once scanned SQL rows through it is gone.
 func normalize(v any, f ir.Field) any {
 	switch t := v.(type) {
-	case nil:
-		return zeroFor(f)
 	case int64:
-		if f.Type == "float" {
-			return float64(t)
-		}
-		return int(t)
-	case float64:
-		if f.Type == "float" {
-			return t
-		}
-		return int(t)
+		v = int(t)
 	case []byte:
-		return decryptIf(f, string(t))
+		v = decryptIf(f, string(t))
 	case string:
-		return decryptIf(f, t)
-	default:
-		return v
+		v = decryptIf(f, t)
 	}
+	return columnValue(f, v)
+}
+
+// columnValue is a value as a column of field f holds it — the language's
+// typing rule for a stored field: a nullable column (`T?`) may hold nothing;
+// every other column holds a value of its declared type, converted the way
+// coerce converts an argument or a state cell (an int column's 3.7 is 3, its
+// "12" is 12, its nothing is 0). Every write applies it (storedValue), and so
+// does every read back from a store (normalize), so a row reads the same
+// before a restart as after.
+func columnValue(f ir.Field, v any) any {
+	if v == nil {
+		if f.Optional {
+			return nil
+		}
+		return zeroFor(f)
+	}
+	switch {
+	case f.IsRelation():
+		return coerce(v, "int")
+	case f.Enum != "":
+		return coerce(v, "text")
+	}
+	switch f.Type {
+	case "int", "money", "date", "float", "bool", "text", "datetime":
+		return coerce(v, f.Type)
+	}
+	return v
 }
 
 // decryptIf decrypts a value when its column is @secret, so the working set
@@ -277,7 +300,7 @@ func decryptIf(f ir.Field, s string) string {
 
 func zeroFor(f ir.Field) any {
 	switch {
-	case f.IsRelation() || f.Type == "int":
+	case f.IsRelation() || f.Type == "int" || f.Type == "money" || f.Type == "date":
 		return 0
 	case f.Type == "float":
 		return 0.0

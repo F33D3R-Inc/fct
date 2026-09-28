@@ -87,6 +87,10 @@ app FqBTreeSelfHost:
     proc btWithReaders(t: FqBTree, rd: FqBtReaders) -> FqBTree:
         return FqBTree{pager: t.pager, generation: t.generation, root: t.root, entries: t.entries, free: t.free, dirty: t.dirty, rd: rd}
 
+    proc btReadOnly(t: FqBTree) -> FqBTree:
+        let r = do btWith(t, pgrReadOnly(t.pager))
+        return r
+
     proc btWith(t: FqBTree, pager: FqPager) -> FqBTree:
         return FqBTree{pager: pager, generation: t.generation, root: t.root, entries: t.entries, free: t.free, dirty: t.dirty, rd: t.rd}
 
@@ -575,9 +579,9 @@ app FqBTreeSelfHost:
     # transaction already made it.
     proc btCow(t: FqBTree, pageId: int) -> FqCow uses io.file:
         let r = do pgrRead(t.pager, pageId)
+        let t1 = FqBTree{pager: r.pager, generation: t.generation, root: t.root, entries: t.entries, free: t.free, dirty: t.dirty, rd: t.rd}
         if !r.ok:
-            return FqCow{ok: false, err: r.err, tree: t, id: 0, body: []}
-        let t1 = do btWith(t, r.pager)
+            return FqCow{ok: false, err: r.err, tree: t1, id: 0, body: []}
         if pageId in t1.dirty:
             return FqCow{ok: true, err: "", tree: t1, id: pageId, body: r.body}
         let a = do btAllocate(t1)
@@ -587,17 +591,15 @@ app FqBTreeSelfHost:
 
     proc btRead(t: FqBTree, id: int) -> FqBtPage uses io.file:
         let r = do pgrRead(t.pager, id)
+        let t1 = FqBTree{pager: r.pager, generation: t.generation, root: t.root, entries: t.entries, free: t.free, dirty: t.dirty, rd: t.rd}
         if !r.ok:
-            return FqBtPage{ok: false, err: r.err, tree: t, body: []}
-        let t1 = do btWith(t, r.pager)
+            return FqBtPage{ok: false, err: r.err, tree: t1, body: []}
         return FqBtPage{ok: true, err: "", tree: t1, body: r.body}
 
     proc btWrite(t: FqBTree, id: int, body: [int]) -> FqBtR uses io.file:
         let w = do pgrWrite(t.pager, id, body)
-        if !w.ok:
-            return FqBtR{ok: false, err: w.err, tree: t}
-        let t1 = do btWith(t, w.pager)
-        return FqBtR{ok: true, err: "", tree: t1}
+        let t1 = FqBTree{pager: w.pager, generation: t.generation, root: t.root, entries: t.entries, free: t.free, dirty: t.dirty, rd: t.rd}
+        return FqBtR{ok: w.ok, err: w.err, tree: t1}
 
     # ── reads ───────────────────────────────────────────────────────────
     struct FqDescend:
@@ -809,6 +811,37 @@ app FqBTreeSelfHost:
             values = append(values, vh)
             hasCursor = true
             cursor = e.entry.key
+            # for_each_range's leaf walk: the rest of this leaf's cells are
+            # the next entries in order, read in place — one seek per leaf,
+            # not one descent from the root per entry
+            let d = do btDescend(t, t.root, cursor)
+            if !d.ok:
+                return FqRange{ok: false, err: d.err, tree: t, keys: [], values: []}
+            let lr = do btRead(d.tree, d.leaf)
+            if !lr.ok:
+                return FqRange{ok: false, err: lr.err, tree: d.tree, keys: [], values: []}
+            t = lr.tree
+            let leaf = lr.body
+            let at = do btLeafSearch(leaf, cursor)
+            let count = uintLE(leaf, 6, 2)
+            let mut idx = at.index + 1
+            if reverse:
+                idx = at.index - 1
+            let mut done = !at.found
+            loop !done && idx >= 0 && idx < count && (limit == 0 || len(keys) < limit):
+                let off = uintLE(leaf, 24 + idx * 4, 2)
+                let cl = uintLE(leaf, 24 + idx * 4 + 2, 2)
+                let kl = uintLE(leaf, off, 2)
+                let np = len(prefix)
+                if kl < np || bytesCmpRange(leaf, off + 2, off + 2 + np, prefix, 0, np) != 0:
+                    return FqRange{ok: true, err: "", tree: t, keys: keys, values: values}
+                keys = append(keys, toHex(slice(leaf, off + 2, off + 2 + kl)))
+                values = append(values, toHex(slice(leaf, off + 2 + kl, off + cl)))
+                cursor = slice(leaf, off + 2, off + 2 + kl)
+                if reverse:
+                    idx = idx - 1
+                else:
+                    idx = idx + 1
         return FqRange{ok: true, err: "", tree: t, keys: keys, values: values}
 
     # ── writes ──────────────────────────────────────────────────────────

@@ -147,7 +147,65 @@ import (
 // Bumped 1.43.0 → 1.44.0 for `exp(x)`, `ln(x)` and `sqrt(x)` (authority
 // only): the ranking model a feed is scored with is written in a cosine, a
 // Gaussian, a sigmoid and an exponential decay, none expressible before.
-var ToolchainVersion = "1.44.0"
+//
+// Bumped 1.44.0 → 1.45.0 for the Web Push primitives (proc-only): p256PrivateKey,
+// p256PublicKey, p256Ecdh, es256Sign, fromBase64UrlRaw, httpSend (headers,
+// binary body, status) — and AES-GCM now takes AES-128 keys — so RFC 8291
+// message encryption and RFC 8292 VAPID are authored in .fct.
+//
+// Bumped 1.45.0 → 1.46.0 for `sin(x)` and `cos(x)` (authority only): the
+// Hann window and FFT twiddles audio feature extraction is authored with,
+// and `uploadBytes(ref)` (proc-only): a stored upload's content, so a proc
+// decodes the file a `bytes` parameter received.
+//
+// Bumped 1.46.0 → 1.47.0 for what an operator CLI that manages a directory
+// needs (the self-hosted FacetQL's init/backup/restore and its confirm
+// prompts): `grantDir(path)` (io.file, `proc main` only — an operator-named
+// directory becomes readable and writable, runtime/grants.go), `listDir(path)`
+// and `makeDir(path)` (io.file, runtime/dirs.go), and `readStdinLine()`
+// (io.console: one line of stdin, where readStdin waits for its end).
+// indexOf also searches a byte buffer natively — for a byte value, or for
+// the first of a set of byte values (runtime/eval.go's bytesIndexOf).
+//
+// Bumped 1.47.0 → 1.48.0 for list-of-`type` action parameters
+// (`events: [PlayEventIn]`, a JSON array of objects, each shaped to the
+// type's fields — runtime/wirearg.go) and ordering by a float field by its
+// value (it had been truncated to an int, unlike the client's comparator).
+//
+// Bumped 1.48.0 → 1.49.0 for `closeWrite(c)` (io.net): half-closes a
+// connection's send side (TLS close_notify, then the TCP FIN) and keeps the
+// read side open — how a server that refused a request lets the client see
+// the end of its answer at once, rather than after the drain's deadline.
+//
+// Bumped 1.49.0 → 1.50.0 for `validUtf8(b)` (proc-only): whether a byte
+// buffer is well-formed UTF-8, the check a JSON decoder written in fct
+// (selfhost/fabric_json.fct) makes on every string's raw bytes — natively,
+// rather than a per-byte loop.
+//
+// Bumped 1.50.0 → 1.51.0 for `jsonQuote(s)` (proc-only): s as a JSON string
+// literal exactly as encoding/json's json.Marshal writes it (HTML-safe) —
+// what the self-hosted compiler's IR encoder quotes every string with,
+// natively rather than a per-byte loop.
+//
+// Bumped 1.51.0 → 1.52.0 for `bytesPut(dst, at, src)` (proc-only): dst with
+// src written over dst[at..at+len(src)] — and, as `b = bytesPut(b, at, src)`
+// on a buffer its slot owns, that write done in place: how a storage page
+// (selfhost/page.fct) inserts a cell without rebuilding its 16 KiB.
+//
+// Bumped 1.52.0 → 1.53.0 for `trySend(ch, value)` (proc-only): send without
+// waiting — false when the channel's buffer is full or it is closed — so a
+// loop serving many receivers skips a slow one instead of stalling on it;
+// and `channel(n)`, a channel buffering n values (1-4096; channel() is 1),
+// the per-receiver outbox such a loop fills.
+//
+// Bumped 1.53.0 → 1.54.0 for `indexOf` everywhere (a view or policy may
+// order rows by a list's order: `for w in Work where w.id in ids by
+// indexOf(ids, w.id, 0)`), view and action `for … by <expr>`, links to a
+// served non-page route, lists and records compared element by element,
+// the most specific dynamic route winning (`/:handle` beside
+// `/settings/:section`), and `upload` into a `[text]` cell taking many
+// files.
+var ToolchainVersion = "1.54.0"
 
 // CheckToolchainRange reports whether the running ToolchainVersion satisfies a
 // `facet` manifest range, returning a clear "upgrade the toolchain" error when
